@@ -1,0 +1,14 @@
+package: bh3gei.lzcapp.exterior
+version: 0.2.0
+name: exterior
+description: >-
+  外装代脑：把 Telegram 群里的每个话题接到设备上的一个 agent（Claude、Codex、Pi），所有 agent 共用一份关于你的记忆。
+author: BH3GEI
+license: MIT
+locales:
+  zh:
+    name: exterior
+    description: 外装代脑：把 Telegram 群里的每个话题接到设备上的一个 agent（Claude、Codex、Pi），所有 agent 共用一份关于你的记忆。
+  en:
+    name: exterior
+    description: Connects each topic of a Telegram group to an agent (Claude, Codex, Pi) on your devices, with one shared memory about you.

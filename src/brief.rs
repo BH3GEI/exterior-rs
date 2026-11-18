@@ -1,24 +1,30 @@
-//! brief: the only way exterior talks to Telegram (and the only way agents reach WeChat/Telegram messages).
+//! brief: the only way exterior talks to Telegram.
 use serde_json::Value;
 use std::process::Command;
 
-pub const BASE: &str = "https://brief.example.com";
-pub const TOKEN_FILE: &str = "/path/to/brief-token";
+fn conf() -> (String, String) {
+    let c = crate::store::config();
+    let url = c["brief"]["url"].as_str().unwrap_or("").trim_end_matches('/').to_string();
+    let key = c["brief"]["key"].as_str().and_then(crate::crypt::open).unwrap_or_default();
+    (url, key)
+}
+
+pub fn configured() -> bool { let (u, k) = conf(); !u.is_empty() && !k.is_empty() }
+
+pub fn key() -> String { conf().1 }
 
 /// One API call. Ok(json) on 2xx, Err((status, json)) otherwise (status 0 = no answer at all).
 pub fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, (u16, Value)> {
-    let key = std::fs::read_to_string(TOKEN_FILE).unwrap_or_default();
+    let (base, key) = conf();
+    if base.is_empty() || key.is_empty() { return Err((0, Value::String("未设置".into()))); }
     let mut c = Command::new("curl");
-    c.args(["-s", "-m", "70", "-w", "\n%{http_code}", "-X", method])
-        .arg("-H").arg(format!("Authorization: Bearer {}", key.trim()))
-        .arg(format!("{BASE}{path}"));
-    if let Some(b) = body {
-        c.args(["-H", "Content-Type: application/json", "-d"]).arg(b.to_string());
-    }
-    let out = match c.output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => return Err((0, Value::Null)),
-    };
+    c.args(["-s", "-m", "70", "-w", "\n%{http_code}", "-X", method, "-H", "@-"]).arg(format!("{base}{path}"));
+    if let Some(b) = body { c.args(["-H", "Content-Type: application/json", "--data-binary"]).arg(b.to_string()); }
+    // the key goes in through stdin, so it never shows up in the process list
+    c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let Ok(mut ch) = c.spawn() else { return Err((0, Value::Null)) };
+    { use std::io::Write; let mut i = ch.stdin.take().unwrap(); let _ = writeln!(i, "Authorization: Bearer {key}"); }
+    let out = match ch.wait_with_output() { Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(), Err(_) => return Err((0, Value::Null)) };
     let (body, code) = out.rsplit_once('\n').unwrap_or(("", "0"));
     let code: u16 = code.trim().parse().unwrap_or(0);
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
