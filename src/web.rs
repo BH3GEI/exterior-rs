@@ -219,11 +219,26 @@ fn devices_page() -> String {
 fn memory_page() -> String {
     let mut body = String::new();
     for d in store::devices() {
+        let dn = d["name"].as_str().unwrap_or("").to_string();
         let p = crate::prompt::infra(&d);
-        let script = format!("cd {} 2>/dev/null || {{ echo '没有这个目录'; exit 0; }}; git log -1 --date=format:'%m-%d %H:%M' --pretty='最后更新 %ad  %s' 2>/dev/null; echo; find . -name '*.md' -not -path './.git/*' -not -path './archive/*' | sed 's#^./##' | sort", crate::host::quote(&p));
-        let out = crate::host::run(&d, &script, 30).unwrap_or_else(|e| format!("读不到：{e}"));
-        body.push_str(&format!(r#"<h2>{}：{}</h2><div class="card"><div class="row mute">agent 开工先读 rules/，其他按需查。各 agent 自带的记忆已关闭，关于 Yao 的知识只放这一处，GitHub 仓库 BH3GEI/agent-infra。</div><pre>{}</pre></div>"#,
-            esc(d["name"].as_str().unwrap_or("")), esc(&p), esc(&out)));
+        let tree = crate::host::run(&d, &format!("cd {} 2>/dev/null || {{ echo '没有这个目录'; exit 0; }}; find . -name '*.md' -not -path './.git/*' -not -path './archive/*' | sed 's#^./##' | sort", crate::host::quote(&p)), 30).unwrap_or_else(|e| format!("读不到：{e}"));
+        let last = &store::state("infra")[&dn];
+        let status = if last.is_null() { "<span class=\"mute\">exterior 还没提交过</span>".to_string() } else {
+            format!("{} <span class=\"mute\">{} · {}</span> <span class=\"msg\">{}</span>", badge(Some(last["ok"] == true), if last["ok"] == true { "已推送" } else { "推送失败" }),
+                ago(last["time"].as_u64().unwrap_or(0)), esc(last["topic"].as_str().unwrap_or("")), esc(last["msg"].as_str().unwrap_or("")))
+        };
+        let log = crate::infra::log(&d, 12);
+        let mut rows = String::new();
+        for l in log.lines().map(str::trim_end) {
+            let first = l.split_whitespace().next().unwrap_or("");
+            if !l.starts_with(' ') && first.len() >= 7 && first.chars().all(|c| c.is_ascii_hexdigit()) {
+                rows.push_str(&format!("<div class=\"row\"><code>{}</code><form class=\"inline\" method=\"post\" action=\"/infra/revert\" onsubmit=\"return confirm('撤回这次修改？')\"><input type=\"hidden\" name=\"d\" value=\"{}\"><input type=\"hidden\" name=\"h\" value=\"{}\"><button>撤回</button></form></div>", esc(l), esc(&dn), esc(first)));
+            } else { rows.push_str(&format!("<div class=\"msg\">{}</div>", esc(l))); }
+        }
+        let r = &store::state("tests")[format!("revert:{dn}")];
+        body.push_str(&format!(r#"<h2>{}：{}</h2><div class="card"><div class="row mute">关于 Yao 的知识只放这一处（GitHub：BH3GEI/agent-infra）。agent 用到时自己查；学到新东西直接改对应文件，exterior 每轮结束自动提交并推送。</div><div class="row">最近一次：{}</div><div class="row"><form class="inline" method="post" action="/infra/test"><input type="hidden" name="d" value="{}"><button>测试推送</button></form>{}</div></div>
+<h2>最近的修改</h2><div class="card">{}<div class="row">{}</div></div><h2>文件</h2><div class="card"><pre>{}</pre></div>"#,
+            esc(&dn), esc(&p), status, esc(&dn), result_cell(&store::state("tests")[format!("infra:{dn}")]), if rows.is_empty() { "<div class=\"mute\">没有记录</div>".into() } else { rows }, result_cell(r), esc(&tree)));
     }
     if body.is_empty() { body = "<p class=\"mute\">还没有设备。</p>".into(); }
     page("/memory", "记忆", &body, false)
@@ -240,14 +255,15 @@ fn messages_page() -> String {
 }
 
 fn prompt_page() -> String {
-    let mut body = String::from("<h2>启动说明</h2><p class=\"mute\">每个 agent 启动时读到的就是下面这段（写在设备根目录的 CLAUDE.md 和 AGENTS.md 里）。每个话题文件夹里另有一小段，写着话题名。</p>");
+    let mut body = String::from("<h2>启动说明</h2><p class=\"mute\">exterior 启动 agent 时，把下面这段直接交给它（claude 和 pi 用 --append-system-prompt，codex 用 developer_instructions），不往文件夹里写文件。话题名、文件夹按实际话题填。各工具自己的全局说明只剩红线和 agent-infra 的位置。</p>");
     for d in store::devices() {
-        let root = d["root"].as_str().unwrap_or("").trim_end_matches('/').to_string();
+        let root = crate::prompt::root(&d);
         let r = &store::state("tests")[format!("prompt:{}", d["name"].as_str().unwrap_or(""))];
-        let actual = crate::host::run(&d, &format!("cat {}", crate::host::quote(&format!("{root}/CLAUDE.md"))), 20);
-        let (ok, text) = match actual { Ok(t) => (t.trim() == crate::prompt::root_text(&d).trim(), t), Err(e) => (false, format!("读不到：{e}")) };
-        body.push_str(&format!("<h2>{}：{root}/CLAUDE.md {}</h2><div class=\"card\"><div class=\"row\"><form method=\"post\" action=\"/prompt/install\"><input type=\"hidden\" name=\"d\" value=\"{}\"><button>重新写入</button></form>{}</div><pre>{}</pre></div>",
-            esc(d["name"].as_str().unwrap_or("")), badge(Some(ok), if ok { "已是最新" } else { "和应写入的不一致" }), esc(d["name"].as_str().unwrap_or("")), result_cell(r), esc(&text)));
+        let sample = crate::prompt::session_text(&d, "某话题", "tgbot:话题号", &format!("{root}/某话题"), false);
+        let global = crate::prompt::session_text(&d, "全局", "tgbot:话题号", &format!("{root}/overview"), true);
+        let extra = global.strip_prefix(sample.replace("某话题", "全局").replace(&format!("{root}/全局"), &format!("{root}/overview")).as_str()).unwrap_or("").trim().to_string();
+        body.push_str(&format!("<h2>{}</h2><div class=\"card\"><pre>{}</pre><div class=\"row mute\">「全局」话题另加一段：</div><pre>{}</pre><div class=\"row\"><form method=\"post\" action=\"/prompt/install\"><input type=\"hidden\" name=\"d\" value=\"{}\"><button>重新写入 brief 密钥</button></form>{}</div></div>",
+            esc(d["name"].as_str().unwrap_or("")), esc(&sample), esc(&extra), esc(d["name"].as_str().unwrap_or("")), result_cell(r)));
     }
     page("/prompt", "启动说明", &body, false)
 }
@@ -367,6 +383,17 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
                 });
             }
             "/devices".into()
+        }
+        "/infra/test" => {
+            if let Some(d) = store::device(&g("d")) { background(format!("infra:{}", g("d")), move || crate::infra::test(&d)); }
+            "/memory".into()
+        }
+        "/infra/revert" => {
+            if let Some(d) = store::device(&g("d")) {
+                let h = g("h");
+                background(format!("revert:{}", g("d")), move || crate::infra::revert(&d, &h));
+            }
+            "/memory".into()
         }
         "/prompt/install" => {
             if let Some(d) = store::device(&g("d")) {

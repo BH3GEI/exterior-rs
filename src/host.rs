@@ -71,7 +71,3 @@ pub fn write(dev: &Value, path: &str, body: &str, mode: &str) -> Result<String, 
     run(dev, &format!("mkdir -p {d} && printf '%s' {b} > {p} && chmod {mode} {p}", d = quote(dir), p = quote(path), b = quote(body)), 30)
 }
 
-pub fn write_new(dev: &Value, path: &str, body: &str) {
-    let dir = path.rsplit_once('/').map(|x| x.0).unwrap_or("/");
-    let _ = run(dev, &format!("mkdir -p {d} && [ -e {p} ] || printf '%s' {b} > {p}", d = quote(dir), p = quote(path), b = quote(body)), 30);
-}

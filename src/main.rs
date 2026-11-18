@@ -4,6 +4,7 @@ mod brief;
 mod crypt;
 mod daemon;
 mod host;
+mod infra;
 mod prompt;
 mod store;
 mod web;

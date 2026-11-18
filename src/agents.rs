@@ -34,6 +34,8 @@ pub enum Ev {
 #[derive(Clone)]
 pub struct Spec {
     pub tid: String,
+    /// what exterior tells the agent at start (see prompt.rs)
+    pub prompt: String,
     pub topic: String,
     pub dev: Value,
     pub dir: String,
@@ -103,6 +105,7 @@ impl Agent {
         let mut args: Vec<String> = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                 "--include-partial-messages", "--dangerously-skip-permissions"].map(String::from).to_vec();
         if let Some(id) = &self.spec.resume { args.push("--resume".into()); args.push(id.clone()); }
+        if !self.spec.prompt.is_empty() { args.push("--append-system-prompt".into()); args.push(self.spec.prompt.clone()); }
         let (out, last) = self.spawn(args)?;
         let (tx, tid, gen, child, busy) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone());
         std::thread::spawn(move || {
@@ -129,7 +132,9 @@ impl Agent {
 
     fn start_pi(&mut self) -> Result<(), String> {
         let sid = self.spec.resume.clone().unwrap_or_else(|| format!("exterior-{}-{}", self.spec.tid.trim_start_matches("tgbot:"), crate::store::now()));
-        let (out, last) = self.spawn(vec!["--mode".into(), "rpc".into(), "--session-id".into(), sid.clone()])?;
+        let mut args: Vec<String> = vec!["--mode".into(), "rpc".into(), "--session-id".into(), sid.clone()];
+        if !self.spec.prompt.is_empty() { args.push("--append-system-prompt".into()); args.push(self.spec.prompt.clone()); }
+        let (out, last) = self.spawn(args)?;
         let _ = self.tx.send(Ev::Session { tid: self.spec.tid.clone(), gen: self.spec.gen, id: sid });
         let (tx, tid, gen, child, busy) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone());
         std::thread::spawn(move || {
@@ -211,6 +216,7 @@ impl Agent {
             let mut text = text;
             loop {
                 let mut args: Vec<String> = ["exec", "--json", "--skip-git-repo-check"].map(String::from).to_vec();
+                if !spec.prompt.is_empty() { args.push("-c".into()); args.push(format!("developer_instructions={}", serde_json::to_string(&spec.prompt).unwrap_or_default())); }
                 if let Some(t) = thread.lock().unwrap().clone() { args.push("resume".into()); args.push(t); }
                 args.push(text.clone());
                 let mut cmd = crate::host::agent(&spec.dev, &spec.dir, &env(&spec), &spec.command, &args);
@@ -292,7 +298,7 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
         Kind::Pi => (vec!["--mode".into(), "rpc".into(), "--no-session".into()], json!({"type": "get_commands"})),
         Kind::Codex => return vec![],
     };
-    let Ok(mut child) = crate::host::agent(dev, dir, &env(&Spec { tid: String::new(), topic: String::new(), dev: dev.clone(), dir: dir.into(), command: command.into(), kind, gen: 0, resume: None }), command, &args)
+    let Ok(mut child) = crate::host::agent(dev, dir, &env(&Spec { tid: String::new(), prompt: String::new(), topic: String::new(), dev: dev.clone(), dir: dir.into(), command: command.into(), kind, gen: 0, resume: None }), command, &args)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return vec![] };
     let mut stdin = child.stdin.take().unwrap();
     let _ = writeln!(stdin, "{ask}");

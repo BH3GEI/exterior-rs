@@ -138,11 +138,8 @@ fn start_agent(s: &mut Session, tx: &Sender<Ev>) -> Result<(), String> {
     let run_row = if resume.is_some() { n["resolved"].as_str().and_then(|r| store::agent(&dev, r)).unwrap_or(row.clone()) } else { row.clone() };
     s.gen += 1;
     let root = root_of(&s.dev);
-    if s.dir != root {
-        let body = crate::prompt::topic_text(&s.name, &s.tid);
-        for f in ["CLAUDE.md", "AGENTS.md"] { crate::host::write_new(&dev, &format!("{}/{f}", s.dir), &body); }
-    }
-    let spec = Spec { tid: s.tid.clone(), topic: s.name.clone(), dev: dev.clone(), dir: s.dir.clone(),
+    let prompt = crate::prompt::session_text(&dev, &s.name, &s.tid, &s.dir, s.dir == format!("{root}/overview"));
+    let spec = Spec { tid: s.tid.clone(), prompt, topic: s.name.clone(), dev: dev.clone(), dir: s.dir.clone(),
                       command: run_row["command"].as_str().unwrap_or("").to_string(), kind, gen: s.gen, resume: resume.clone() };
     store::log(&format!("start {} ({}) for {} in {} resume {:?}", run_row["name"], spec.command, s.name, s.dir, resume));
     s.agent = Some(Agent::start(spec, tx.clone())?);
@@ -209,9 +206,12 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 if let Some(e) = &error { body = format!("{body}\n\n⚠️ {e}").trim().to_string(); }
                 if body.trim().is_empty() { body = "✓ 完成（没有文字输出）".into(); }
                 match o.id { None => { send(&own, &sessions, &tid, &body); } Some(i) => edit(&sessions, &tid, i, &body) }
-                {
+                let who = {
                     let mut ss = sessions.lock().unwrap();
-                    if let Some(s) = ss.get_mut(&tid) { if s.gen == gen { s.pending = false; } s.active = Instant::now(); }
+                    ss.get_mut(&tid).map(|s| { if s.gen == gen { s.pending = false; } s.active = Instant::now(); (s.dev.clone(), s.name.clone()) })
+                };
+                if let Some((d, name)) = who {
+                    if let Some(dev) = store::device(&d) { std::thread::spawn(move || crate::infra::commit(&dev, &name)); }
                 }
                 if current(&tid, gen) {
                     set_status(&tid, if error.is_some() { "出错" } else { "空闲" });
