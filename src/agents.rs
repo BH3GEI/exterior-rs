@@ -150,7 +150,6 @@ impl Agent {
               thread: self.thread.clone(), model: self.model.clone(), dir: self.spec.dir.clone(), prompt: self.spec.prompt.clone() }
     }
 
-    fn ask(&mut self, make: impl FnOnce(&str) -> Value) -> Result<Value, String> { self.ctl().ask(make) }
 
     fn start_claude(&mut self) -> Result<(), String> {
         let mut args: Vec<String> = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
@@ -291,18 +290,36 @@ impl Agent {
             let why = last.lock().unwrap().clone();
             let _ = tx.send(Ev::Exited { tid, gen, why });
         });
-        self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": {"clientInfo": {"name": "exterior", "version": env!("CARGO_PKG_VERSION")}}}))?;
-        put(&self.stdin, &json!({"jsonrpc": "2.0", "method": "initialized"}))?;
-        let common = json!({"cwd": self.spec.dir, "developerInstructions": self.spec.prompt, "approvalPolicy": "never", "sandbox": "danger-full-access"});
-        let (method, mut params) = match &self.spec.resume { Some(t) => ("thread/resume", json!({"threadId": t})), None => ("thread/start", json!({})) };
-        for (k, v) in common.as_object().unwrap() { params[k] = v.clone(); }
-        let r = self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
-        if let Some(e) = r["error"]["message"].as_str() { return Err(format!("codex：{e}")); }
-        if let Some(t) = r["result"]["thread"]["id"].as_str() {
-            let new = self.thread.lock().unwrap().as_deref() != Some(t);
-            *self.thread.lock().unwrap() = Some(t.to_string());
-            if new { let _ = self.tx.send(Ev::Session { tid: self.spec.tid.clone(), gen: self.spec.gen, id: t.to_string() }); }
-        }
+        // the handshake runs in the background, so starting codex never holds anything up; messages wait in the queue
+        let (c, tx, spec, thread, queue, busy, model, stdin) = (self.ctl(), self.tx.clone(), self.spec.clone(), self.thread.clone(), self.queue.clone(), self.busy.clone(), self.model.clone(), self.stdin.clone());
+        std::thread::spawn(move || {
+            let r = (|| -> Result<String, String> {
+                c.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": {"clientInfo": {"name": "exterior", "version": env!("CARGO_PKG_VERSION")}}}))?;
+                put(&stdin, &json!({"jsonrpc": "2.0", "method": "initialized"}))?;
+                let mut params = match &spec.resume { Some(t) => json!({"threadId": t}), None => json!({}) };
+                for (k, v) in [("cwd", json!(spec.dir)), ("developerInstructions", json!(spec.prompt)), ("approvalPolicy", json!("never")), ("sandbox", json!("danger-full-access"))] { params[k] = v; }
+                let method = if spec.resume.is_some() { "thread/resume" } else { "thread/start" };
+                let r = c.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
+                if let Some(e) = r["error"]["message"].as_str() { return Err(format!("codex：{e}")); }
+                r["result"]["thread"]["id"].as_str().map(String::from).ok_or("codex 没给会话编号".into())
+            })();
+            match r {
+                Ok(t) => {
+                    let mut q = queue.lock().unwrap();
+                    let new = thread.lock().unwrap().as_deref() != Some(t.as_str());
+                    *thread.lock().unwrap() = Some(t.clone());
+                    if new { let _ = tx.send(Ev::Session { tid: spec.tid.clone(), gen: spec.gen, id: t.clone() }); }
+                    let next = if q.is_empty() { None } else { Some(q.remove(0)) };
+                    drop(q);
+                    match next { Some(m) => { let _ = put(&stdin, &codex_turn(&t, &m, model.lock().unwrap().clone())); } None => *busy.lock().unwrap() = false }
+                }
+                Err(e) => {
+                    queue.lock().unwrap().clear();
+                    *busy.lock().unwrap() = false;
+                    let _ = tx.send(Ev::Done { tid: spec.tid.clone(), gen: spec.gen, text: None, stopped: false, error: Some(format!("codex 没启动起来：{e}")) });
+                }
+            }
+        });
         Ok(())
     }
 
@@ -317,8 +334,12 @@ impl Agent {
                 put(&self.stdin, &m)
             }
             Kind::Codex => {
-                if was_busy { self.queue.lock().unwrap().push(text.to_string()); return Ok(()); }
-                let th = self.thread.lock().unwrap().clone().ok_or("codex 还没准备好")?;
+                // the queue lock also guards "is the thread ready yet", so a message can't slip between the two
+                let th = {
+                    let mut q = self.queue.lock().unwrap();
+                    let th = self.thread.lock().unwrap().clone();
+                    match th.filter(|_| !was_busy) { Some(th) => th, None => { q.push(text.to_string()); return Ok(()); } }
+                };
                 put(&self.stdin, &codex_turn(&th, text, self.model.lock().unwrap().clone()))
             }
         }
@@ -345,6 +366,13 @@ impl Agent {
 }
 
 impl Ctl {
+    /// codex: wait (up to 40 s) until the background handshake is done.
+    fn ready(&self) -> Result<(), String> {
+        if self.kind != Kind::Codex { return Ok(()); }
+        for _ in 0..80 { if self.thread.lock().unwrap().is_some() { return Ok(()); } std::thread::sleep(std::time::Duration::from_millis(500)); }
+        Err("codex 还没准备好".into())
+    }
+
     /// Send a request and wait for its answer (up to 30 s). `make` puts the id into the request.
     pub fn ask(&self, make: impl FnOnce(&str) -> Value) -> Result<Value, String> {
         let id = format!("x{}", self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1);
@@ -357,6 +385,7 @@ impl Ctl {
 
     /// The models this agent can switch to.
     pub fn models(&self) -> Result<Vec<Choice>, String> {
+        self.ready()?;
         match self.kind {
             Kind::Claude => {
                 for _ in 0..30 { if !self.info.lock().unwrap().is_null() { break; } std::thread::sleep(std::time::Duration::from_secs(1)); }
@@ -389,6 +418,7 @@ impl Ctl {
 
     /// Built-in commands that are not prompts: pi's thinking/compact/new, codex's compact/new.
     pub fn builtin(&self, name: &str, arg: &str) -> Result<String, String> {
+        self.ready()?;
         let r = match (self.kind, name) {
             (Kind::Pi, "thinking") => self.ask(|id| json!({"type": "set_thinking_level", "id": id, "level": arg}))?,
             (Kind::Pi, "compact") => self.ask(|id| json!({"type": "compact", "id": id}))?,
