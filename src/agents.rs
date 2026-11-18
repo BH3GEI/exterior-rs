@@ -1,8 +1,9 @@
 //! Driving one agent per topic. An agent is a row of the device's table: a name, the command that starts it,
-//! and which protocol it speaks (claude: stream-json; pi: rpc; codex: exec --json, one process per turn).
+//! and which protocol it speaks (claude: stream-json; pi: rpc; codex: app-server). Each stays running for the session.
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Stdio};
+use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -45,15 +46,25 @@ pub struct Spec {
     pub resume: Option<String>,
 }
 
+type Pending = Arc<Mutex<HashMap<String, Sender<Value>>>>;
+
 pub struct Agent {
     pub kind: Kind,
-    stdin: Option<ChildStdin>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     child: Arc<Mutex<Option<Child>>>,
     spec: Spec,
     tx: Sender<Ev>,
     busy: Arc<Mutex<bool>>,
     queue: Arc<Mutex<Vec<String>>>,
-    codex_thread: Arc<Mutex<Option<String>>>,
+    /// requests waiting for their answer, by id
+    pending: Pending,
+    next: Arc<std::sync::atomic::AtomicU64>,
+    /// claude: the initialize answer (commands, models)
+    info: Arc<Mutex<Value>>,
+    /// codex: thread, current turn, chosen model
+    thread: Arc<Mutex<Option<String>>>,
+    turn: Arc<Mutex<Option<String>>>,
+    model: Arc<Mutex<Option<String>>>,
 }
 
 fn env(spec: &Spec) -> Vec<(&'static str, String)> {
@@ -78,14 +89,47 @@ fn watch_stderr(err: std::process::ChildStderr, tx: Sender<Ev>, tid: String, gen
     });
 }
 
+fn put(stdin: &Arc<Mutex<Option<ChildStdin>>>, v: &Value) -> Result<(), String> {
+    let mut g = stdin.lock().unwrap();
+    let s = g.as_mut().ok_or("agent 没在运行")?;
+    writeln!(s, "{v}").and_then(|_| s.flush()).map_err(|e| e.to_string())
+}
+
+/// An answer to one of our requests: hand it to whoever waits for it. Returns true if it was one.
+fn route(pending: &Pending, id: Option<String>, v: &Value) -> bool {
+    let Some(id) = id else { return false };
+    if let Some(w) = pending.lock().unwrap().remove(&id) { let _ = w.send(v.clone()); return true; }
+    false
+}
+
+/// A model to choose: what to send back, and what to show.
+pub struct Choice { pub value: String, pub label: String }
+
+/// The part of a running agent that answers questions (models, built-in commands). Cheap to clone, so it can be
+/// used without holding the sessions lock.
+#[derive(Clone)]
+pub struct Ctl {
+    pub kind: Kind,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    pending: Pending,
+    next: Arc<std::sync::atomic::AtomicU64>,
+    info: Arc<Mutex<Value>>,
+    thread: Arc<Mutex<Option<String>>>,
+    model: Arc<Mutex<Option<String>>>,
+    dir: String,
+    prompt: String,
+}
+
 impl Agent {
     pub fn start(spec: Spec, tx: Sender<Ev>) -> Result<Agent, String> {
-        let mut a = Agent { kind: spec.kind, stdin: None, child: Arc::new(Mutex::new(None)), spec, tx, busy: Arc::new(Mutex::new(false)),
-                            queue: Arc::new(Mutex::new(vec![])), codex_thread: Arc::new(Mutex::new(None)) };
+        let mut a = Agent { kind: spec.kind, stdin: Arc::new(Mutex::new(None)), child: Arc::new(Mutex::new(None)), spec, tx,
+                            busy: Arc::new(Mutex::new(false)), queue: Arc::new(Mutex::new(vec![])), pending: Arc::new(Mutex::new(HashMap::new())),
+                            next: Arc::new(std::sync::atomic::AtomicU64::new(0)), info: Arc::new(Mutex::new(Value::Null)), thread: Arc::new(Mutex::new(None)),
+                            turn: Arc::new(Mutex::new(None)), model: Arc::new(Mutex::new(None)) };
         match a.kind {
             Kind::Claude => a.start_claude()?,
             Kind::Pi => a.start_pi()?,
-            Kind::Codex => { *a.codex_thread.lock().unwrap() = a.spec.resume.clone(); }
+            Kind::Codex => a.start_codex()?,
         }
         Ok(a)
     }
@@ -93,7 +137,7 @@ impl Agent {
     fn spawn(&mut self, args: Vec<String>) -> Result<(std::process::ChildStdout, Arc<Mutex<String>>), String> {
         let mut c = crate::host::agent(&self.spec.dev, &self.spec.dir, &env(&self.spec), &self.spec.command, &args);
         let mut child = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
-        self.stdin = child.stdin.take();
+        *self.stdin.lock().unwrap() = child.stdin.take();
         let out = child.stdout.take().unwrap();
         let last = Arc::new(Mutex::new(String::new()));
         watch_stderr(child.stderr.take().unwrap(), self.tx.clone(), self.spec.tid.clone(), self.spec.gen, last.clone());
@@ -101,17 +145,30 @@ impl Agent {
         Ok((out, last))
     }
 
+    pub fn ctl(&self) -> Ctl {
+        Ctl { kind: self.kind, stdin: self.stdin.clone(), pending: self.pending.clone(), next: self.next.clone(), info: self.info.clone(),
+              thread: self.thread.clone(), model: self.model.clone(), dir: self.spec.dir.clone(), prompt: self.spec.prompt.clone() }
+    }
+
+    fn ask(&mut self, make: impl FnOnce(&str) -> Value) -> Result<Value, String> { self.ctl().ask(make) }
+
     fn start_claude(&mut self) -> Result<(), String> {
         let mut args: Vec<String> = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                 "--include-partial-messages", "--dangerously-skip-permissions"].map(String::from).to_vec();
         if let Some(id) = &self.spec.resume { args.push("--resume".into()); args.push(id.clone()); }
         if !self.spec.prompt.is_empty() { args.push("--append-system-prompt".into()); args.push(self.spec.prompt.clone()); }
         let (out, last) = self.spawn(args)?;
-        let (tx, tid, gen, child, busy) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone());
+        let (tx, tid, gen, child, busy, pending, info) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone(), self.info.clone());
         std::thread::spawn(move || {
             let mut known = String::new();
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                if v["type"] == "control_response" {
+                    let id = v["response"]["request_id"].as_str().map(String::from);
+                    if id.as_deref() == Some("init") { *info.lock().unwrap() = v["response"]["response"].clone(); continue; }
+                    route(&pending, id, &v["response"]);
+                    continue;
+                }
                 if let Some(s) = v["session_id"].as_str() {
                     if s != known { known = s.to_string(); let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: known.clone() }); }
                 }
@@ -127,6 +184,8 @@ impl Agent {
             let why = last.lock().unwrap().clone();
             let _ = tx.send(Ev::Exited { tid, gen, why });
         });
+        // ask for the commands and models once, right away
+        put(&self.stdin, &json!({"type": "control_request", "request_id": "init", "request": {"subtype": "initialize"}}))?;
         Ok(())
     }
 
@@ -136,11 +195,12 @@ impl Agent {
         if !self.spec.prompt.is_empty() { args.push("--append-system-prompt".into()); args.push(self.spec.prompt.clone()); }
         let (out, last) = self.spawn(args)?;
         let _ = self.tx.send(Ev::Session { tid: self.spec.tid.clone(), gen: self.spec.gen, id: sid });
-        let (tx, tid, gen, child, busy) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone());
+        let (tx, tid, gen, child, busy, pending) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone());
         std::thread::spawn(move || {
             let mut last_text: Option<String> = None;
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                if v["type"] == "response" && route(&pending, v["id"].as_str().map(String::from), &v) { continue; }
                 match v["type"].as_str() {
                     Some("message_update") => {
                         let e = &v["assistantMessageEvent"];
@@ -170,20 +230,96 @@ impl Agent {
         Ok(())
     }
 
+    /// codex: one `codex app-server` per session, kept running; each message is a turn on the same thread.
+    fn start_codex(&mut self) -> Result<(), String> {
+        let (out, last) = self.spawn(vec!["app-server".into()])?;
+        let (tx, tid, gen, child, busy, pending) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone());
+        let (stdin, queue, thread, turn, model) = (self.stdin.clone(), self.queue.clone(), self.thread.clone(), self.turn.clone(), self.model.clone());
+        std::thread::spawn(move || {
+            let (mut reply, mut error): (String, Option<String>) = (String::new(), None);
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                let method = v["method"].as_str().unwrap_or("");
+                if method.is_empty() {
+                    route(&pending, v["id"].as_str().map(String::from).or(v["id"].as_u64().map(|n| n.to_string())), &v);
+                    continue;
+                }
+                if !v["id"].is_null() {
+                    // a request from codex (approvals): we run without approvals, so say yes; anything else, decline
+                    let res = if method.ends_with("requestApproval") { json!({"id": v["id"], "result": {"decision": "accept"}}) }
+                              else if method == "execCommandApproval" || method == "applyPatchApproval" { json!({"id": v["id"], "result": {"decision": "approved"}}) }
+                              else { json!({"id": v["id"], "error": {"code": -32601, "message": "exterior 不处理这个请求"}}) };
+                    let _ = put(&stdin, &res);
+                    continue;
+                }
+                let p = &v["params"];
+                match method {
+                    "thread/started" => {
+                        if let Some(t) = p["thread"]["id"].as_str() {
+                            *thread.lock().unwrap() = Some(t.to_string());
+                            let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: t.to_string() });
+                        }
+                    }
+                    "turn/started" => { *turn.lock().unwrap() = p["turn"]["id"].as_str().map(String::from); }
+                    "item/agentMessage/delta" => {
+                        let d = p["delta"].as_str().unwrap_or("");
+                        reply.push_str(d);
+                        let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() });
+                    }
+                    "item/completed" if p["item"]["type"] == "agentMessage" => {
+                        if !reply.is_empty() && !reply.ends_with("\n\n") { reply.push_str("\n\n"); let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
+                    }
+                    "error" if p["willRetry"] != true => { error = p["error"]["message"].as_str().map(String::from).or(Some("codex 出错了".into())); }
+                    "turn/completed" => {
+                        *turn.lock().unwrap() = None;
+                        let st = p["turn"]["status"].as_str().unwrap_or("");
+                        if st == "failed" && error.is_none() { error = Some(p["turn"]["error"]["message"].as_str().unwrap_or("codex 出错了").to_string()); }
+                        let text = reply.trim().to_string();
+                        let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: if text.is_empty() { None } else { Some(text) }, stopped: st == "interrupted", error: error.take() });
+                        reply.clear();
+                        // the next waiting message, if any
+                        let next = { let mut q = queue.lock().unwrap(); if q.is_empty() { None } else { Some(q.remove(0)) } };
+                        match (next, thread.lock().unwrap().clone()) {
+                            (Some(t), Some(th)) => { let _ = put(&stdin, &codex_turn(&th, &t, model.lock().unwrap().clone())); }
+                            _ => { *busy.lock().unwrap() = false; }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(mut c) = child.lock().unwrap().take() { let _ = c.wait(); }
+            let why = last.lock().unwrap().clone();
+            let _ = tx.send(Ev::Exited { tid, gen, why });
+        });
+        self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": {"clientInfo": {"name": "exterior", "version": env!("CARGO_PKG_VERSION")}}}))?;
+        put(&self.stdin, &json!({"jsonrpc": "2.0", "method": "initialized"}))?;
+        let common = json!({"cwd": self.spec.dir, "developerInstructions": self.spec.prompt, "approvalPolicy": "never", "sandbox": "danger-full-access"});
+        let (method, mut params) = match &self.spec.resume { Some(t) => ("thread/resume", json!({"threadId": t})), None => ("thread/start", json!({})) };
+        for (k, v) in common.as_object().unwrap() { params[k] = v.clone(); }
+        let r = self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
+        if let Some(e) = r["error"]["message"].as_str() { return Err(format!("codex：{e}")); }
+        if let Some(t) = r["result"]["thread"]["id"].as_str() {
+            let new = self.thread.lock().unwrap().as_deref() != Some(t);
+            *self.thread.lock().unwrap() = Some(t.to_string());
+            if new { let _ = self.tx.send(Ev::Session { tid: self.spec.tid.clone(), gen: self.spec.gen, id: t.to_string() }); }
+        }
+        Ok(())
+    }
+
     /// Hand one message (or one of the agent's own slash commands) to the agent.
     pub fn say(&mut self, text: &str) -> Result<(), String> {
         let was_busy = { let mut b = self.busy.lock().unwrap(); let w = *b; *b = true; w };
         match self.kind {
-            Kind::Claude => self.write(json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}})),
+            Kind::Claude => put(&self.stdin, &json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}})),
             Kind::Pi => {
                 let mut m = json!({"type": "prompt", "message": text});
                 if was_busy { m["streamingBehavior"] = json!("followUp"); }
-                self.write(m)
+                put(&self.stdin, &m)
             }
             Kind::Codex => {
                 if was_busy { self.queue.lock().unwrap().push(text.to_string()); return Ok(()); }
-                self.codex_turn(text.to_string());
-                Ok(())
+                let th = self.thread.lock().unwrap().clone().ok_or("codex 还没准备好")?;
+                put(&self.stdin, &codex_turn(&th, text, self.model.lock().unwrap().clone()))
             }
         }
     }
@@ -191,78 +327,93 @@ impl Agent {
     /// Esc.
     pub fn stop(&mut self) {
         match self.kind {
-            Kind::Claude => { let _ = self.write(json!({"type": "control_request", "request_id": "stop", "request": {"subtype": "interrupt"}})); }
-            Kind::Pi => { let _ = self.write(json!({"type": "abort"})); }
-            Kind::Codex => { self.queue.lock().unwrap().clear(); if let Some(c) = self.child.lock().unwrap().as_mut() { let _ = c.kill(); } }
+            Kind::Claude => { let _ = put(&self.stdin, &json!({"type": "control_request", "request_id": "stop", "request": {"subtype": "interrupt"}})); }
+            Kind::Pi => { let _ = put(&self.stdin, &json!({"type": "abort"})); }
+            Kind::Codex => {
+                self.queue.lock().unwrap().clear();
+                let (th, tu) = (self.thread.lock().unwrap().clone(), self.turn.lock().unwrap().clone());
+                if let (Some(th), Some(tu)) = (th, tu) { let _ = put(&self.stdin, &json!({"jsonrpc": "2.0", "id": "stop", "method": "turn/interrupt", "params": {"threadId": th, "turnId": tu}})); }
+            }
         }
     }
 
     pub fn kill(&mut self) {
-        self.stdin = None;
+        *self.stdin.lock().unwrap() = None;
         if let Some(c) = self.child.lock().unwrap().as_mut() { let _ = c.kill(); }
     }
 
-    fn write(&mut self, v: Value) -> Result<(), String> {
-        let s = self.stdin.as_mut().ok_or("agent 没在运行")?;
-        writeln!(s, "{v}").and_then(|_| s.flush()).map_err(|e| e.to_string())
+}
+
+impl Ctl {
+    /// Send a request and wait for its answer (up to 30 s). `make` puts the id into the request.
+    pub fn ask(&self, make: impl FnOnce(&str) -> Value) -> Result<Value, String> {
+        let id = format!("x{}", self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1);
+        let (w, r) = std::sync::mpsc::channel();
+        self.pending.lock().unwrap().insert(id.clone(), w);
+        let v = make(&id);
+        if let Err(e) = put(&self.stdin, &v) { self.pending.lock().unwrap().remove(&id); return Err(e); }
+        r.recv_timeout(std::time::Duration::from_secs(30)).map_err(|_| { self.pending.lock().unwrap().remove(&id); "agent 没有回应".to_string() })
     }
 
-    /// codex: one `<command> exec --json [resume <thread>] <text>` per turn; messages that arrive meanwhile follow in order.
-    fn codex_turn(&self, text: String) {
-        let (tx, spec) = (self.tx.clone(), self.spec.clone());
-        let (child_slot, busy, queue, thread) = (self.child.clone(), self.busy.clone(), self.queue.clone(), self.codex_thread.clone());
-        std::thread::spawn(move || {
-            let (tid, gen) = (spec.tid.clone(), spec.gen);
-            let mut text = text;
-            loop {
-                let mut args: Vec<String> = ["exec", "--json", "--skip-git-repo-check"].map(String::from).to_vec();
-                if !spec.prompt.is_empty() { args.push("-c".into()); args.push(format!("developer_instructions={}", serde_json::to_string(&spec.prompt).unwrap_or_default())); }
-                if let Some(t) = thread.lock().unwrap().clone() { args.push("resume".into()); args.push(t); }
-                args.push(text.clone());
-                let mut cmd = crate::host::agent(&spec.dev, &spec.dir, &env(&spec), &spec.command, &args);
-                let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).spawn() {
-                    Ok(ch) => ch,
-                    Err(e) => { let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: None, stopped: false, error: Some(e.to_string()) }); break; }
-                };
-                let out = child.stdout.take().unwrap();
-                let last = Arc::new(Mutex::new(String::new()));
-                watch_stderr(child.stderr.take().unwrap(), tx.clone(), tid.clone(), gen, last.clone());
-                *child_slot.lock().unwrap() = Some(child);
-                let (mut reply, mut error) = (String::new(), None);
-                for line in BufReader::new(out).lines().map_while(Result::ok) {
-                    let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-                    match v["type"].as_str() {
-                        Some("thread.started") => {
-                            if let Some(t) = v["thread_id"].as_str() {
-                                *thread.lock().unwrap() = Some(t.to_string());
-                                let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: t.to_string() });
-                            }
-                        }
-                        Some("item.completed") if v["item"]["type"] == "agent_message" => {
-                            let t = v["item"]["text"].as_str().unwrap_or("");
-                            if !reply.is_empty() { reply.push_str("\n\n"); let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
-                            reply.push_str(t);
-                            let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: t.to_string() });
-                        }
-                        Some("turn.failed") | Some("error") => {
-                            let m = v["error"]["message"].as_str().or(v["message"].as_str()).unwrap_or("codex 出错了");
-                            error = Some(m.to_string());
-                        }
-                        _ => {}
-                    }
-                }
-                let ok = { let mut s = child_slot.lock().unwrap(); let st = s.as_mut().and_then(|c| c.wait().ok()); s.take(); st.map(|s| s.success()).unwrap_or(false) };
-                if !ok && error.is_none() && reply.is_empty() {
-                    let e = last.lock().unwrap().trim().to_string();
-                    if !e.is_empty() { error = Some(e.lines().last().unwrap_or("").to_string()); }
-                }
-                let stopped = !ok && error.is_none() && reply.is_empty();
-                let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: if reply.is_empty() { None } else { Some(reply) }, stopped, error });
-                let next = { let mut q = queue.lock().unwrap(); if q.is_empty() { None } else { Some(q.remove(0)) } };
-                match next { Some(t) => text = t, None => { *busy.lock().unwrap() = false; break; } }
+    /// The models this agent can switch to.
+    pub fn models(&self) -> Result<Vec<Choice>, String> {
+        match self.kind {
+            Kind::Claude => {
+                for _ in 0..30 { if !self.info.lock().unwrap().is_null() { break; } std::thread::sleep(std::time::Duration::from_secs(1)); }
+                let info = self.info.lock().unwrap().clone();
+                Ok(info["models"].as_array().into_iter().flatten().filter_map(|m| Some(Choice { value: m["value"].as_str()?.to_string(), label: m["displayName"].as_str().unwrap_or(m["value"].as_str()?).to_string() })).collect())
             }
-        });
+            Kind::Pi => {
+                let r = self.ask(|id| json!({"type": "get_available_models", "id": id}))?;
+                Ok(r["data"]["models"].as_array().into_iter().flatten().filter_map(|m| Some(Choice { value: format!("{}/{}", m["provider"].as_str()?, m["id"].as_str()?), label: m["name"].as_str().unwrap_or(m["id"].as_str()?).to_string() })).collect())
+            }
+            Kind::Codex => {
+                let r = self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "model/list", "params": {}}))?;
+                Ok(r["result"]["data"].as_array().into_iter().flatten().filter(|m| m["hidden"] != true).filter_map(|m| Some(Choice { value: m["model"].as_str().or(m["id"].as_str())?.to_string(), label: m["displayName"].as_str().unwrap_or(m["id"].as_str()?).to_string() })).collect())
+            }
+        }
     }
+
+    pub fn set_model(&self, value: &str) -> Result<(), String> {
+        let r = match self.kind {
+            Kind::Claude => self.ask(|id| json!({"type": "control_request", "request_id": id, "request": {"subtype": "set_model", "model": value}}))?,
+            Kind::Pi => {
+                let (p, m) = value.split_once('/').ok_or("模型要写成 provider/id")?;
+                self.ask(|id| json!({"type": "set_model", "id": id, "provider": p, "modelId": m}))?
+            }
+            Kind::Codex => { *self.model.lock().unwrap() = Some(value.to_string()); return Ok(()); }
+        };
+        if r["subtype"] == "error" || r["success"] == false { return Err(r["error"].as_str().unwrap_or("没换成").to_string()); }
+        Ok(())
+    }
+
+    /// Built-in commands that are not prompts: pi's thinking/compact/new, codex's compact/new.
+    pub fn builtin(&self, name: &str, arg: &str) -> Result<String, String> {
+        let r = match (self.kind, name) {
+            (Kind::Pi, "thinking") => self.ask(|id| json!({"type": "set_thinking_level", "id": id, "level": arg}))?,
+            (Kind::Pi, "compact") => self.ask(|id| json!({"type": "compact", "id": id}))?,
+            (Kind::Pi, "new") => self.ask(|id| json!({"type": "new_session", "id": id}))?,
+            (Kind::Codex, "compact") => {
+                let th = self.thread.lock().unwrap().clone().ok_or("codex 还没准备好")?;
+                self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "thread/compact/start", "params": {"threadId": th}}))?
+            }
+            (Kind::Codex, "new") => {
+                let p = json!({"cwd": self.dir, "developerInstructions": self.prompt, "approvalPolicy": "never", "sandbox": "danger-full-access"});
+                self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "thread/start", "params": p}))?
+            }
+            _ => return Err("没有这个命令".into()),
+        };
+        if r["success"] == false || !r["error"].is_null() {
+            return Err(r["error"]["message"].as_str().or(r["error"].as_str()).unwrap_or("失败了").to_string());
+        }
+        Ok("好了".into())
+    }
+}
+
+fn codex_turn(thread: &str, text: &str, model: Option<String>) -> Value {
+    let mut p = json!({"threadId": thread, "input": [{"type": "text", "text": text}]});
+    if let Some(m) = model { p["model"] = json!(m); }
+    json!({"jsonrpc": "2.0", "id": format!("turn-{}", crate::store::now()), "method": "turn/start", "params": p})
 }
 
 /// One question, one answer: used by the 测试 button on the Agent page.

@@ -24,6 +24,9 @@ const IDLE: Duration = Duration::from_secs(2 * 3600);
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 type Own = Arc<Mutex<HashSet<u64>>>;
 
+/// The last model list shown in each topic, so a button can say "/model 3".
+static CHOICES: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
+
 /// What the 会话 page shows about the running side (the rest is in the notes).
 pub static LIVE: Mutex<Option<Sessions>> = Mutex::new(None);
 
@@ -35,9 +38,20 @@ pub fn running(tid: &str) -> Option<(bool, bool)> {
 
 fn set_status(tid: &str, st: &str) { store::note_set(tid, "status", json!(st)); store::note_set(tid, "active", json!(store::now())); }
 
-fn send(own: &Own, sessions: &Sessions, chat: &str, text: &str) -> Option<u64> {
+fn send(own: &Own, sessions: &Sessions, chat: &str, text: &str) -> Option<u64> { send_with(own, sessions, chat, text, None) }
+
+/// Buttons: rows of (label, what pressing it says).
+fn buttons(rows: Vec<Vec<(String, String)>>) -> Value {
+    Value::Array(rows.into_iter().map(|r| Value::Array(r.into_iter().map(|(t, d)| json!({"text": t, "data": d})).collect())).collect())
+}
+
+fn in_rows(items: Vec<(String, String)>, per: usize) -> Vec<Vec<(String, String)>> { items.chunks(per).map(|c| c.to_vec()).collect() }
+
+fn send_with(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Option<Value>) -> Option<u64> {
     for _ in 0..3 {
-        match brief::post("/api/send", json!({"chat": chat, "text": brief::clip(text)})) {
+        let mut body = json!({"chat": chat, "text": brief::clip(text)});
+        if let Some(b) = &btns { body["buttons"] = b.clone(); }
+        match brief::post("/api/send", body) {
             Ok(v) => { let id = v["id"].as_u64(); if let Some(i) = id { own.lock().unwrap().insert(i); } return id; }
             Err((410, _)) => { gone(sessions, chat); return None; }
             Err((c, v)) if c == 0 || c >= 500 => { store::log(&format!("send {chat}: {c} {v}; retry")); std::thread::sleep(Duration::from_secs(3)); }
@@ -147,15 +161,22 @@ fn start_agent(s: &mut Session, tx: &Sender<Ev>) -> Result<(), String> {
     Ok(())
 }
 
-/// The "/" menu: exterior's two commands, then each agent's own commands with its prefix (cc_ claude, pi_ pi).
+/// The "/" menu: exterior's commands, the built-ins, then each agent's own commands with its prefix (cc_ claude, pi_ pi).
 pub fn build_menu() -> Result<usize, String> {
     let dev = store::default_device().ok_or("还没有设备")?;
     let mut cmds = vec![
         json!({"command": "stop", "description": "停下当前这一轮（Esc）"}),
-        json!({"command": "agent", "description": "切换 agent，例如 /agent cc3"}),
+        json!({"command": "exit", "description": "结束这个会话，下一条消息开新的"}),
+        json!({"command": "agent", "description": "切换 agent"}),
+        json!({"command": "model", "description": "换模型"}),
+        json!({"command": "pi_thinking", "description": "Pi · 思考强度"}),
+        json!({"command": "pi_compact", "description": "Pi · 压缩上下文"}),
+        json!({"command": "pi_new", "description": "Pi · 开新会话"}),
+        json!({"command": "cx_compact", "description": "Codex · 压缩上下文"}),
+        json!({"command": "cx_new", "description": "Codex · 开新会话"}),
     ];
     let mut map = serde_json::Map::new();
-    let mut used: HashSet<String> = ["stop", "agent"].iter().map(|s| s.to_string()).collect();
+    let mut used: HashSet<String> = cmds.iter().filter_map(|c| c["command"].as_str().map(String::from)).collect();
     let root = dev["root"].as_str().unwrap_or("/").to_string();
     for (kind, prefix) in [(Kind::Claude, "cc"), (Kind::Pi, "pi")] {
         let Some(row) = dev["agents"].as_array().into_iter().flatten().find(|a| a["kind"] == kind.name()) else { continue };
@@ -347,7 +368,9 @@ fn agent_names(dev: &str) -> String {
 
 fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, text: &str) {
     let mut reply: Option<String> = None;
+    let mut reply_buttons: Option<Value> = None;
     let mut transfer: Option<String> = None;
+    let mut ctl: Option<(agents::Ctl, String, String)> = None;
     {
         let mut ss = sessions.lock().unwrap();
         let Some(s) = ss.get_mut(chat) else { return };
@@ -360,10 +383,32 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, text: &st
         let dev = store::device(&s.dev);
         let cur_kind = dev.as_ref().and_then(|d| store::agent(d, &cur)).and_then(|r| Kind::parse(r["kind"].as_str().unwrap_or("")));
         let mut say: Option<String> = None;
-        if t == "/stop" || t.starts_with("/stop ") {
+        let head = t.split_whitespace().next().unwrap_or("");
+        let arg = t[head.len()..].trim().to_string();
+        if head == "/exit" {
+            if let Some(a) = s.agent.as_mut() { a.stop(); a.kill(); }
+            s.agent = None; s.gen += 1; s.pending = false;
+            store::note_set(chat, "session", Value::Null);
+            store::note_set(chat, "resolved", Value::Null);
+            store::note_set(chat, "from", Value::Null);
+            set_status(chat, "未启动");
+            reply = Some(format!("已退出。下一条消息会开一个新的 {cur} 会话。"));
+        } else if matches!(head, "/model" | "/pi_thinking" | "/pi_compact" | "/pi_new" | "/cx_compact" | "/cx_new") {
+            let need = match head { "/model" => None, h if h.starts_with("/pi_") => Some(Kind::Pi), _ => Some(Kind::Codex) };
+            if need.is_some() && need != cur_kind {
+                reply = Some(format!("这是 {} 的命令，这个话题现在是 {cur}。", need.map(|k| k.name()).unwrap_or("")));
+            } else {
+                if s.agent.is_none() {
+                    if let Err(e) = start_agent(s, tx) { reply = Some(format!("⚠️ 启动 {cur} 失败：{e}")); }
+                }
+                if let Some(a) = s.agent.as_ref() { ctl = Some((a.ctl(), head.to_string(), arg.clone())); }
+            }
+        } else if t == "/stop" || t.starts_with("/stop ") {
             match s.agent.as_mut() { Some(a) if s.pending => a.stop(), _ => reply = Some("现在没有在运行的任务。".into()) }
         } else if t == "/agent" {
-            reply = Some(format!("现在是 {cur}。可用：{}", agent_names(&s.dev)));
+            reply = Some(format!("现在是 {cur}。换成："));
+            let names: Vec<(String, String)> = agent_names(&s.dev).split('、').filter(|n| !n.is_empty() && *n != cur).map(|n| (n.to_string(), format!("/agent {n}"))).collect();
+            reply_buttons = Some(buttons(in_rows(names, 4)));
         } else if let Some(want) = t.strip_prefix("/agent ") {
             let want = want.trim().to_string();
             match dev.as_ref().and_then(|d| store::agent(d, &want)) {
@@ -411,5 +456,42 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, text: &st
         }
     }
     if transfer.is_some() { send(own, sessions, chat, "正在转移上下文"); }
-    if let Some(r) = reply { send(own, sessions, chat, &r); }
+    if let Some(r) = reply { send_with(own, sessions, chat, &r, reply_buttons); }
+    if let Some((c, head, arg)) = ctl {
+        let (own, sessions, chat) = (own.clone(), sessions.clone(), chat.to_string());
+        std::thread::spawn(move || {
+            let (text, btns) = control(&c, &chat, &head, &arg);
+            send_with(&own, &sessions, &chat, &text, btns);
+        });
+    }
+}
+
+/// /model and the built-in commands, answered without holding the sessions lock.
+fn control(c: &agents::Ctl, chat: &str, head: &str, arg: &str) -> (String, Option<Value>) {
+    match head {
+        "/model" if arg.is_empty() => match c.models() {
+            Err(e) => (format!("⚠️ 拿不到模型列表：{e}"), None),
+            Ok(list) if list.is_empty() => ("这个 agent 没有可选的模型。".into(), None),
+            Ok(list) => {
+                let items: Vec<(String, String)> = list.iter().enumerate().map(|(i, m)| (m.label.clone(), format!("/model {}", i + 1))).collect();
+                CHOICES.lock().unwrap().get_or_insert_with(HashMap::new).insert(chat.to_string(), list.into_iter().map(|m| m.value).collect());
+                ("选一个模型：".into(), Some(buttons(in_rows(items, 2))))
+            }
+        },
+        "/model" => {
+            let value = arg.parse::<usize>().ok().and_then(|i| CHOICES.lock().unwrap().as_ref().and_then(|m| m.get(chat)).and_then(|l| l.get(i.wrapping_sub(1)).cloned())).unwrap_or_else(|| arg.to_string());
+            match c.set_model(&value) { Ok(()) => (format!("已换成 {value}。"), None), Err(e) => (format!("⚠️ 没换成：{e}"), None) }
+        }
+        "/pi_thinking" if arg.is_empty() => {
+            let items = ["off", "minimal", "low", "medium", "high", "xhigh"].iter().map(|l| (l.to_string(), format!("/pi_thinking {l}"))).collect();
+            ("思考强度：".into(), Some(buttons(in_rows(items, 3))))
+        }
+        _ => {
+            let name = head.trim_start_matches("/pi_").trim_start_matches("/cx_");
+            match c.builtin(name, arg) {
+                Ok(_) => (match name { "thinking" => format!("思考强度已设为 {arg}。"), "compact" => "已压缩上下文。".into(), _ => "已开新会话。".into() }, None),
+                Err(e) => (format!("⚠️ {e}"), None),
+            }
+        }
+    }
 }
