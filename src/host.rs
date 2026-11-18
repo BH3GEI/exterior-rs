@@ -71,3 +71,18 @@ pub fn write(dev: &Value, path: &str, body: &str, mode: &str) -> Result<String, 
     run(dev, &format!("mkdir -p {d} && printf '%s' {b} > {p} && chmod {mode} {p}", d = quote(dir), p = quote(path), b = quote(body)), 30)
 }
 
+
+/// Write bytes to a file on the device (through stdin, so any size and any content).
+pub fn write_bytes(dev: &Value, path: &str, data: &[u8]) -> Result<(), String> {
+    let dir = path.rsplit_once('/').map(|x| x.0).unwrap_or("/");
+    let mut c = line(dev, &format!("mkdir -p {d} && cat > {p}", d = quote(dir), p = quote(path)));
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(|e| format!("无法执行：{e}"))?;
+    {
+        use std::io::Write;
+        let mut i = child.stdin.take().unwrap();
+        i.write_all(data).map_err(|e| e.to_string())?;
+    }
+    let out = wait(child, 120)?;
+    if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
+}

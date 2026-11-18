@@ -31,6 +31,18 @@ pub fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, (u1
     if (200..300).contains(&code) { Ok(v) } else { Err((code, v)) }
 }
 
+/// Download a file (e.g. /api/media/<id>) as bytes.
+pub fn download(path: &str) -> Result<Vec<u8>, String> {
+    let (base, key) = conf();
+    let mut c = Command::new("curl");
+    c.args(["-s", "-f", "-m", "180", "-H", "@-"]).arg(format!("{base}{path}"));
+    c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let mut ch = c.spawn().map_err(|e| e.to_string())?;
+    { use std::io::Write; let mut i = ch.stdin.take().unwrap(); let _ = writeln!(i, "Authorization: Bearer {key}"); }
+    let o = ch.wait_with_output().map_err(|e| e.to_string())?;
+    if o.status.success() && !o.stdout.is_empty() { Ok(o.stdout) } else { Err(format!("下载失败（curl {:?}）", o.status.code())) }
+}
+
 pub fn get(path: &str) -> Option<Value> { call("GET", path, None).ok() }
 pub fn post(path: &str, body: Value) -> Result<Value, (u16, Value)> { call("POST", path, Some(&body)) }
 

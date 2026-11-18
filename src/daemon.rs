@@ -356,9 +356,27 @@ fn run(sessions: Sessions) {
             } else if let Some((who, body)) = text.split_once(" → ") {
                 store::append("messages.jsonl", &json!({"time": store::now(), "from": who.trim(), "to": to_name, "text": body.chars().take(500).collect::<String>()}));
             }
+            if from_user && m["media"]["url"].is_string() {
+                text = with_file(&sessions, &chat, id, &m["media"], &text);
+            }
             handle(&sessions, &own, &tx, &chat, &text);
         }
         store::set_state("last_id", json!(last));
+    }
+}
+
+/// Yao sent a picture or a file: put it in the topic's folder and tell the agent where it is.
+fn with_file(sessions: &Sessions, chat: &str, id: u64, media: &Value, text: &str) -> String {
+    let (dev, dir) = { let ss = sessions.lock().unwrap(); match ss.get(chat) { Some(s) => (s.dev.clone(), s.dir.clone()), None => return text.to_string() } };
+    let kind = if media["kind"] == "image" { "图片" } else { "文件" };
+    let name: String = media["name"].as_str().unwrap_or("file").chars().map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c }).collect();
+    let path = format!("{dir}/files/{id}_{name}");
+    let r = store::device(&dev).ok_or("设备不存在".to_string())
+        .and_then(|d| brief::download(media["url"].as_str().unwrap_or("")).and_then(|b| crate::host::write_bytes(&d, &path, &b)));
+    let base = text.trim();
+    match r {
+        Ok(()) => { store::log(&format!("file for {chat}: {path}")); format!("{base}\n\n[Yao 发来一个{kind}：{path}]").trim().to_string() }
+        Err(e) => { store::log(&format!("file for {chat} failed: {e}")); format!("{base}\n\n[Yao 发来一个{kind}，但 exterior 没能取下来：{e}]").trim().to_string() }
     }
 }
 

@@ -19,7 +19,7 @@ pub fn session_text(dev: &Value, name: &str, tid: &str, dir: &str, global: bool)
 
 - 第一条消息如果只是一条恢复会话的命令（如 `cc3 --resume <编号>`、`pi --session <编号>`、`cx3 resume <编号>`），表示 Yao 把这个话题从那个会话换到了你这里：找到那个会话的记录读一下，接着做，不用问他。
 - 开头是「某某 → 」的消息来自另一个会话，不是 Yao。
-- 别的会话、微信和 Telegram 消息：用 brief API {brief}，请求头 `Authorization: Bearer $(cat {root}/.brief-key)`，先看 `GET /api/help?for=all`。给别的会话发话用 `POST /api/send`，文字以「{name} → 」开头。往外给别人发消息只会进草稿，要 Yao 确认。
+- 别的会话、微信和 Telegram 消息：用 brief API {brief}，请求头 `Authorization: Bearer $(cat {root}/.brief-key)`，先看 `GET /api/help?for=all`。给别的会话发话用 `POST /api/send`，文字以「{name} → 」开头。给 Yao 发图片或文件：`POST /api/send_file`，`{{"chat": "{tid}", "name": "图.png", "data": "<base64>", "text": "说明"}}`，图片会直接显示。Yao 发来的图片和文件，exterior 会放进你文件夹的 files/ 里，并在消息末尾写明路径。往外给别人发消息只会进草稿，要 Yao 确认。
 - 关于 Yao 的一切（规矩、机器、项目、工具用法）在 {infra}，用到时先看那一层的 README.md 再翻具体文件，不用提前读。
 - 学到以后还用得上的事（Yao 纠正你的、机器和项目的新事实），直接改 {infra} 里对应的那个文件；新机器、新项目才新建文件，并更新那层的 README.md。不要另起记忆文件，不要自己跑 git，exterior 会提交。
 "#);
