@@ -76,7 +76,39 @@ fn result_cell(r: &Value) -> String {
     format!("{} <span class=\"mute\">{}</span><div class=\"msg\">{}</div>", badge(Some(ok), if ok { "正常" } else { "失败" }), ago(r["time"].as_u64().unwrap_or(0)), esc(r["msg"].as_str().unwrap_or("")))
 }
 
-const JS: &str = r#"<script>document.addEventListener("submit",function(e){var b=e.submitter||e.target.querySelector("button");if(b){b.classList.add("busy");b.dataset.t=b.textContent;var m={"保存":"保存中","测试":"测试中","测试连接":"连接中","删除":"删除中","添加":"添加中","重新生成":"生成中","重新写入":"写入中","立即同步并备份":"同步中","新建":"打开中"};if(m[b.textContent])b.textContent=m[b.textContent];}});window.addEventListener("pageshow",function(){document.querySelectorAll("button.busy").forEach(function(b){b.classList.remove("busy");if(b.dataset.t)b.textContent=b.dataset.t;});});</script>"#;
+const JS: &str = r#"<script>
+(function(){
+  var main=document.querySelector("main");
+  function swapAll(doc){main.classList.add("swap","out");setTimeout(function(){main.innerHTML=doc.querySelector("main").innerHTML;main.classList.remove("out");},180);}
+  function morph(doc){
+    var olds=main.querySelectorAll("[data-k]"),news=doc.querySelectorAll("main [data-k]");
+    if(olds.length!==news.length){swapAll(doc);return;}
+    news.forEach(function(n){var o=main.querySelector('[data-k="'+n.getAttribute("data-k")+'"]');
+      if(!o){return;} if(o.innerHTML!==n.innerHTML){o.innerHTML=n.innerHTML;o.classList.remove("flash");void o.offsetWidth;o.classList.add("flash");}});
+  }
+  function fast(doc){return !!(doc.querySelector(".badge.run"));}
+  var timer=null;
+  function poll(){fetch(location.href,{cache:"no-store"}).then(function(r){return r.text();}).then(function(t){
+    var doc=new DOMParser().parseFromString(t,"text/html");morph(doc);schedule(fast(doc));}).catch(function(){schedule(false);});}
+  function schedule(f){clearTimeout(timer);timer=setTimeout(poll,f?2000:12000);}
+  schedule(!!document.querySelector(".badge.run"));
+  var words={"保存":"保存中","测试":"测试中","测试连接":"连接中","删除":"删除中","添加":"添加中","重新生成":"生成中","重新写入":"写入中","立即同步并备份":"同步中","全部测试":"测试中"};
+  document.addEventListener("submit",function(e){
+    var f=e.target,b=e.submitter||f.querySelector("button");
+    if(f.method.toLowerCase()!=="post")return;
+    e.preventDefault();
+    if(b){b.classList.add("busy");b.dataset.t=b.textContent;if(words[b.textContent])b.textContent=words[b.textContent];}
+    fetch(f.action,{method:"POST",body:new URLSearchParams(new FormData(f)),redirect:"follow"}).then(function(r){
+      var to=new URL(r.url);return r.text().then(function(t){
+        var doc=new DOMParser().parseFromString(t,"text/html");
+        if(to.pathname!==location.pathname){history.pushState(null,"",to.pathname);swapAll(doc);} else {morph(doc);}
+        if(b){b.classList.remove("busy");b.textContent=b.dataset.t;}
+        schedule(fast(doc));});
+    }).catch(function(){if(b){b.classList.remove("busy");b.textContent=b.dataset.t;}});
+  });
+  window.addEventListener("popstate",function(){location.reload();});
+})();
+</script>"#;
 
 const CSS: &str = r#"
 :root{--bg:#f6f6f4;--fg:#1d1d1b;--mute:#6b6b66;--card:#fff;--line:#e3e2dc;--accent:#2f5d50;--ok:#1f7a4d;--bad:#b3261e;--warn:#9a6700}
@@ -94,13 +126,13 @@ textarea{width:100%;min-height:420px;font-family:ui-monospace,Menlo,monospace;fo
 button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:4px 10px}button.primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}button.danger{color:var(--bad)}
 form.inline{display:inline}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}.row label{color:var(--mute);font-size:12px}
 pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;margin:0}code{font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
-@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{50%{opacity:.35}}@keyframes fade{from{opacity:0;transform:translateY(-4px)}to{opacity:1}}button{transition:background .15s,opacity .15s,transform .05s}button:active{transform:scale(.97)}button:hover{filter:brightness(1.06)}button.busy{opacity:.7;pointer-events:none}button.busy::before{content:"";display:inline-block;width:11px;height:11px;margin-right:6px;vertical-align:-1px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite}.badge.run{color:var(--warn);animation:pulse 1.2s ease-in-out infinite}.badge.run::before{content:"";display:inline-block;width:9px;height:9px;margin-right:5px;vertical-align:-1px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite}main{animation:fade .2s ease-out}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{50%{opacity:.35}}@keyframes fade{from{opacity:0;transform:translateY(-4px)}to{opacity:1}}button{transition:background .15s,opacity .15s,transform .05s}button:active{transform:scale(.97)}button:hover{filter:brightness(1.06)}button.busy{opacity:.7;pointer-events:none}button.busy::before{content:"";display:inline-block;width:11px;height:11px;margin-right:6px;vertical-align:-1px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite}.badge.run{color:var(--warn);animation:pulse 1.2s ease-in-out infinite}.badge.run::before{content:"";display:inline-block;width:9px;height:9px;margin-right:5px;vertical-align:-1px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite}main{animation:fade .2s ease-out}@keyframes flash{from{background:color-mix(in srgb,var(--accent) 22%,transparent)}to{background:transparent}}.flash{animation:flash 1.2s ease-out}.swap{transition:opacity .18s}.swap.out{opacity:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
 "#;
 
 fn page(active: &str, title: &str, body: &str, refresh: bool) -> String {
     let tabs = [("/", "会话"), ("/devices", "设备"), ("/memory", "记忆"), ("/messages", "消息记录"), ("/prompt", "启动说明"), ("/settings", "设置"), ("/log", "日志")];
     let nav: String = tabs.iter().map(|(h, t)| format!("<a href=\"{h}\"{}>{t}</a>", if *h == active { " class=\"on\"" } else { "" })).collect();
-    let meta = if refresh { "<meta http-equiv=\"refresh\" content=\"5\">" } else { "" };
+    let meta = if refresh { "<meta name=\"live\" content=\"fast\">" } else { "" };
     format!("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{meta}<title>{} · exterior</title><style>{CSS}</style></head><body><header><b>exterior</b>{nav}</header><main>{body}</main>{JS}</body></html>", esc(title))
 }
 
@@ -124,8 +156,8 @@ fn sessions_page() -> String {
         let err = n["last_error"].as_str().map(|e| format!("<div class=\"msg\">{}</div>", esc(e))).unwrap_or_default();
         let link = format!("https://t.me/c/GROUP_ID/{}", tid.trim_start_matches("tgbot:"));
         rows.push_str(&format!(
-            "<tr><td><a href=\"{link}\">{}</a><div class=\"mute\">{}</div></td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}{}{}{}</td><td>{}</td><td class=\"msg\">{}</td></tr>",
-            esc(n["name"].as_str().unwrap_or("")), esc(tid), esc(n["device"].as_str().unwrap_or("")), esc(&agent),
+            "<tr data-k=\"s:{}\"><td><a href=\"{link}\">{}</a><div class=\"mute\">{}</div></td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}{}{}{}</td><td>{}</td><td class=\"msg\">{}</td></tr>",
+            esc(tid), esc(n["name"].as_str().unwrap_or("")), esc(tid), esc(n["device"].as_str().unwrap_or("")), esc(&agent),
             esc(n["session"].as_str().unwrap_or("—")), if running_now { format!("<span class=\"badge run\">{}</span>", esc(&shown)) } else { badge(cls, &shown) }, if live { " <span class=\"mute\">进程在</span>" } else { "" }, from, err,
             ago(n["active"].as_u64().unwrap_or(0)), esc(n["dir"].as_str().unwrap_or(""))));
     }
@@ -156,15 +188,15 @@ fn devices_page() -> String {
 <div class="row"><button class="primary">保存</button></form>
 <form class="inline" method="post" action="/devices/test"><input type="hidden" name="i" value="{i}"><button>测试连接</button></form>
 <form class="inline" method="post" action="/devices/delete" onsubmit="return confirm('删除设备「{}」？')"><input type="hidden" name="i" value="{i}"><button class="danger">删除</button></form>
-{}</div>"#,
+<span data-k="dev:{}">{}</span></div>"#,
             esc(dn), esc(d["host"].as_str().unwrap_or("")), d["port"].as_u64().unwrap_or(22), esc(d["user"].as_str().unwrap_or("")),
-            if has_pw { "（已加密保存）" } else { "" }, if has_pw { "不改就留空" } else { "" }, esc(d["root"].as_str().unwrap_or("")), esc(dn), result_cell(conn)));
+            if has_pw { "（已加密保存）" } else { "" }, if has_pw { "不改就留空" } else { "" }, esc(d["root"].as_str().unwrap_or("")), esc(dn), esc(dn), result_cell(conn)));
         let sync = &store::state("memory_sync")[dn];
         if !sync.is_null() {
             body.push_str(&format!("<div class=\"row\"><span class=\"mute\">记忆同步：</span>{} <span class=\"mute\">{}</span> <span class=\"msg\">{}</span></div>",
                 badge(Some(sync["ok"] == true), if sync["ok"] == true { "正常" } else { "失败" }), ago(sync["time"].as_u64().unwrap_or(0)), esc(sync["msg"].as_str().unwrap_or(""))));
         }
-        body.push_str(&format!("<h2>Agent{}</h2><table><tr><th>名称</th><th>启动命令</th><th>类型</th><th></th><th>测试结果</th></tr>", if i == 0 { "（第一行是新话题的默认 agent）" } else { "" }));
+        body.push_str(&format!("<h2>Agent{}</h2><div class=\"row\"><form class=\"inline\" method=\"post\" action=\"/agents/testall\"><input type=\"hidden\" name=\"i\" value=\"{i}\"><button>全部测试</button></form><span class=\"mute\">逐个测试这台设备上的所有 agent</span></div><table><tr><th>名称</th><th>启动命令</th><th>类型</th><th></th><th>测试结果</th></tr>", if i == 0 { "（第一行是新话题的默认 agent）" } else { "" }, i = i));
         for (j, a) in d["agents"].as_array().into_iter().flatten().enumerate() {
             let an = a["name"].as_str().unwrap_or("");
             let r = &tests[format!("agent:{dn}:{an}")];
@@ -176,7 +208,7 @@ fn devices_page() -> String {
 <td style="white-space:nowrap"><button>保存</button></form>
 <form class="inline" method="post" action="/agents/test"><input type="hidden" name="i" value="{i}"><input type="hidden" name="j" value="{j}"><button>测试</button></form>
 <form class="inline" method="post" action="/agents/delete"><input type="hidden" name="i" value="{i}"><input type="hidden" name="j" value="{j}"><button class="danger">删除</button></form></td>
-<td>{}</td></tr>"#, esc(an), esc(a["command"].as_str().unwrap_or("")), result_cell(r)));
+<td data-k="a:{}:{}">{}</td></tr>"#, esc(an), esc(a["command"].as_str().unwrap_or("")), esc(dn), esc(an), result_cell(r)));
         }
         body.push_str(&format!(r#"<tr><form method="post" action="/agents/save"><input type="hidden" name="i" value="{i}"><input type="hidden" name="j" value="new">
 <td><input name="name" placeholder="名称" size="8"></td><td><input name="command" placeholder="启动命令" size="22"></td><td><select name="kind"><option value="claude">Claude</option><option value="codex">Codex</option><option value="pi">Pi</option></select></td><td><button>添加</button></td><td></td></form></tr></table></div>"#));
@@ -345,6 +377,22 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
                         agents::test(&d, &dir, a["command"].as_str().unwrap_or(""), Kind::parse(a["kind"].as_str().unwrap_or("")).unwrap_or(Kind::Claude))
                     });
                 }
+            }
+            "/devices".into()
+        }
+        "/agents/testall" => {
+            if let Some(d) = idx(&f, "i").and_then(|i| c["devices"].get(i).cloned()) {
+                let dn = d["name"].as_str().unwrap_or("").to_string();
+                let rows: Vec<Value> = d["agents"].as_array().cloned().unwrap_or_default();
+                for a in &rows { set_test(&format!("agent:{dn}:{}", a["name"].as_str().unwrap_or("")), json!({"running": true, "time": store::now()})); }
+                std::thread::spawn(move || {
+                    let dir = format!("{}/overview", d["root"].as_str().unwrap_or("").trim_end_matches('/'));
+                    for a in rows {
+                        let key = format!("agent:{dn}:{}", a["name"].as_str().unwrap_or(""));
+                        let r = agents::test(&d, &dir, a["command"].as_str().unwrap_or(""), Kind::parse(a["kind"].as_str().unwrap_or("")).unwrap_or(Kind::Claude));
+                        set_test(&key, json!({"ok": r.is_ok(), "time": store::now(), "msg": match r { Ok(s) => s, Err(e) => e }}));
+                    }
+                });
             }
             "/devices".into()
         }
