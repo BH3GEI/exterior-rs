@@ -1,4 +1,4 @@
-//! exterior: Yao's Telegram topics ↔ agents on his devices. Agents read what they need to know about Yao from agent-infra.
+//! exterior: Yao's Telegram topics ↔ agents on his devices. Agents read what they need to know about Yao from knowledge.
 mod agents;
 mod brief;
 mod crypt;

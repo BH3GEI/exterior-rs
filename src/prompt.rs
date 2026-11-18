@@ -1,11 +1,11 @@
 //! What exterior tells an agent when it starts it. Passed on the command line (claude and pi:
 //! --append-system-prompt; codex: -c developer_instructions), so nothing is written into the folders.
-//! Everything about Yao lives in agent-infra; the agent looks things up there when it needs them.
+//! Everything about Yao lives in knowledge; the agent looks things up there when it needs them.
 use serde_json::Value;
 
-/// Where agent-infra lives on a device.
+/// Where knowledge lives on a device.
 pub fn infra(dev: &Value) -> String {
-    dev["infra"].as_str().filter(|s| !s.is_empty()).unwrap_or("/Users/you/Desktop/agent-infra").trim_end_matches('/').to_string()
+    dev["infra"].as_str().filter(|s| !s.is_empty()).map(String::from).unwrap_or_else(|| format!("{}/knowledge", root(dev))).trim_end_matches('/').to_string()
 }
 
 pub fn root(dev: &Value) -> String { dev["root"].as_str().unwrap_or("").trim_end_matches('/').to_string() }

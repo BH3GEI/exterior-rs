@@ -236,7 +236,7 @@ fn memory_page() -> String {
             } else { rows.push_str(&format!("<div class=\"msg\">{}</div>", esc(l))); }
         }
         let r = &store::state("tests")[format!("revert:{dn}")];
-        body.push_str(&format!(r#"<h2>{}：{}</h2><div class="card"><div class="row mute">关于 Yao 的知识只放这一处（GitHub：BH3GEI/agent-infra）。agent 用到时自己查；学到新东西直接改对应文件，exterior 每轮结束自动提交并推送。</div><div class="row">最近一次：{}</div><div class="row"><form class="inline" method="post" action="/infra/test"><input type="hidden" name="d" value="{}"><button>测试推送</button></form>{}</div></div>
+        body.push_str(&format!(r#"<h2>{}：{}</h2><div class="card"><div class="row mute">关于 Yao 的知识只放这一处（GitHub：BH3GEI/exterior-knowledge）。agent 用到时自己查；学到新东西直接改对应文件，exterior 每轮结束自动提交并推送。</div><div class="row">最近一次：{}</div><div class="row"><form class="inline" method="post" action="/infra/test"><input type="hidden" name="d" value="{}"><button>测试推送</button></form>{}</div></div>
 <h2>最近的修改</h2><div class="card">{}<div class="row">{}</div></div><h2>文件</h2><div class="card"><pre>{}</pre></div>"#,
             esc(&dn), esc(&p), status, esc(&dn), result_cell(&store::state("tests")[format!("infra:{dn}")]), if rows.is_empty() { "<div class=\"mute\">没有记录</div>".into() } else { rows }, result_cell(r), esc(&tree)));
     }
@@ -255,7 +255,7 @@ fn messages_page() -> String {
 }
 
 fn prompt_page() -> String {
-    let mut body = String::from("<h2>启动说明</h2><p class=\"mute\">exterior 启动 agent 时，把下面这段直接交给它（claude 和 pi 用 --append-system-prompt，codex 用 developer_instructions），不往文件夹里写文件。话题名、文件夹按实际话题填。各工具自己的全局说明只剩红线和 agent-infra 的位置。</p>");
+    let mut body = String::from("<h2>启动说明</h2><p class=\"mute\">exterior 启动 agent 时，把下面这段直接交给它（claude 和 pi 用 --append-system-prompt，codex 用 developer_instructions），不往文件夹里写文件。话题名、文件夹按实际话题填。各工具自己的全局说明只剩红线和 knowledge 的位置。</p>");
     for d in store::devices() {
         let root = crate::prompt::root(&d);
         let r = &store::state("tests")[format!("prompt:{}", d["name"].as_str().unwrap_or(""))];

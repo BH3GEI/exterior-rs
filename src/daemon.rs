@@ -96,7 +96,7 @@ fn dir_for(dev: &str, tid: &str, name: &str) -> String {
     if name.trim() == "全局" { return format!("{root}/overview"); }
     let taken: Vec<String> = store::notes().iter().filter(|n| n["topic"] != tid).filter_map(|n| n["dir"].as_str().map(String::from)).collect();
     let mut d = format!("{root}/{}", safe(name));
-    if taken.contains(&d) || name.trim() == "overview" { d = format!("{d}-{}", tid.trim_start_matches("tgbot:")); }
+    if taken.contains(&d) || name.trim() == "overview" || name.trim() == "knowledge" { d = format!("{d}-{}", tid.trim_start_matches("tgbot:")); }
     d
 }
 
