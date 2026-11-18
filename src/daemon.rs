@@ -293,6 +293,15 @@ fn run(sessions: Sessions) {
         std::thread::sleep(Duration::from_secs(15));
     }
     store::log("exterior started");
+    // nothing runs right after a restart: a topic still marked running had its turn cut off
+    for n in store::notes() {
+        let tid = n["topic"].as_str().unwrap_or("").to_string();
+        if matches!(n["status"].as_str(), Some("运行中") | Some("转移中")) && !tid.is_empty() {
+            store::note_set(&tid, "status", json!("出错"));
+            store::note_set(&tid, "last_error", json!("exterior 重启时这一轮还没答完；再发一次就好"));
+            store::log(&format!("{}: turn cut off by restart", n["name"]));
+        }
+    }
     let own: Own = Arc::new(Mutex::new(HashSet::new()));
     let (tx, rx) = channel();
     { let (s, o) = (sessions.clone(), own.clone()); std::thread::spawn(move || output(rx, s, o)); }
