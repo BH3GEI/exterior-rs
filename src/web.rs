@@ -1,6 +1,6 @@
 //! The interface. Every page shows real state read from where it lives; nothing is written in by hand.
 use crate::agents::{self, Kind};
-use crate::{brief, crypt, daemon, memory, store};
+use crate::{brief, crypt, daemon, store};
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 use tiny_http::{Header, Request, Response, Server};
@@ -191,11 +191,6 @@ fn devices_page() -> String {
 <span data-k="dev:{}">{}</span></div>"#,
             esc(dn), esc(d["host"].as_str().unwrap_or("")), d["port"].as_u64().unwrap_or(22), esc(d["user"].as_str().unwrap_or("")),
             if has_pw { "（已加密保存）" } else { "" }, if has_pw { "不改就留空" } else { "" }, esc(d["root"].as_str().unwrap_or("")), esc(dn), esc(dn), result_cell(conn)));
-        let sync = &store::state("memory_sync")[dn];
-        if !sync.is_null() {
-            body.push_str(&format!("<div class=\"row\"><span class=\"mute\">记忆同步：</span>{} <span class=\"mute\">{}</span> <span class=\"msg\">{}</span></div>",
-                badge(Some(sync["ok"] == true), if sync["ok"] == true { "正常" } else { "失败" }), ago(sync["time"].as_u64().unwrap_or(0)), esc(sync["msg"].as_str().unwrap_or(""))));
-        }
         body.push_str(&format!("<h2>Agent{}</h2><div class=\"row\"><form class=\"inline\" method=\"post\" action=\"/agents/testall\"><input type=\"hidden\" name=\"i\" value=\"{i}\"><button>全部测试</button></form><span class=\"mute\">逐个测试这台设备上的所有 agent</span></div><table><tr><th>名称</th><th>启动命令</th><th>类型</th><th></th><th>测试结果</th></tr>", if i == 0 { "（第一行是新话题的默认 agent）" } else { "" }, i = i));
         for (j, a) in d["agents"].as_array().into_iter().flatten().enumerate() {
             let an = a["name"].as_str().unwrap_or("");
@@ -222,39 +217,19 @@ fn devices_page() -> String {
 }
 
 fn memory_page() -> String {
-    let files = memory::files();
-    let rows: String = files.iter().map(|(n, len, d)| format!("<tr><td><a href=\"/memory/edit?f={}\">{}</a></td><td class=\"mute\">{} 字节</td><td class=\"msg\">{}</td></tr>", esc(&enc(n)), esc(n), len, esc(d))).collect();
-    let mut sync = String::new();
-    let st = store::state("memory_sync");
-    for (k, v) in st.as_object().into_iter().flatten() {
-        sync.push_str(&format!("<div class=\"row\">{}：{} <span class=\"mute\">{}</span> <span class=\"msg\">{}</span></div>", esc(k), badge(Some(v["ok"] == true), if v["ok"] == true { "正常" } else { "失败" }), ago(v["time"].as_u64().unwrap_or(0)), esc(v["msg"].as_str().unwrap_or(""))));
+    let mut body = String::new();
+    for d in store::devices() {
+        let p = crate::prompt::infra(&d);
+        let script = format!("cd {} 2>/dev/null || {{ echo '没有这个目录'; exit 0; }}; git log -1 --date=format:'%m-%d %H:%M' --pretty='最后更新 %ad  %s' 2>/dev/null; echo; find . -name '*.md' -not -path './.git/*' -not -path './archive/*' | sed 's#^./##' | sort", crate::host::quote(&p));
+        let out = crate::host::run(&d, &script, 30).unwrap_or_else(|e| format!("读不到：{e}"));
+        body.push_str(&format!(r#"<h2>{}：{}</h2><div class="card"><div class="row mute">agent 开工先读 rules/，其他按需查。各 agent 自带的记忆已关闭，关于 Yao 的知识只放这一处，GitHub 仓库 BH3GEI/agent-infra。</div><pre>{}</pre></div>"#,
+            esc(d["name"].as_str().unwrap_or("")), esc(&p), esc(&out)));
     }
-    let b = &store::state("backup")["github"];
-    let backup = if store::config()["github"]["remote"].as_str().unwrap_or("").is_empty() { "<span class=\"mute\">未设置（在「设置」里填 GitHub 仓库）</span>".to_string() }
-        else if b.is_null() { "<span class=\"mute\">还没有备份过</span>".into() }
-        else { format!("{} <span class=\"mute\">{}</span> <span class=\"msg\">{}</span>", badge(Some(b["ok"] == true), if b["ok"] == true { "正常" } else { "失败" }), ago(b["time"].as_u64().unwrap_or(0)), esc(b["msg"].as_str().unwrap_or(""))) };
-    let log: String = memory::log_lines(15).iter().map(|l| format!("{}\n", esc(l))).collect();
-    let body = format!(r#"<h2>关于 Yao 的记忆</h2><div class="card"><table><tr><th>文件</th><th>大小</th><th>说明</th></tr>{}</table>
-<div class="row"><form class="inline" method="get" action="/memory/edit"><input name="f" placeholder="新文件名.md"><button>新建</button></form></div></div>
-<h2>同步</h2><div class="card">{}<div class="row">GitHub 备份：{backup}</div><div class="row"><form method="post" action="/memory/sync"><button>立即同步并备份</button></form></div></div>
-<h2>最近的修改</h2><div class="card"><pre>{}</pre></div>"#,
-        if rows.is_empty() { "<tr><td colspan=3 class=\"mute\">还没有记忆。</td></tr>".into() } else { rows },
-        if sync.is_empty() { "<div class=\"mute\">还没有同步过。</div>".into() } else { sync }, if log.is_empty() { "—".into() } else { log });
+    if body.is_empty() { body = "<p class=\"mute\">还没有设备。</p>".into(); }
     page("/memory", "记忆", &body, false)
 }
 
-fn enc(s: &str) -> String {
-    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
-}
 
-fn memory_edit(f: &str) -> String {
-    let Some(n) = memory::safe_name(f) else { return page("/memory", "记忆", "<p>文件名不合法。</p>", false) };
-    let body = format!(r#"<h2>{}</h2><div class="card"><form method="post" action="/memory/save"><input type="hidden" name="f" value="{}"><textarea name="body">{}</textarea>
-<div class="row"><button class="primary">保存</button> <a href="/memory">返回</a></div></form>
-<form method="post" action="/memory/delete" onsubmit="return confirm('删除 {}？')"><input type="hidden" name="f" value="{}"><button class="danger">删除</button></form></div>"#,
-        esc(&n), esc(&n), esc(&memory::read(&n)), esc(&n), esc(&n));
-    page("/memory", &n, &body, false)
-}
 
 fn messages_page() -> String {
     let mut rows: Vec<String> = store::tail("messages.jsonl", 200).iter().rev().filter_map(|l| serde_json::from_str::<Value>(l).ok()).map(|m| {
@@ -286,13 +261,10 @@ fn settings_page() -> String {
     let body = format!(r#"<h2>brief</h2><div class="card"><form method="post" action="/settings/save">
 <div class="grid"><div><label class="mute">brief 地址</label><br><input name="brief_url" value="{}" size="34"></div><div><label class="mute">brief 密钥{}</label><br><input name="brief_key" type="password" placeholder="{}" autocomplete="new-password"></div></div>
 <div class="row"><button class="primary">保存</button></div></form><div class="row">状态：{} <span class="mute">{}</span></div>
-<div class="row">「/」命令菜单：{} 条 agent 命令，更新于 {} <form class="inline" method="post" action="/settings/menu"><button>重新生成</button></form> {}</div></div>
-<h2>GitHub 备份</h2><div class="card"><form method="post" action="/settings/save"><div class="row"><label>仓库</label><input name="github" value="{}" size="46" placeholder="git@github.com:用户/仓库.git"><button class="primary">保存</button></div></form>
-<div class="row"><label>部署公钥（加到仓库的 Deploy keys，勾选可写）</label></div><pre>{}</pre></div>"#,
+<div class="row">「/」命令菜单：{} 条 agent 命令，更新于 {} <form class="inline" method="post" action="/settings/menu"><button>重新生成</button></form> {}</div></div>"#,
         esc(c["brief"]["url"].as_str().unwrap_or("")), if has_key { "（已加密保存）" } else { "" }, if has_key { "不改就留空" } else { "" },
         badge(Some(tg["ok"] == true), tg["msg"].as_str().unwrap_or("未知")), ago(tg["time"].as_u64().unwrap_or(0)),
-        menu_n, ago(store::state("menu_time").as_u64().unwrap_or(0)), result_cell(r),
-        esc(c["github"]["remote"].as_str().unwrap_or("")), esc(&memory::github_public_key()));
+        menu_n, ago(store::state("menu_time").as_u64().unwrap_or(0)), result_cell(r));
     page("/settings", "设置", &body, r["running"] == true)
 }
 
@@ -396,9 +368,6 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
             }
             "/devices".into()
         }
-        "/memory/save" => { let _ = memory::write(&g("f"), Some(f.get("body").map(|s| s.as_str()).unwrap_or(""))); "/memory".into() }
-        "/memory/delete" => { let _ = memory::write(&g("f"), None); "/memory".into() }
-        "/memory/sync" => { std::thread::spawn(|| memory::sync(None, "手动同步")); "/memory".into() }
         "/prompt/install" => {
             if let Some(d) = store::device(&g("d")) {
                 background(format!("prompt:{}", g("d")), move || crate::prompt::install(&d).map(|_| "已写入".to_string()));
@@ -410,7 +379,6 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
                 c["brief"]["url"] = json!(g("brief_url").trim_end_matches('/'));
                 if !g("brief_key").is_empty() { c["brief"]["key"] = json!(crypt::seal(&g("brief_key"))); }
             }
-            if f.contains_key("github") { c["github"]["remote"] = json!(g("github")); }
             store::set_config(&c);
             "/settings".into()
         }
@@ -421,7 +389,7 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
 
 fn respond(mut req: Request) {
     let url = req.url().to_string();
-    let (path, query) = url.split_once('?').unwrap_or((&url, ""));
+    let (path, _query) = url.split_once('?').unwrap_or((&url, ""));
     let path = path.to_string();
     let html = Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
     if req.method() == &tiny_http::Method::Post {
@@ -431,12 +399,10 @@ fn respond(mut req: Request) {
         let _ = req.respond(Response::empty(303).with_header(Header::from_bytes("Location", to.as_bytes()).unwrap()));
         return;
     }
-    let q = form(query);
     let out = match path.as_str() {
         "/" => sessions_page(),
         "/devices" => devices_page(),
         "/memory" => memory_page(),
-        "/memory/edit" => memory_edit(q.get("f").map(|s| s.as_str()).unwrap_or("")),
         "/messages" => messages_page(),
         "/prompt" => prompt_page(),
         "/settings" => settings_page(),

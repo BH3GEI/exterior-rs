@@ -5,10 +5,11 @@ use serde_json::Value;
 
 pub fn root_text(dev: &Value) -> String {
     let root = dev["root"].as_str().unwrap_or("").trim_end_matches('/');
+    let infra = infra(dev);
     let brief = crate::store::config()["brief"]["url"].as_str().unwrap_or("").trim_end_matches('/').to_string();
     format!(r#"# exterior
 
-你运行在 exterior 里。exterior 是 Yao 的外装：它把你接到 Telegram 群里的一个话题上，替你保管关于 Yao 的记忆，不替你做判断。
+你运行在 exterior 里。exterior 是 Yao 的外装：它把你接到 Telegram 群里的一个话题上，不替你做判断。
 
 - 一个话题就是一个会话。话题名就是你的名字（环境变量 `EXTERIOR_SESSION`，当前目录的 AGENTS.md 里也写着）。Yao 在话题里对你说话，你的回答会直接出现在话题里。他多半在手机上看，回答要短、直接。
 - 你的启动目录就是这个话题的文件夹：{root}/<话题名>/。和这件事有关的文件都放在这里。
@@ -29,40 +30,17 @@ pub fn root_text(dev: &Value) -> String {
 
 ## 关于 Yao
 
-下面是关于 Yao 的记忆索引（{root}/memory/MEMORY.md）。Claude 会自动读到；其他 agent 开始工作前先读一遍这个文件。
+关于 Yao 的知识只有一处：{infra}（GitHub：BH3GEI/agent-infra），严格树形，每个文件夹有 README.md 目录。
 
-@memory/MEMORY.md
-
-## Memory
-
-You have a persistent file-based memory in two places:
-
-- **About Yao** (`user`, `feedback`): `{root}/memory/`. Shared by every session and every agent; exterior keeps it in sync.
-- **About this work** (`project`, `reference`): a `memory/` folder inside your own working directory (create it if missing).
-
-Write to these directories directly. Each memory is one file holding one fact, with frontmatter:
-
-```markdown
----
-name: <short-kebab-case-slug>
-description: <one-line summary, used to decide relevance during recall>
-metadata:
-  type: user | feedback | project | reference
----
-
-<the fact; for feedback/project, follow with **Why:** and **How to apply:** lines. Link related memories with [[their-name]].>
-```
-
-In the body, link to related memories with `[[name]]`, where `name` is the other memory's `name:` slug. Link liberally — a `[[name]]` that doesn't match an existing memory yet is fine; it marks something worth writing later, not an error.
-
-`user`: who the user is (role, expertise, preferences). `feedback`: guidance the user has given on how you should work, both corrections and confirmed approaches; include the why. `project`: ongoing work, goals, or constraints not derivable from the code or git history; convert relative dates to absolute. `reference`: pointers to external resources (URLs, dashboards, tickets).
-
-After writing the file, add a one-line pointer in that directory's `MEMORY.md` (`- [Title](file.md) — hook`). `MEMORY.md` is the index — one line per memory, no frontmatter, never put memory content there.
-
-Before saving, check for an existing file that already covers it. Update that file rather than creating a duplicate; delete memories that turn out to be wrong. Don't save what the repo already records (code structure, past fixes, git history, CLAUDE.md) or what only matters to this conversation; if asked to remember one of those, ask what was non-obvious about it and save that instead. Recalled memories reflect what was true when written. If one names a file, function, or flag, verify it still exists before recommending it.
-
-Do not run git in {root}/memory/ yourself; exterior syncs it after each turn.
+- 开工前先读 {infra}/rules/ 下的全部文件（规矩、沟通、红线）。
+- 碰机器前读 {infra}/machines/README.md 和那台机器的文件；做运维读 ops/ 里对应的文件；做某个项目读 projects/ 里那个项目的文件。
+- 不要另起记忆文件或记忆目录。发现值得长期记住的新规矩或事实，告诉 Yao，由他决定写进 agent-infra。
 "#)
+}
+
+/// Where agent-infra lives on a device.
+pub fn infra(dev: &Value) -> String {
+    dev["infra"].as_str().filter(|s| !s.is_empty()).unwrap_or("/Users/you/Desktop/agent-infra").trim_end_matches('/').to_string()
 }
 
 pub fn topic_text(name: &str, tid: &str) -> String {
@@ -75,7 +53,7 @@ pub fn install(dev: &Value) -> Result<(), String> {
     if root.is_empty() { return Err("没有设置根目录".into()); }
     let t = root_text(dev);
     crate::host::write(dev, &format!("{root}/CLAUDE.md"), &t, "644")?;
-    crate::host::write(dev, &format!("{root}/AGENTS.md"), &t.replace("@memory/MEMORY.md", "（见 memory/MEMORY.md）"), "644")?;
+    crate::host::write(dev, &format!("{root}/AGENTS.md"), &t, "644")?;
     let k = crate::brief::key();
     if !k.is_empty() { crate::host::write(dev, &format!("{root}/.brief-key"), &k, "600")?; }
     Ok(())

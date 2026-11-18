@@ -14,11 +14,6 @@ fn ssh_opts() -> Vec<String> {
         .iter().map(|s| s.to_string()).collect()
 }
 
-/// `ssh …` as one string, for GIT_SSH_COMMAND (the password comes from SSHPASS in the environment).
-pub fn git_ssh(dev: &Value) -> String {
-    let port = dev["port"].as_u64().unwrap_or(22);
-    format!("sshpass -e ssh -p {port} {}", ssh_opts().join(" "))
-}
 
 pub fn password(dev: &Value) -> String { dev["password"].as_str().and_then(crate::crypt::open).unwrap_or_default() }
 

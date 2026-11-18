@@ -1,10 +1,9 @@
-//! exterior: Yao's Telegram topics ↔ agents on his devices, with one shared memory about him.
+//! exterior: Yao's Telegram topics ↔ agents on his devices. Agents read what they need to know about Yao from agent-infra.
 mod agents;
 mod brief;
 mod crypt;
 mod daemon;
 mod host;
-mod memory;
 mod prompt;
 mod store;
 mod web;

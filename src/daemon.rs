@@ -1,6 +1,6 @@
 //! Every Telegram topic Yao creates is a session. Messages in → the topic's agent; the agent's answer → the topic.
 use crate::agents::{self, Agent, Ev, Kind, Spec};
-use crate::{brief, memory, store};
+use crate::{brief, store};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -82,7 +82,7 @@ fn dir_for(dev: &str, tid: &str, name: &str) -> String {
     if name.trim() == "全局" { return format!("{root}/overview"); }
     let taken: Vec<String> = store::notes().iter().filter(|n| n["topic"] != tid).filter_map(|n| n["dir"].as_str().map(String::from)).collect();
     let mut d = format!("{root}/{}", safe(name));
-    if taken.contains(&d) || name.trim() == "overview" || name.trim() == "memory" { d = format!("{d}-{}", tid.trim_start_matches("tgbot:")); }
+    if taken.contains(&d) || name.trim() == "overview" { d = format!("{d}-{}", tid.trim_start_matches("tgbot:")); }
     d
 }
 
@@ -183,7 +183,7 @@ pub fn build_menu() -> Result<usize, String> {
 }
 
 /// Agent output → Telegram: one message per answer, edited as it grows.
-fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own, sync_tx: Sender<String>) {
+fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
     struct Out { gen: u64, buf: String, id: Option<u64>, shown: Instant }
     let mut outs: HashMap<String, Out> = HashMap::new();
     loop {
@@ -209,16 +209,15 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own, sync_tx: Sender<String
                 if let Some(e) = &error { body = format!("{body}\n\n⚠️ {e}").trim().to_string(); }
                 if body.trim().is_empty() { body = "✓ 完成（没有文字输出）".into(); }
                 match o.id { None => { send(&own, &sessions, &tid, &body); } Some(i) => edit(&sessions, &tid, i, &body) }
-                let dev = {
+                {
                     let mut ss = sessions.lock().unwrap();
-                    ss.get_mut(&tid).map(|s| { if s.gen == gen { s.pending = false; } s.active = Instant::now(); s.dev.clone() })
-                };
+                    if let Some(s) = ss.get_mut(&tid) { if s.gen == gen { s.pending = false; } s.active = Instant::now(); }
+                }
                 if current(&tid, gen) {
                     set_status(&tid, if error.is_some() { "出错" } else { "空闲" });
                     store::note_set(&tid, "last_error", error.map(Value::String).unwrap_or(Value::Null));
                     store::note_set(&tid, "from", Value::Null);
                 }
-                if let Some(d) = dev { let _ = sync_tx.send(d); }
             }
             Ev::Session { tid, gen, id } => {
                 if current(&tid, gen) && store::note(&tid)["session"].as_str() != Some(&id) { store::note_set(&tid, "session", json!(id)); }
@@ -275,22 +274,11 @@ fn run(sessions: Sessions) {
     store::log("exterior started");
     let own: Own = Arc::new(Mutex::new(HashSet::new()));
     let (tx, rx) = channel();
-    // memory: one sync at a time, coalescing bursts
-    let (sync_tx, sync_rx) = channel::<String>();
-    std::thread::spawn(move || {
-        while let Ok(d) = sync_rx.recv() {
-            std::thread::sleep(Duration::from_secs(2));
-            while sync_rx.try_recv().is_ok() {}
-            memory::sync(Some(&d), "会话结束一轮");
-        }
-    });
-    { let (s, o, st) = (sessions.clone(), own.clone(), sync_tx.clone()); std::thread::spawn(move || output(rx, s, o, st)); }
+    { let (s, o) = (sessions.clone(), own.clone()); std::thread::spawn(move || output(rx, s, o)); }
     std::thread::spawn(|| for _ in 0..5 {
         match build_menu() { Ok(n) => { store::log(&format!("menu: {n} commands")); break; } Err(e) => { store::log(&format!("menu failed: {e}; retry in 5 min")); std::thread::sleep(Duration::from_secs(300)); } }
     });
     std::thread::spawn(|| for d in store::devices() { if let Err(e) = crate::prompt::install(&d) { store::log(&format!("install prompt on {}: {e}", d["name"])); } });
-    // hourly: GitHub backup, even without turns
-    { let st = sync_tx.clone(); std::thread::spawn(move || loop { std::thread::sleep(Duration::from_secs(3600)); if let Some(d) = store::default_device() { let _ = st.send(d["name"].as_str().unwrap_or("").to_string()); } }); }
     refresh(&sessions);
     let mut last = store::state("last_id").as_u64().unwrap_or(0);
     if last == 0 {

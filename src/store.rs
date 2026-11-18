@@ -1,6 +1,6 @@
 //! Everything exterior keeps, in one folder (on Lazycat: /lzcapp/var):
 //! config.json (devices, agents, brief, GitHub), secret.key, sessions/<topic>.json, state.json,
-//! messages.jsonl (session → session), exterior.log, memory/ (the master copy of the memory about Yao).
+//! messages.jsonl (session → session), exterior.log.
 use serde_json::{json, Value};
 use std::io::Write;
 use std::sync::Mutex;
