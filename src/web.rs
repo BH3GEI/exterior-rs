@@ -71,10 +71,12 @@ fn badge(ok: Option<bool>, text: &str) -> String {
 
 fn result_cell(r: &Value) -> String {
     if r.is_null() { return "<span class=\"mute\">—</span>".into(); }
-    if r["running"] == true { return format!("{} <span class=\"mute\">{}</span>", badge(None, "测试中…"), ago(r["time"].as_u64().unwrap_or(0))); }
+    if r["running"] == true { return format!("<span class=\"badge run\">测试中</span> <span class=\"mute\">{}</span>", ago(r["time"].as_u64().unwrap_or(0))); }
     let ok = r["ok"] == true;
     format!("{} <span class=\"mute\">{}</span><div class=\"msg\">{}</div>", badge(Some(ok), if ok { "正常" } else { "失败" }), ago(r["time"].as_u64().unwrap_or(0)), esc(r["msg"].as_str().unwrap_or("")))
 }
+
+const JS: &str = r#"<script>document.addEventListener("submit",function(e){var b=e.submitter||e.target.querySelector("button");if(b){b.classList.add("busy");b.dataset.t=b.textContent;var m={"保存":"保存中","测试":"测试中","测试连接":"连接中","删除":"删除中","添加":"添加中","重新生成":"生成中","重新写入":"写入中","立即同步并备份":"同步中","新建":"打开中"};if(m[b.textContent])b.textContent=m[b.textContent];}});window.addEventListener("pageshow",function(){document.querySelectorAll("button.busy").forEach(function(b){b.classList.remove("busy");if(b.dataset.t)b.textContent=b.dataset.t;});});</script>"#;
 
 const CSS: &str = r#"
 :root{--bg:#f6f6f4;--fg:#1d1d1b;--mute:#6b6b66;--card:#fff;--line:#e3e2dc;--accent:#2f5d50;--ok:#1f7a4d;--bad:#b3261e;--warn:#9a6700}
@@ -92,14 +94,14 @@ textarea{width:100%;min-height:420px;font-family:ui-monospace,Menlo,monospace;fo
 button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:4px 10px}button.primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}button.danger{color:var(--bad)}
 form.inline{display:inline}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}.row label{color:var(--mute);font-size:12px}
 pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;margin:0}code{font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{50%{opacity:.35}}@keyframes fade{from{opacity:0;transform:translateY(-4px)}to{opacity:1}}button{transition:background .15s,opacity .15s,transform .05s}button:active{transform:scale(.97)}button:hover{filter:brightness(1.06)}button.busy{opacity:.7;pointer-events:none}button.busy::before{content:"";display:inline-block;width:11px;height:11px;margin-right:6px;vertical-align:-1px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite}.badge.run{color:var(--warn);animation:pulse 1.2s ease-in-out infinite}.badge.run::before{content:"";display:inline-block;width:9px;height:9px;margin-right:5px;vertical-align:-1px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite}main{animation:fade .2s ease-out}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
 "#;
 
 fn page(active: &str, title: &str, body: &str, refresh: bool) -> String {
     let tabs = [("/", "会话"), ("/devices", "设备"), ("/memory", "记忆"), ("/messages", "消息记录"), ("/prompt", "启动说明"), ("/settings", "设置"), ("/log", "日志")];
     let nav: String = tabs.iter().map(|(h, t)| format!("<a href=\"{h}\"{}>{t}</a>", if *h == active { " class=\"on\"" } else { "" })).collect();
     let meta = if refresh { "<meta http-equiv=\"refresh\" content=\"5\">" } else { "" };
-    format!("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{meta}<title>{} · exterior</title><style>{CSS}</style></head><body><header><b>exterior</b>{nav}</header><main>{body}</main></body></html>", esc(title))
+    format!("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{meta}<title>{} · exterior</title><style>{CSS}</style></head><body><header><b>exterior</b>{nav}</header><main>{body}</main>{JS}</body></html>", esc(title))
 }
 
 // ---- pages ----
@@ -115,6 +117,7 @@ fn sessions_page() -> String {
         let shown = if status == "运行中" && !pending && live { "空闲".to_string() } else { status.to_string() };
         if pending || status == "转移中" { any_running = true; }
         let cls = match shown.as_str() { "运行中" | "转移中" => Some(true), "出错" => Some(false), _ => None };
+        let running_now = matches!(shown.as_str(), "运行中" | "转移中");
         let agent = n["agent"].as_str().unwrap_or("—");
         let agent = match n["resolved"].as_str() { Some(r) if r != agent => format!("{agent} → {r}"), _ => agent.to_string() };
         let from = n["from"].as_str().map(|f| format!("<div class=\"msg\">从 {} 转来</div>", esc(f))).unwrap_or_default();
@@ -123,7 +126,7 @@ fn sessions_page() -> String {
         rows.push_str(&format!(
             "<tr><td><a href=\"{link}\">{}</a><div class=\"mute\">{}</div></td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}{}{}{}</td><td>{}</td><td class=\"msg\">{}</td></tr>",
             esc(n["name"].as_str().unwrap_or("")), esc(tid), esc(n["device"].as_str().unwrap_or("")), esc(&agent),
-            esc(n["session"].as_str().unwrap_or("—")), badge(cls, &shown), if live { " <span class=\"mute\">进程在</span>" } else { "" }, from, err,
+            esc(n["session"].as_str().unwrap_or("—")), if running_now { format!("<span class=\"badge run\">{}</span>", esc(&shown)) } else { badge(cls, &shown) }, if live { " <span class=\"mute\">进程在</span>" } else { "" }, from, err,
             ago(n["active"].as_u64().unwrap_or(0)), esc(n["dir"].as_str().unwrap_or(""))));
     }
     if rows.is_empty() { rows = "<tr><td colspan=7 class=\"mute\">还没有会话。在 Telegram 群里新建一个话题，发一句话。</td></tr>".into(); }
