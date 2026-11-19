@@ -194,6 +194,8 @@ fn deliver(own: &Own, sessions: &Sessions, chat: &str, msg: &str) -> Option<u64>
 pub fn relay(from: &str, to: &str, body: &str) -> Result<String, String> {
     let sessions = LIVE.lock().unwrap().clone().ok_or(text::NOT_READY)?;
     let to = to.trim();
+    // a topic opened a moment ago (an agent handing off a task) is not in the list until the next refresh: do it now
+    if !sessions.lock().unwrap().values().any(|t| !t.deleted && (t.name == to || t.tid == to)) { refresh(&sessions); }
     let (name, dev, dir, target, names) = {
         let ss = sessions.lock().unwrap();
         let s = ss.get(from).filter(|s| !s.deleted).ok_or_else(|| text::relay_from_unknown(from))?;
