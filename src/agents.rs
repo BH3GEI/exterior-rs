@@ -218,6 +218,7 @@ impl Agent {
         args.extend(params::args("claude_args"));
         if let Some(e) = self.spec.effort.as_ref().filter(|e| *e != "auto") { args.push("--effort".into()); args.push(e.clone()); }
         // claude leaves its thinking out unless asked; the summaries Anthropic's API gives are shown as steps
+        args.push("--forward-subagent-text".into());
         let td = params::get("claude_thinking");
         if !td.is_empty() { args.push("--thinking-display".into()); args.push(td); }
         if let Some(id) = &self.spec.resume { args.push("--resume".into()); args.push(id.clone()); }
@@ -254,24 +255,42 @@ impl Agent {
                         match b["type"].as_str() {
                             Some("thinking") => if let Some(t) = b["thinking"].as_str().filter(|t| !t.trim().is_empty()) { step(text::THINKING.into(), t.trim().to_string()); },
                             Some("redacted_thinking") => step(text::THINKING.into(), text::THINKING_HIDDEN.into()),
+                            // a subagent's words (with --forward-subagent-text) are part of its work, not the answer
+                            Some("text") if !v["parent_tool_use_id"].is_null() => step(text::SUBAGENT.into(), b["text"].as_str().unwrap_or("").to_string()),
                             Some("text") if !streamed && quiet.load(std::sync::atomic::Ordering::SeqCst) == 0 => if let Some(t) = b["text"].as_str().filter(|t| !t.trim().is_empty()) {
                                 let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: format!("\n\n{t}") });
                             },
                             Some("tool_use") => { tools.insert(b["id"].as_str().unwrap_or("").to_string(), (b["name"].as_str().unwrap_or("?").to_string(), b["input"].clone())); }
-                            _ => {}
+                            Some("text") => {}
+                            _ => step(text::event_title(&format!("assistant · {}", b["type"].as_str().unwrap_or("?"))), pretty(b)),
                         }
                     },
-                    Some("user") => for b in v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
-                        let (name, input) = tools.remove(b["tool_use_id"].as_str().unwrap_or("")).unwrap_or(("?".into(), Value::Null));
-                        let failed = b["is_error"] == true;
-                        step(tool_title(&name, &input, failed), tool_body(&input, Some(&result_text(&b["content"]))));
+                    Some("user") => match &v["message"]["content"] {
+                        Value::Array(a) => for b in a {
+                            if b["type"] == "tool_result" {
+                                let (name, input) = tools.remove(b["tool_use_id"].as_str().unwrap_or("")).unwrap_or(("?".into(), Value::Null));
+                                let failed = b["is_error"] == true;
+                                step(tool_title(&name, &input, failed), tool_body(&input, Some(&result_text(&b["content"]))));
+                            } else {
+                                // what claude put in front of the model itself: command output, hook text, reminders
+                                step(text::event_title(&format!("user · {}", b["type"].as_str().unwrap_or("?"))), result_text(&Value::Array(vec![b.clone()])));
+                            }
+                        },
+                        c => step(text::event_title("user"), pretty(c)),
                     },
-                    Some("system") if !matches!(v["subtype"].as_str(), Some("status") | Some("thinking_tokens")) => {
+                    // thinking_tokens is a running counter of the thinking that arrives in full anyway
+                    Some("system") if v["subtype"] != "thinking_tokens" => {
                         step(text::event_title(&format!("system · {}", v["subtype"].as_str().unwrap_or(""))), pretty(&v));
                     }
                     Some("rate_limit_event") => step(text::event_title("rate_limit_event"), pretty(&v)),
-                    Some("result") => for (_, (name, input)) in tools.drain() { step(tool_title(&name, &input, false), tool_body(&input, None)); },
-                    _ => {}
+                    Some("result") => {
+                        for (_, (name, input)) in tools.drain() { step(tool_title(&name, &input, false), tool_body(&input, None)); }
+                        step(text::event_title("result"), pretty(&v));
+                    }
+                    // stream_event pieces come again whole in the assistant message; control_response answers exterior
+                    Some("stream_event") | Some("control_response") | Some("system") => {}
+                    Some(t) => step(text::event_title(t), pretty(&v)),
+                    None => step(text::STDOUT.into(), line.clone()),
                 }
                 if let Some(t) = claude_note(&v) {
                     if v["type"] == "rate_limit_event" && v["rate_limit_info"]["status"] == "rejected" {
@@ -381,7 +400,7 @@ impl Agent {
                                 let _ = put(&stdin, &json!({"type": "extension_ui_response", "id": v["id"], "cancelled": true}));
                                 let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::dialog_cancelled(m, &clip(&what)) });
                             }
-                            _ => {}
+                            m => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title(&format!("extension_ui · {m}")), body: pretty(&v) }); }
                         }
                     }
                     Some("response") if v["command"] == "prompt" && v["data"]["disposition"] == "handled" => {
@@ -402,7 +421,10 @@ impl Agent {
                         let err = v["error"].as_str().unwrap_or(text::PI_REJECTED).to_string();
                         let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: None, stopped: false, error: Some(err) });
                     }
-                    _ => {}
+                    // these repeat what tool_execution_end and the streamed text already carry in full
+                    Some("tool_execution_start") | Some("tool_execution_update") | Some("message_start") | Some("message_end") => {}
+                    Some(t) => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title(t), body: pretty(&v) }); }
+                    None => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::STDOUT.into(), body: line.clone() }); }
                 }
             }
             if let Some(mut c) = child.lock().unwrap().take() { let _ = c.wait(); }
@@ -512,7 +534,9 @@ impl Agent {
                             _ => { *busy.lock().unwrap() = false; }
                         }
                     }
-                    _ => {}
+                    // pieces (…Delta, item/started) that item/completed repeats in full
+                    m if m.ends_with("Delta") || m.ends_with("/delta") || m == "item/started" => {}
+                    m => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title(m), body: pretty(&p) }); }
                 }
             }
             if let Some(mut c) = child.lock().unwrap().take() { let _ = c.wait(); }

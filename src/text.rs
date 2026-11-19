@@ -64,6 +64,8 @@ pub fn builtin_desc(agent: &str, name: &str) -> String {
 pub const WARN: &str = "⚠️";
 pub const THINKING: &str = "💭 思考";
 pub const STDERR: &str = "🖥 stderr";
+pub const STDOUT: &str = "🖥 stdout";
+pub const SUBAGENT: &str = "🤖 子 agent";
 pub const THINKING_HIDDEN: &str = "（模型没有给出思考内容）";
 pub fn event_title(kind: &str) -> String { format!("ℹ️ {kind}") }
 /// exterior's own notices, set apart from what the agent says: small grey text (a rich message footer).
