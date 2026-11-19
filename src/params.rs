@@ -22,6 +22,7 @@ pub const PARAMS: &[Param] = &[
     Param { key: "ask_timeout_s", label: "等待 agent 响应请求的时间（秒）", default: "30" },
     Param { key: "codex_ready_s", label: "等待 codex 就绪的时间（秒）", default: "40" },
     Param { key: "notice_every", label: "重试提示的发送间隔（每多少次重试发一条）", default: "3" },
+    Param { key: "limit_warn_pct", label: "codex 用量达到多少百分比时提醒", default: "90" },
     Param { key: "error_lines", label: "报错保留的行数", default: "3" },
     Param { key: "error_chars", label: "报错保留的字数", default: "300" },
     Param { key: "refresh_s", label: "同步话题列表的间隔（秒）", default: "60" },

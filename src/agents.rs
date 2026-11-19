@@ -74,6 +74,8 @@ pub struct Agent {
     spec: Spec,
     tx: Sender<Ev>,
     busy: Arc<Mutex<bool>>,
+    /// claude: set when we asked it to stop, so the result that follows is shown as stopped, not as an error
+    interrupted: Arc<std::sync::atomic::AtomicBool>,
     queue: Arc<Mutex<Vec<String>>>,
     /// requests waiting for their answer, by id
     pending: Pending,
@@ -143,7 +145,7 @@ pub struct Ctl {
 impl Agent {
     pub fn start(spec: Spec, tx: Sender<Ev>) -> Result<Agent, String> {
         let mut a = Agent { kind: spec.kind, stdin: Arc::new(Mutex::new(None)), child: Arc::new(Mutex::new(None)), spec, tx,
-                            busy: Arc::new(Mutex::new(false)), queue: Arc::new(Mutex::new(vec![])), pending: Arc::new(Mutex::new(HashMap::new())),
+                            busy: Arc::new(Mutex::new(false)), interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)), queue: Arc::new(Mutex::new(vec![])), pending: Arc::new(Mutex::new(HashMap::new())),
                             next: Arc::new(std::sync::atomic::AtomicU64::new(0)), info: Arc::new(Mutex::new(Value::Null)), thread: Arc::new(Mutex::new(None)),
                             turn: Arc::new(Mutex::new(None)), model: Arc::new(Mutex::new(None)) };
         match a.kind {
@@ -179,6 +181,7 @@ impl Agent {
         if !self.spec.prompt.is_empty() { args.push("--append-system-prompt".into()); args.push(self.spec.prompt.clone()); }
         let (out, last) = self.spawn(args)?;
         let (tx, tid, gen, child, busy, pending, info) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone(), self.info.clone());
+        let interrupted = self.interrupted.clone();
         std::thread::spawn(move || {
             let mut known = String::new();
             for line in BufReader::new(out).lines().map_while(Result::ok) {
@@ -196,9 +199,15 @@ impl Agent {
                 if let Some(d) = v["event"]["delta"]["text"].as_str() { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() }); }
                 if v["type"] == "result" {
                     *busy.lock().unwrap() = false;
-                    let stopped = v["subtype"] == "error_during_execution";
-                    let error = if v["is_error"] == true && !stopped { Some(v["result"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or(text::AGENT_ERROR).to_string()) } else { None };
-                    let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: v["result"].as_str().map(String::from), stopped, error });
+                    let sub = v["subtype"].as_str().unwrap_or("");
+                    let stopped = interrupted.swap(false, std::sync::atomic::Ordering::SeqCst) && sub == "error_during_execution";
+                    let failed = !stopped && (v["is_error"] == true || sub.starts_with("error"));
+                    let error = failed.then(|| {
+                        let listed: Vec<&str> = v["errors"].as_array().into_iter().flatten().filter_map(|e| e.as_str()).collect();
+                        let said = v["result"].as_str().filter(|s| !s.trim().is_empty()).map(String::from);
+                        said.or_else(|| (!listed.is_empty()).then(|| clip(&listed.join("；")))).unwrap_or_else(|| text::result_error(sub))
+                    });
+                    let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: if failed { None } else { v["result"].as_str().map(String::from) }, stopped, error });
                 }
             }
             if let Some(mut c) = child.lock().unwrap().take() { let _ = c.wait(); }
@@ -217,6 +226,7 @@ impl Agent {
         let (out, last) = self.spawn(args)?;
         let _ = self.tx.send(Ev::Session { tid: self.spec.tid.clone(), gen: self.spec.gen, id: sid });
         let (tx, tid, gen, child, busy, pending) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone());
+        let stdin = self.stdin.clone();
         std::thread::spawn(move || {
             let mut last_text: Option<String> = None;
             let mut last_err: Option<String> = None;
@@ -245,6 +255,37 @@ impl Agent {
                         if worth_noting(a) {
                             let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::retrying(text::Source::Model, a, v["maxAttempts"].as_i64().unwrap_or(0), &clip(v["errorMessage"].as_str().unwrap_or(""))) });
                         }
+                    }
+                    Some("auto_retry_end") if v["success"] == false => {
+                        if let Some(e) = v["finalError"].as_str() { if last_err.is_none() { last_err = Some(clip(e)); } }
+                    }
+                    Some("summarization_retry_scheduled") => {
+                        let a = v["attempt"].as_i64().unwrap_or(0);
+                        if worth_noting(a) {
+                            let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::retrying(text::Source::Compaction, a, v["maxAttempts"].as_i64().unwrap_or(0), &clip(v["errorMessage"].as_str().unwrap_or(""))) });
+                        }
+                    }
+                    Some("compaction_end") => {
+                        if let Some(e) = v["errorMessage"].as_str() { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::compaction_failed(&clip(e)) }); }
+                    }
+                    Some("extension_ui_request") => {
+                        let what = v["title"].as_str().or(v["message"].as_str()).unwrap_or("").to_string();
+                        match v["method"].as_str().unwrap_or("") {
+                            "notify" if matches!(v["notifyType"].as_str(), Some("warning") | Some("error")) => {
+                                let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::extension_notice(&clip(&what)) });
+                            }
+                            // dialogs wait for an answer; exterior has no way to ask the user yet, so it cancels them and says so
+                            m @ ("select" | "confirm" | "input" | "editor") => {
+                                let _ = put(&stdin, &json!({"type": "extension_ui_response", "id": v["id"], "cancelled": true}));
+                                let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::dialog_cancelled(m, &clip(&what)) });
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some("response") if v["command"] == "prompt" && v["data"]["disposition"] == "handled" => {
+                        // an extension consumed the prompt: no run follows
+                        *busy.lock().unwrap() = false;
+                        let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: None, stopped: false, error: None });
                     }
                     Some("extension_error") => {
                         let e = v["error"].as_str().map(String::from).unwrap_or_else(|| v.to_string());
@@ -276,6 +317,7 @@ impl Agent {
         let (stdin, queue, thread, turn, model) = (self.stdin.clone(), self.queue.clone(), self.thread.clone(), self.turn.clone(), self.model.clone());
         std::thread::spawn(move || {
             let (mut reply, mut error, mut retries): (String, Option<String>, i64) = (String::new(), None, 0);
+            let mut limits = CodexLimits::default();
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                 let method = v["method"].as_str().unwrap_or("");
@@ -284,10 +326,13 @@ impl Agent {
                     continue;
                 }
                 if !v["id"].is_null() {
-                    // a request from codex (approvals): we run without approvals, so say yes; anything else, decline
+                    // a request from codex (approvals): we run without approvals, so say yes; anything else, decline and say so
                     let res = if method.ends_with("requestApproval") { json!({"id": v["id"], "result": {"decision": "accept"}}) }
                               else if method == "execCommandApproval" || method == "applyPatchApproval" { json!({"id": v["id"], "result": {"decision": "approved"}}) }
-                              else { json!({"id": v["id"], "error": {"code": -32601, "message": text::CODEX_UNHANDLED}}) };
+                              else {
+                                  let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::codex_request_declined(method) });
+                                  json!({"id": v["id"], "error": {"code": -32601, "message": text::CODEX_UNHANDLED}})
+                              };
                     let _ = put(&stdin, &res);
                     continue;
                 }
@@ -314,11 +359,38 @@ impl Agent {
                             let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::retrying(text::Source::Codex, retries, 0, &clip(p["error"]["message"].as_str().unwrap_or(""))) });
                         }
                     }
-                    "error" => { error = Some(p["error"]["message"].as_str().unwrap_or(text::CODEX_ERROR).to_string()); }
+                    "error" => { error = Some(codex_error(&p["error"])); }
+                    "warning" | "guardianWarning" => {
+                        if let Some(m) = p["message"].as_str() { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: clip(m) }); }
+                    }
+                    "deprecationNotice" | "configWarning" => {
+                        let t = [p["summary"].as_str(), p["details"].as_str(), p["path"].as_str()].into_iter().flatten().collect::<Vec<_>>().join("；");
+                        if !t.is_empty() { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: clip(&t) }); }
+                    }
+                    "model/rerouted" => {
+                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::fallback(p["fromModel"].as_str().unwrap_or("?"), p["toModel"].as_str().unwrap_or("?")) });
+                    }
+                    "account/rateLimits/updated" => {
+                        for t in limits.update(&p["rateLimits"]) { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: t }); }
+                    }
+                    "mcpServer/startupStatus/updated" if p["status"] == "failed" => {
+                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::mcp_failed(p["name"].as_str().unwrap_or("?"), &clip(p["error"].as_str().unwrap_or(""))) });
+                    }
+                    "modelProvider/authRecoveryStarted" => {
+                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::auth_recovery(p["provider"].as_str().unwrap_or(""), &clip(p["message"].as_str().unwrap_or(""))) });
+                    }
+                    "thread/status/changed" if p["status"]["type"] == "systemError" => {
+                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::CODEX_SYSTEM_ERROR.into() });
+                    }
+                    "hook/completed" if matches!(p["run"]["status"].as_str(), Some("failed") | Some("blocked")) => {
+                        let r = &p["run"];
+                        let detail = r["statusMessage"].as_str().map(String::from).unwrap_or_else(|| r["entries"].as_array().into_iter().flatten().filter_map(|e| e["text"].as_str()).collect::<Vec<_>>().join("；"));
+                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::hook_failed(r["eventName"].as_str().unwrap_or(""), &clip(&detail)) });
+                    }
                     "turn/completed" => {
                         *turn.lock().unwrap() = None;
                         let st = p["turn"]["status"].as_str().unwrap_or("");
-                        if st == "failed" && error.is_none() { error = Some(p["turn"]["error"]["message"].as_str().unwrap_or(text::CODEX_ERROR).to_string()); }
+                        if st == "failed" && error.is_none() { error = Some(codex_error(&p["turn"]["error"])); }
                         let text = reply.trim().to_string();
                         let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: if text.is_empty() { None } else { Some(text) }, stopped: st == "interrupted", error: error.take() });
                         reply.clear();
@@ -394,7 +466,10 @@ impl Agent {
     /// Esc.
     pub fn stop(&mut self) {
         match self.kind {
-            Kind::Claude => { let _ = put(&self.stdin, &json!({"type": "control_request", "request_id": "stop", "request": {"subtype": "interrupt"}})); }
+            Kind::Claude => {
+                self.interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = put(&self.stdin, &json!({"type": "control_request", "request_id": "stop", "request": {"subtype": "interrupt"}}));
+            }
             Kind::Pi => { let _ = put(&self.stdin, &json!({"type": "abort"})); }
             Kind::Codex => {
                 self.queue.lock().unwrap().clear();
@@ -580,6 +655,39 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
     out
 }
 
+/// codex's error object: its message, with the extra details and the error kind when given.
+fn codex_error(e: &Value) -> String {
+    let mut parts: Vec<String> = vec![e["message"].as_str().filter(|s| !s.is_empty()).unwrap_or(text::CODEX_ERROR).to_string()];
+    if let Some(d) = e["additionalDetails"].as_str().filter(|s| !s.is_empty()) { parts.push(d.to_string()); }
+    match &e["codexErrorInfo"] { Value::String(k) => parts.push(format!("（{k}）")), Value::Object(o) => if let Some(k) = o.keys().next() { parts.push(format!("（{k}）")) }, _ => {} }
+    clip(&parts.join(" "))
+}
+
+/// codex's rate-limit updates arrive often; say something only when a limit is reached, or when usage first
+/// passes the `limit_warn_pct` setting in a window.
+#[derive(Default)]
+struct CodexLimits { reached: Option<String>, warned: std::collections::HashSet<String> }
+
+impl CodexLimits {
+    fn update(&mut self, r: &Value) -> Vec<String> {
+        let mut out = vec![];
+        let reached = r["rateLimitReachedType"].as_str().map(String::from);
+        if reached.is_some() && reached != self.reached { out.push(text::limit_reached(reached.as_deref().unwrap_or(""), &resets(&r["primary"]))); }
+        self.reached = reached;
+        let warn = params::num("limit_warn_pct") as i64;
+        for w in ["primary", "secondary"] {
+            let Some(used) = r[w]["usedPercent"].as_i64() else { continue };
+            let key = format!("{w}:{}", r[w]["resetsAt"]);
+            if used >= warn && self.warned.insert(key) { out.push(text::limit_near(w, &text::used_pct(used as f64), &resets(&r[w]))); }
+        }
+        out
+    }
+}
+
+fn resets(w: &Value) -> String {
+    w["resetsAt"].as_i64().map(|t| t - crate::store::now() as i64).filter(|l| *l > 0).map(|l| text::resets_in(l / 3600, l % 3600 / 60)).unwrap_or_default()
+}
+
 /// Whether a retry is worth a message: the first one, then every `notice_every`-th.
 fn worth_noting(attempt: i64) -> bool {
     let every = params::num("notice_every").max(1) as i64;
@@ -622,6 +730,24 @@ pub fn claude_note(v: &Value) -> Option<String> {
             let e = v["error"].as_str().map(String::from).unwrap_or_else(|| v["error_status"].to_string());
             Some(text::retrying(text::Source::Api, a, v["max_retries"].as_i64().unwrap_or(0), &clip(&e)))
         }
+        ("system", "hook_response") if v["outcome"] == "error" => {
+            let e = v["stderr"].as_str().filter(|s| !s.trim().is_empty()).or(v["error"].as_str()).or(v["output"].as_str()).unwrap_or("");
+            Some(text::hook_failed(v["hook_name"].as_str().unwrap_or(""), &clip(e)))
+        }
+        ("system", "stop_hook_summary") if v["hook_errors"].as_array().map(|a| !a.is_empty()).unwrap_or(false) => {
+            let e: Vec<String> = v["hook_errors"].as_array().into_iter().flatten().map(|e| e.as_str().map(String::from).unwrap_or_else(|| e.to_string())).collect();
+            Some(text::hook_failed("Stop", &clip(&e.join("；"))))
+        }
+        ("auth_status", _) => v["error"].as_str().filter(|e| !e.is_empty()).map(|e| text::auth_error(&clip(e))),
+        ("system", "instruction_size_warning") => Some(text::instructions_too_long(v["total_chars"].as_u64().unwrap_or(0), v["total_limit_chars"].as_u64().unwrap_or(0))),
+        ("system", "permission_denied") => Some(text::tool_denied(v["tool_name"].as_str().unwrap_or("?"), v["decision_reason_type"].as_str().unwrap_or(""))),
+        ("system", "session_writes_lost") => Some(text::writes_lost(v["error_code"].as_str().unwrap_or(""))),
+        ("system", "mirror_error") => Some(text::mirror_failed(&clip(v["error"].as_str().unwrap_or("")))),
+        ("system", "model_refusal_no_fallback") => Some(v["content"].as_str().filter(|c| !c.trim().is_empty()).map(String::from).unwrap_or_else(|| text::REFUSED_NO_FALLBACK.into())),
+        ("system", "init") => {
+            let failed: Vec<String> = v["mcp_servers"].as_array().into_iter().flatten().filter(|s| s["status"] == "failed").filter_map(|s| s["name"].as_str().map(String::from)).collect();
+            (!failed.is_empty()).then(|| text::mcp_failed(&failed.join("、"), ""))
+        }
         ("system", "notification") => {
             let t = v["text"].as_str()?.trim();
             if t.is_empty() || v["priority"] == "low" { None } else { Some(t.to_string()) }
@@ -654,5 +780,25 @@ mod note_tests {
         assert!(claude_note(&json!({"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"error":"overloaded"})).unwrap().contains("1/10"));
         assert_eq!(claude_note(&json!({"type":"system","subtype":"api_retry","attempt":2})), None);
         assert_eq!(claude_note(&json!({"type":"assistant"})), None);
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn errors() {
+        assert_eq!(codex_error(&json!({"message": "boom", "codexErrorInfo": "usageLimitExceeded"})), "boom （usageLimitExceeded）");
+        assert_eq!(codex_error(&json!({"message": "x", "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}}})), "x （httpConnectionFailed）");
+        let mut l = CodexLimits::default();
+        assert_eq!(l.update(&json!({"primary": {"usedPercent": 50}})).len(), 0);
+        assert_eq!(l.update(&json!({"primary": {"usedPercent": 95, "resetsAt": 1}})).len(), 1);
+        assert_eq!(l.update(&json!({"primary": {"usedPercent": 96, "resetsAt": 1}})).len(), 0);
+        assert_eq!(l.update(&json!({"rateLimitReachedType": "workspace", "primary": {"usedPercent": 100, "resetsAt": 1}})).len(), 1);
+        assert!(claude_note(&json!({"type":"system","subtype":"hook_response","outcome":"error","hook_name":"PreToolUse","stderr":"bad"})).unwrap().contains("bad"));
+        assert!(claude_note(&json!({"type":"system","subtype":"init","mcp_servers":[{"name":"a","status":"failed"},{"name":"b","status":"connected"}]})).unwrap().contains("a"));
+        assert_eq!(claude_note(&json!({"type":"system","subtype":"init","mcp_servers":[{"name":"b","status":"connected"}]})), None);
+        assert!(claude_note(&json!({"type":"auth_status","error":"expired"})).unwrap().contains("expired"));
     }
 }

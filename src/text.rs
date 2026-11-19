@@ -124,13 +124,39 @@ pub fn no_response(secs: u64) -> String { format!("agent 在 {secs} 秒内没有
 pub fn codex_start_failed(e: &str) -> String { format!("codex 启动失败：{e}") }
 pub fn model_unknown(agent: &str, v: &str) -> String { format!("{agent} 的模型列表中没有「{v}」") }
 /// Whose request failed, for retry notices.
-pub enum Source { Model, Api, Codex }
+pub enum Source { Model, Api, Codex, Compaction }
 
 pub fn retrying(src: Source, a: i64, max: i64, e: &str) -> String {
-    let who = match src { Source::Model => "模型", Source::Api => "接口", Source::Codex => "codex " };
+    let who = match src { Source::Model => "模型", Source::Api => "接口", Source::Codex => "codex ", Source::Compaction => "上下文压缩" };
     if max > 0 { format!("{who}请求失败，正在进行第 {a}/{max} 次重试：{e}") } else { format!("{who}请求失败，正在重试：{e}") }
 }
 pub fn extension_error(e: &str) -> String { format!("pi 扩展出错：{e}") }
+pub fn extension_notice(m: &str) -> String { format!("pi 扩展提示：{m}") }
+pub fn dialog_cancelled(kind: &str, title: &str) -> String {
+    let what = match kind { "select" => "选择", "confirm" => "确认", _ => "输入" };
+    format!("pi 扩展请求你进行{what}：「{title}」。exterior 目前无法转交此类请求，已将其取消。")
+}
+pub fn compaction_failed(e: &str) -> String { format!("上下文压缩失败：{e}") }
+pub fn codex_request_declined(method: &str) -> String { format!("codex 发出了 exterior 不支持的请求（{method}），已拒绝。") }
+pub fn mcp_failed(name: &str, e: &str) -> String { if e.is_empty() { format!("MCP 服务 {name} 启动失败") } else { format!("MCP 服务 {name} 启动失败：{e}") } }
+pub fn auth_recovery(provider: &str, m: &str) -> String { format!("模型服务 {provider} 认证失效，正在恢复：{m}") }
+pub fn auth_error(e: &str) -> String { format!("claude 登录状态出错：{e}") }
+pub fn hook_failed(name: &str, e: &str) -> String { format!("钩子 {name} 执行失败：{e}") }
+pub fn instructions_too_long(total: u64, limit: u64) -> String { format!("说明文件总长度为 {total} 字符，超过上限 {limit} 字符") }
+pub fn tool_denied(tool: &str, why: &str) -> String { if why.is_empty() { format!("claude 拒绝调用工具 {tool}") } else { format!("claude 拒绝调用工具 {tool}（{why}）") } }
+pub fn writes_lost(code: &str) -> String { format!("会话记录写入失败（{code}），部分记录已丢失") }
+pub fn mirror_failed(e: &str) -> String { format!("会话记录同步失败：{e}") }
+pub const REFUSED_NO_FALLBACK: &str = "模型拒绝了该请求，且没有可用的备用模型";
+pub const CODEX_SYSTEM_ERROR: &str = "codex 会话出现系统错误";
+pub fn result_error(subtype: &str) -> String {
+    match subtype {
+        "error_max_turns" => "已达到最大回合数".into(),
+        "error_max_budget_usd" => "已达到费用上限".into(),
+        "error_max_structured_output_retries" => "结构化输出的重试次数已用完".into(),
+        "error_during_execution" => "执行过程中出错".into(),
+        _ => AGENT_ERROR.into(),
+    }
+}
 pub fn fallback(from: &str, to: &str) -> String { format!("模型已从 {from} 切换为 {to}") }
 pub fn limit_reached(kind: &str, when: &str) -> String { format!("用量已达上限（{kind}）{when}") }
 pub fn limit_near(kind: &str, pct: &str, when: &str) -> String { format!("用量接近上限（{kind}）{pct}{when}") }
