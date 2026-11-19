@@ -125,8 +125,8 @@ pub fn tg_post(path: &str, body: Value, wait: bool) -> Result<Value, (u16, Value
 }
 
 /// Telegram allows 4096 characters per message; keep the end, which is where an answer concludes.
-const MESSAGE_MAX: usize = 4000;
-const KEEP: usize = 3900;
+const MESSAGE_MAX: usize = 32000;
+const KEEP: usize = 31900;
 
 pub fn clip(s: &str) -> String {
     let n = s.chars().count();
