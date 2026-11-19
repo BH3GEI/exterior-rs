@@ -53,10 +53,49 @@ fn chosen(chat: &str, cmd: &str, arg: &str) -> Option<String> {
 /// What the 会话 page shows about the running side (the rest is in the notes).
 pub static LIVE: Mutex<Option<Sessions>> = Mutex::new(None);
 
+/// (process running, turn running). A topic whose output has not all gone out yet counts as running: the 会话 page
+/// shows it so, and a deploy waits for it, so a restart cannot lose what is still on its way.
 pub fn running(tid: &str) -> Option<(bool, bool)> {
+    let owed = owes(tid);
     let g = LIVE.lock().unwrap();
     let ss = g.as_ref()?.lock().unwrap();
-    ss.get(tid).map(|s| (s.agent.is_some(), s.pending))
+    ss.get(tid).map(|s| (s.agent.is_some(), s.pending || owed))
+}
+
+/// What each topic still has to send: messages handed to its sender and not yet sent, and topics whose text is still
+/// being gathered (output keeps this up to date).
+#[derive(Default)]
+struct Owed { handed: HashMap<String, usize>, gathering: HashSet<String> }
+static OWED: Mutex<Option<Owed>> = Mutex::new(None);
+
+fn owed<T>(f: impl FnOnce(&mut Owed) -> T) -> T { f(OWED.lock().unwrap().get_or_insert_with(Owed::default)) }
+fn handed(tid: &str) -> usize { owed(|o| o.handed.get(tid).copied().unwrap_or(0)) }
+fn owes(tid: &str) -> bool { owed(|o| o.handed.get(tid).is_some_and(|n| *n > 0) || o.gathering.contains(tid)) }
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Each topic sends through its own thread, its jobs one after another in the order given: a slow send (a file read
+/// from a device that does not answer, an upload, brief being retried) holds up only its own topic. Every send still
+/// waits its turn in brief's one queue, so the rate limit stays shared.
+#[derive(Default)]
+struct Lanes(HashMap<String, Sender<Job>>);
+
+impl Lanes {
+    fn push(&mut self, tid: &str, job: impl FnOnce() + Send + 'static) {
+        owed(|o| *o.handed.entry(tid.to_string()).or_insert(0) += 1);
+        let tx = self.0.entry(tid.to_string()).or_insert_with(|| {
+            let (tx, rx) = channel::<Job>();
+            let t = tid.to_string();
+            std::thread::spawn(move || for job in rx {
+                // a job that panics must not take the topic's later messages with it, nor leave it running forever
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() { store::log(&format!("sending to {t} panicked")); }
+                owed(|o| if let Some(n) = o.handed.get_mut(&t) { *n -= 1; });
+            });
+            tx
+        });
+        // the thread never ends while its sender is here, so this cannot fail
+        let _ = tx.send(Box::new(job));
+    }
 }
 
 fn set_status(tid: &str, status: &str) { store::note_set(tid, "status", json!(status)); store::note_set(tid, "active", json!(store::now())); }
@@ -341,7 +380,8 @@ pub fn build_menu() -> Result<usize, String> {
 
 /// Agent output → Telegram. No live editing: what the agent says is sent as it is said. A paragraph is done when the
 /// agent pauses (pause_ms); paragraphs of one topic within merge_s go out together as one message, and whatever is
-/// left goes out at once when the turn ends. Every send waits its turn in brief's queue.
+/// left goes out at once when the turn ends. This thread only gathers; each topic's sender (Lanes) sends, so one
+/// topic's slow send does not hold up the others. Every send waits its turn in brief's queue.
 fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
     /// buf: text still coming in; last: when the last piece came; said: paragraphs waiting to go out, since when
     struct Out { gen: u64, buf: String, last: Instant, said: Vec<String>, since: Option<Instant>, spoke: bool }
@@ -352,6 +392,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
     }
     fn take(o: &mut Out) -> Vec<String> { o.since = None; if !o.said.is_empty() { o.spoke = true; } text::pack(std::mem::take(&mut o.said)) }
     let mut outs: HashMap<String, Out> = HashMap::new();
+    let mut lanes = Lanes::default();
     loop {
         // take in everything that has arrived, so no backlog builds up while a send waits for its slot
         let mut batch = Vec::new();
@@ -375,8 +416,12 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 if let Some(e) = &error { o.said.push(text::failed(e)); }
                 if o.said.is_empty() && !o.spoke { o.said.push(text::sys(text::DONE_EMPTY)); }
                 let msgs = take(&mut o);
-                for m in &msgs { if deliver(&own, &sessions, &tid, m).is_none() { store::log(&format!("answer for {tid} could not be delivered")); } }
                 let body = msgs.join("\n\n");
+                // handed over before the turn is marked over, so the topic counts as running until they are sent
+                { let (own, sessions, t) = (own.clone(), sessions.clone(), tid.clone());
+                  lanes.push(&tid, move || for m in &msgs { if deliver(&own, &sessions, &t, m).is_none() { store::log(&format!("answer for {t} could not be delivered")); } }); }
+                // the bookkeeping is done now, not after the sends: a message the user sends meanwhile starts a new
+                // turn, which must not be marked over by this one
                 let who = {
                     let mut ss = sessions.lock().unwrap();
                     ss.get_mut(&tid).map(|s| { if s.gen == gen { s.pending = false; } s.active = Instant::now(); (s.dev.clone(), s.name.clone()) })
@@ -392,11 +437,12 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                         store::note_set(&tid, "retry_msg", n["turn_msg"].clone());
                         store::note_set(&tid, "exhausted", Value::Null);
                         let acct = n["resolved"].as_str().or(n["agent"].as_str()).unwrap_or("").to_string();
-                        let (own, sessions, tid, why) = (own.clone(), sessions.clone(), tid.clone(), why.to_string());
-                        std::thread::spawn(move || {
-                            let dev = store::note(&tid)["device"].as_str().and_then(store::device);
+                        // after the answer: in the topic's own line
+                        let (own, sessions, t, why) = (own.clone(), sessions.clone(), tid.clone(), why.to_string());
+                        lanes.push(&tid, move || {
+                            let dev = store::note(&t)["device"].as_str().and_then(store::device);
                             let b = dev.and_then(|d| account_buttons(&d, &acct).ok()).map(|(_, b)| b);
-                            send_with(&own, &sessions, &tid, &text::sys_warn(&text::exhausted(&acct, &why)), b);
+                            send_with(&own, &sessions, &t, &text::sys_warn(&text::exhausted(&acct, &why)), b);
                         });
                     }
                     set_status(&tid, if error.is_some() { st::ERROR } else { st::IDLE });
@@ -431,6 +477,15 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 if current(&tid, gen) { store::note_set(&tid, "resolved", json!(name)); }
             }
             Ev::Exited { tid, gen, why } => {
+                // what was left goes out first, handed over before the turn is marked over
+                if let Some(mut o) = outs.remove(&tid) {
+                    settle(&mut o);
+                    if !o.said.is_empty() {
+                        o.said.push(text::sys_warn(text::CUT_SUFFIX));
+                        let (own, sessions, t, msgs) = (own.clone(), sessions.clone(), tid.clone(), take(&mut o));
+                        lanes.push(&tid, move || for b in msgs { deliver(&own, &sessions, &t, &b); });
+                    }
+                }
                 let warn = {
                     let mut ss = sessions.lock().unwrap();
                     match ss.get_mut(&tid) {
@@ -438,10 +493,6 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                         _ => false,
                     }
                 };
-                if let Some(mut o) = outs.remove(&tid) {
-                    settle(&mut o);
-                    if !o.said.is_empty() { o.said.push(text::sys_warn(text::CUT_SUFFIX)); for b in take(&mut o) { deliver(&own, &sessions, &tid, &b); } }
-                }
                 if current(&tid, gen) || warn {
                     let why = agents::last_lines(&why);
                     if warn {
@@ -451,14 +502,16 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                         // the device may have rebooted or dropped off the network: keep the message and carry on
                         // once it answers again (see retry_waiting); only once per turn, like after a restart
                         let n = store::note(&tid);
-                        match n["turn_msg"].as_str().filter(|_| n["turn_resent"] != json!(true)) {
+                        let says = match n["turn_msg"].as_str().filter(|_| n["turn_resent"] != json!(true)) {
                             Some(m) => {
                                 store::note_set(&tid, "wait_msg", json!(m));
                                 store::note_set(&tid, "wait_since", json!(store::now()));
-                                send(&own, &sessions, &tid, &text::exited_waiting(&why));
+                                text::exited_waiting(&why)
                             }
-                            None => { send(&own, &sessions, &tid, &text::exited(&why)); }
-                        }
+                            None => text::exited(&why),
+                        };
+                        let (own, sessions, t) = (own.clone(), sessions.clone(), tid.clone());
+                        lanes.push(&tid, move || { send(&own, &sessions, &t, &says); });
                     } else if store::note(&tid)["status"] != st::DELETED {
                         set_status(&tid, st::STOPPED);
                     }
@@ -466,21 +519,27 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
             }
         }
         }
-        // then one message at most: the topic whose words have waited longest. Under load each topic's text simply
-        // grows until its turn, so the total stays within the queue's rate however much the agents say.
+        // then one message for each topic whose words have waited merge_s and whose sender is free, longest waiting
+        // first. Under load each topic's text simply grows while its last message waits for its turn, so the total
+        // stays within the queue's rate however much the agents say.
         let (pause, merge) = (Duration::from_millis(params::num("pause_ms")), params::secs("merge_s"));
         for o in outs.values_mut() { if !o.buf.is_empty() && o.last.elapsed() > pause { settle(o); } }
-        let next = outs.iter().filter_map(|(t, o)| o.since.filter(|s| s.elapsed() >= merge).map(|s| (s, t.clone()))).min().map(|x| x.1);
-        if let Some(tid) = next {
+        let mut ready: Vec<(Instant, String)> = outs.iter().filter_map(|(t, o)| o.since.filter(|s| s.elapsed() >= merge).map(|s| (s, t.clone()))).collect();
+        ready.sort();
+        for (_, tid) in ready {
+            if handed(&tid) > 0 { continue; }
             let o = outs.get_mut(&tid).unwrap();
             let mut msgs = take(o);
-            if !msgs.is_empty() {
-                let first = msgs.remove(0);
-                // what did not fit stays first in line for this topic
-                if !msgs.is_empty() { o.said = msgs; o.since = Some(Instant::now() - merge); }
-                deliver(&own, &sessions, &tid, &first);
-            }
+            if msgs.is_empty() { continue; }
+            let first = msgs.remove(0);
+            // what did not fit stays first in line for this topic
+            if !msgs.is_empty() { o.said = msgs; o.since = Some(Instant::now() - merge); }
+            let (own, sessions, t) = (own.clone(), sessions.clone(), tid.clone());
+            lanes.push(&tid, move || { deliver(&own, &sessions, &t, &first); });
         }
+        // text still being gathered is owed too
+        let gathering: HashSet<String> = outs.iter().filter(|(_, o)| !o.said.is_empty() || !o.buf.trim().is_empty()).map(|(t, _)| t.clone()).collect();
+        owed(|o| o.gathering = gathering);
     }
 }
 
@@ -673,6 +732,8 @@ fn retry_waiting(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
             if !ok { continue; }
             // the user may have moved on in the meantime: then his newer message stands, nothing to repeat
             if store::note(&tid)["wait_msg"].as_str() != Some(msg.as_str()) { continue; }
+            // what the topic still has to send (the notice that it is waiting, among others) goes first: next round
+            if owes(&tid) { continue; }
             store::note_set(&tid, "wait_msg", Value::Null);
             store::log(&format!("{}: device back, resending", n["name"]));
             send(&own, &sessions, &tid, &text::sys(text::DEVICE_BACK));
@@ -1046,5 +1107,79 @@ mod more_tests {
         // a step's folded content is in a fence: never sent as a file
         let step = crate::text::step("🔧 Read", "![x](/a.png)").join("");
         assert_eq!(pieces(&step), vec![Piece::Text(step.clone())]);
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_send_does_not_stop_its_topic() {
+        let mut lanes = Lanes::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        lanes.push("tgbot:panic", || panic!("boom"));
+        let s = seen.clone();
+        lanes.push("tgbot:panic", move || s.lock().unwrap().push(2));
+        let t = Instant::now();
+        while handed("tgbot:panic") > 0 && t.elapsed() < Duration::from_secs(5) { std::thread::sleep(Duration::from_millis(20)); }
+        assert_eq!(*seen.lock().unwrap(), vec![2]);
+        assert!(!owes("tgbot:panic"));
+    }
+
+    #[test]
+    fn slow_topic_does_not_hold_up_others() {
+        let _g = store::TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("exterior-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("EXTERIOR_VAR", &dir);
+        std::fs::write(dir.join("pic.png"), b"png").unwrap();
+        // a fake brief that answers each request on its own thread; uploading the slow topic's file takes 3 s.
+        // It records what arrived, in the order it was answered
+        let srv = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = srv.server_addr().to_ip().unwrap().port();
+        let got: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        std::thread::spawn(move || for mut r in srv.incoming_requests() {
+            let g = g.clone();
+            std::thread::spawn(move || {
+                let mut b = String::new();
+                let _ = std::io::Read::read_to_string(r.as_reader(), &mut b);
+                let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
+                let what = v["name"].as_str().map(|n| format!("file {n}")).or(v["text"].as_str().map(String::from)).unwrap_or_default();
+                if r.url() == "/api/send_file" && v["chat"] == "tgbot:slow" { std::thread::sleep(Duration::from_secs(3)); }
+                g.lock().unwrap().push((v["chat"].as_str().unwrap_or("").to_string(), what));
+                let _ = r.respond(tiny_http::Response::from_string(r#"{"id":1}"#));
+            });
+        });
+        store::set_config(&json!({"brief": {"url": format!("http://127.0.0.1:{port}"), "key": crate::crypt::seal("k")},
+            "params": {"tg_gap_ms": "0", "merge_s": "0", "pause_ms": "0"},
+            "devices": [{"name": "here", "host": "local", "infra": dir.join("no-knowledge").display().to_string()}]}));
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        for t in ["tgbot:slow", "tgbot:fast"] {
+            sessions.lock().unwrap().insert(t.into(), Session { tid: t.into(), name: t.into(), dev: "here".into(), dir: dir.display().to_string(),
+                agent: None, gen: 1, pending: true, deleted: false, active: Instant::now() });
+        }
+        *LIVE.lock().unwrap() = Some(sessions.clone());
+        let (tx, rx) = channel();
+        { let s = sessions.clone(); std::thread::spawn(move || output(rx, s, Arc::new(Mutex::new(HashSet::new())))); }
+        let done = |tid: &str, t: &str| Ev::Done { tid: tid.into(), gen: 1, text: Some(t.into()), stopped: false, error: None };
+        tx.send(done("tgbot:slow", "a1\n\n![图](pic.png)\n\na2")).unwrap();
+        tx.send(done("tgbot:fast", "b1")).unwrap();
+        let of = |chat: &str| got.lock().unwrap().iter().filter(|(c, _)| c == chat).map(|(_, w)| w.clone()).collect::<Vec<_>>();
+        let wait = |what: &dyn Fn() -> bool| { let t = Instant::now(); while !what() && t.elapsed() < Duration::from_secs(10) { std::thread::sleep(Duration::from_millis(20)); } };
+        // the fast topic is answered while the slow one's file is still uploading
+        wait(&|| !of("tgbot:fast").is_empty());
+        assert_eq!(of("tgbot:fast"), vec!["b1"]);
+        assert_eq!(of("tgbot:slow"), vec!["a1"]);
+        // its turn is over, but what it still has to send keeps it running (a deploy waits for it)
+        assert!(!sessions.lock().unwrap()["tgbot:slow"].pending);
+        assert_eq!(running("tgbot:slow"), Some((false, true)));
+        // within a topic the order stays: the text after the file waits for the file
+        wait(&|| of("tgbot:slow").len() == 3);
+        assert_eq!(of("tgbot:slow"), vec!["a1", "file pic.png", "a2"]);
+        wait(&|| running("tgbot:slow") == Some((false, false)));
+        assert_eq!(running("tgbot:slow"), Some((false, false)));
+        assert_eq!(running("tgbot:fast"), Some((false, false)));
     }
 }

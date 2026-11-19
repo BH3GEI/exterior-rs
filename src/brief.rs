@@ -156,6 +156,7 @@ mod tests {
 
     #[test]
     fn rate_limit() {
+        let _g = crate::store::TEST.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("exterior-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("EXTERIOR_VAR", &dir);

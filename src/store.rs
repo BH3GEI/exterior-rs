@@ -10,6 +10,10 @@ pub fn path(p: &str) -> String { format!("{}/{p}", var()) }
 
 static LOCK: Mutex<()> = Mutex::new(());
 
+/// Tests that point the config at their own fake brief take turns.
+#[cfg(test)]
+pub static TEST: Mutex<()> = Mutex::new(());
+
 pub fn load(p: &str) -> Value { std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({})) }
 
 pub fn save(p: &str, v: &Value) {
