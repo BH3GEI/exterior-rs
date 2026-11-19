@@ -55,15 +55,21 @@ pub fn run(dev: &Value, script: &str, secs: u64) -> Result<String, String> {
 }
 
 pub fn wait(mut child: std::process::Child, secs: u64) -> Result<Output, String> {
+    // read the output while waiting: a child whose output fills the pipe would otherwise block until the time limit
+    fn drain<R: std::io::Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || { let mut v = Vec::new(); if let Some(mut r) = r { let _ = r.read_to_end(&mut v); } v })
+    }
+    let (so, se) = (drain(child.stdout.take()), drain(child.stderr.take()));
     let start = std::time::Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().map_err(|e| e.to_string()),
-            Ok(None) if start.elapsed().as_secs() >= secs => { let _ = child.kill(); return Err(crate::text::timed_out(secs)); }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Ok(Some(st)) => break st,
+            Ok(None) if start.elapsed().as_secs() >= secs => { let _ = child.kill(); let _ = child.wait(); return Err(crate::text::timed_out(secs)); }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
             Err(e) => return Err(e.to_string()),
         }
-    }
+    };
+    Ok(Output { status, stdout: so.join().unwrap_or_default(), stderr: se.join().unwrap_or_default() })
 }
 
 /// Write a file on the device (always replaces it).
@@ -99,5 +105,20 @@ pub fn read_bytes(dev: &Value, path: &str, max: usize) -> Result<Vec<u8>, String
         Some(0) => Ok(out.stdout),
         Some(3) => Err(crate::text::FILE_MISSING.into()),
         _ => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn big_file_reads_at_once() {
+        // more than a pipe holds: must not hang until the time limit
+        let p = std::env::temp_dir().join("exterior-big-test.bin");
+        std::fs::write(&p, vec![7u8; 400_000]).unwrap();
+        let t = std::time::Instant::now();
+        let b = super::read_bytes(&serde_json::json!({"host": "local"}), &super::quote(p.to_str().unwrap()), 1_000_000).unwrap();
+        assert_eq!(b.len(), 400_000);
+        assert!(t.elapsed().as_secs() < 5);
+        assert_eq!(super::read_bytes(&serde_json::json!({"host": "local"}), "/nonexistent/x", 10).unwrap_err(), crate::text::FILE_MISSING);
     }
 }
