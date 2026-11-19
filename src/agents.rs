@@ -220,6 +220,16 @@ impl Agent {
                             last_err = Some(match inner { Some(i) => format!("{} {i}", m.split(' ').next().unwrap_or("")), None => m.chars().take(300).collect() });
                         } else { last_err = None; }
                     }
+                    Some("auto_retry_start") => {
+                        let a = v["attempt"].as_i64().unwrap_or(0);
+                        if a == 1 || a % 3 == 0 {
+                            let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: format!("模型出错，正在重试 {a}/{}：{}", v["maxAttempts"].as_i64().unwrap_or(0), v["errorMessage"].as_str().unwrap_or("").chars().take(200).collect::<String>()) });
+                        }
+                    }
+                    Some("extension_error") => {
+                        let e = v["error"].as_str().map(String::from).unwrap_or_else(|| v.to_string());
+                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: format!("pi 扩展出错：{}", e.chars().take(200).collect::<String>()) });
+                    }
                     Some("agent_settled") => {
                         *busy.lock().unwrap() = false;
                         let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: last_text.take(), stopped: v["aborted"] == true, error: last_err.take() });
@@ -277,6 +287,9 @@ impl Agent {
                     }
                     "item/completed" if p["item"]["type"] == "agentMessage" => {
                         if !reply.is_empty() && !reply.ends_with("\n\n") { reply.push_str("\n\n"); let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
+                    }
+                    "error" if p["willRetry"] == true => {
+                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: format!("codex 出错，正在重试：{}", p["error"]["message"].as_str().unwrap_or("")) });
                     }
                     "error" if p["willRetry"] != true => { error = p["error"]["message"].as_str().map(String::from).or(Some("codex 出错了".into())); }
                     "turn/completed" => {
