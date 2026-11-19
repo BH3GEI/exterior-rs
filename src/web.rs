@@ -147,7 +147,7 @@ fn sessions_page() -> String {
         let tid = n["topic"].as_str().unwrap_or("");
         let status = n["status"].as_str().unwrap_or(st::NEW);
         let (live, pending) = daemon::running(tid).unwrap_or((false, false));
-        let key = if status == st::RUNNING && !pending && live { st::IDLE } else { status };
+        let key = if pending { st::RUNNING } else if status == st::RUNNING && live { st::IDLE } else { status };
         if pending || status == st::MOVING { any_running = true; }
         let running_now = matches!(key, st::RUNNING | st::MOVING);
         let cls = if running_now { Some(true) } else if key == st::ERROR { Some(false) } else { None };

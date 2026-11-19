@@ -587,7 +587,11 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                 s.pending = true;
                 if let Err(e) = a.say(&line) { s.pending = false; reply = Some(text::say_failed(&e)); }
                 else if transfer.is_some() { set_status(chat, st::MOVING); }
-                else { store::note_set(chat, "turn_msg", json!(msg)); }
+                else {
+                    // the agent may already have been running: the turn starts now either way
+                    set_status(chat, st::RUNNING);
+                    store::note_set(chat, "turn_msg", json!(msg));
+                }
             }
         }
     }
