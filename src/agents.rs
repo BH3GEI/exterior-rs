@@ -220,8 +220,8 @@ impl Agent {
         let (out, last) = self.spawn(args)?;
         let (tx, tid, gen, child, busy, pending, info) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone(), self.info.clone());
         let interrupted = self.interrupted.clone();
-        // effort auto (the default) has no command-line form: it is set with "/effort auto" right after start,
-        // and the answer to that is swallowed
+        // effort auto (the default) has no command-line form: it is set with "/effort auto" right after start.
+        // That exchange is shown like everything else (folded), but its end is not the end of the user's turn
         let auto = self.spec.effort.as_deref().map(|e| e == "auto").unwrap_or(true);
         let silent = Arc::new(std::sync::atomic::AtomicU64::new(auto as u64));
         let quiet = silent.clone();
@@ -251,7 +251,9 @@ impl Agent {
                             Some("redacted_thinking") => step(text::THINKING.into(), text::THINKING_HIDDEN.into()),
                             // a subagent's words (with --forward-subagent-text) are part of its work, not the answer
                             Some("text") if !v["parent_tool_use_id"].is_null() => step(text::SUBAGENT.into(), b["text"].as_str().unwrap_or("").to_string()),
-                            Some("text") if !streamed && quiet.load(std::sync::atomic::Ordering::SeqCst) == 0 => if let Some(t) = b["text"].as_str().filter(|t| !t.trim().is_empty()) {
+                            // claude's answer to exterior's own "/effort auto": not part of the user's answer
+                            Some("text") if quiet.load(std::sync::atomic::Ordering::SeqCst) > 0 => step(text::event_title(text::EFFORT_AUTO_REPLY), b["text"].as_str().unwrap_or("").to_string()),
+                            Some("text") if !streamed => if let Some(t) = b["text"].as_str().filter(|t| !t.trim().is_empty()) {
                                 let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: format!("\n\n{t}") });
                             },
                             Some("tool_use") => { tools.insert(b["id"].as_str().unwrap_or("").to_string(), (b["name"].as_str().unwrap_or("?").to_string(), b["input"].clone())); }
@@ -322,6 +324,7 @@ impl Agent {
         // ask for the commands and models once, right away
         put(&self.stdin, &json!({"type": "control_request", "request_id": "init", "request": {"subtype": "initialize"}}))?;
         if silent.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            let _ = self.tx.send(Ev::Step { tid: self.spec.tid.clone(), gen: self.spec.gen, title: text::event_title(text::EFFORT_AUTO_SENT), body: "/effort auto".into() });
             put(&self.stdin, &json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "/effort auto"}]}}))?;
         }
         Ok(())

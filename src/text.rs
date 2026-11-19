@@ -69,6 +69,9 @@ pub fn builtin_desc(name: &str) -> String {
 pub const WARN: &str = "⚠️";
 /// a tool call the turn ended without a result for; the result follows later under the same title
 pub fn tool_waiting(title: &str) -> String { format!("{title}（结果稍后）") }
+/// exterior's own "/effort auto" to claude at start (claude has no command-line form for it), and claude's reply
+pub const EFFORT_AUTO_SENT: &str = "exterior → claude（启动时设置 effort auto，claude 没有对应的启动参数）";
+pub const EFFORT_AUTO_REPLY: &str = "claude 对 /effort auto 的回复";
 pub const THINKING: &str = "💭 思考";
 pub const STDERR: &str = "🖥 stderr";
 pub const STDOUT: &str = "🖥 stdout";
