@@ -22,9 +22,14 @@ impl Kind {
     pub const ALL: [Kind; 3] = [Kind::Claude, Kind::Pi, Kind::Codex];
 }
 
-/// Commands that are requests to the agent rather than prompts, per kind. The menu, the dispatch and the
-/// "which agent is this for" check are all built from this one table.
-pub const BUILTINS: &[(Kind, &str)] = &[(Kind::Pi, "thinking"), (Kind::Pi, "compact"), (Kind::Pi, "new"), (Kind::Codex, "compact"), (Kind::Codex, "new")];
+/// The agents' own commands that their headless protocols take as requests rather than as typed text. Each keeps
+/// the agent's own name (pi's /thinking is pi_thinking, codex's /model is cx_model); exterior only turns it into the
+/// protocol call. The menu, the dispatch and the "which agent is this for" check are all built from this table.
+pub const BUILTINS: &[(Kind, &str)] = &[
+    (Kind::Claude, "model"),
+    (Kind::Pi, "model"), (Kind::Pi, "thinking"), (Kind::Pi, "compact"), (Kind::Pi, "new"), (Kind::Pi, "name"), (Kind::Pi, "session"), (Kind::Pi, "fork"), (Kind::Pi, "export"),
+    (Kind::Codex, "model"), (Kind::Codex, "compact"), (Kind::Codex, "new"), (Kind::Codex, "status"), (Kind::Codex, "review"),
+];
 
 /// The menu name of a built-in command, e.g. pi_thinking.
 pub fn builtin_command(kind: Kind, name: &str) -> String { format!("{}_{name}", kind.prefix()) }
@@ -350,6 +355,10 @@ impl Agent {
                         reply.push_str(d);
                         let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() });
                     }
+                    "item/completed" if p["item"]["type"] == "exitedReviewMode" => {
+                        // the result of /cx_review
+                        if let Some(r) = p["item"]["review"].as_str() { reply.push_str(r); let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: r.to_string() }); }
+                    }
                     "item/completed" if p["item"]["type"] == "agentMessage" => {
                         if !reply.is_empty() && !reply.ends_with("\n\n") { reply.push_str("\n\n"); let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
                     }
@@ -567,14 +576,31 @@ impl Ctl {
     }
 
     /// Built-in commands that are not prompts (see BUILTINS).
-    pub fn builtin(&self, name: &str, arg: &str) -> Result<(), String> {
+    /// Returns the answer's data; for pi's new and fork also the new session id under "_session".
+    pub fn builtin(&self, name: &str, arg: &str) -> Result<Value, String> {
         self.ready()?;
+        let codex_thread = || self.thread.lock().unwrap().clone().ok_or_else(|| text::CODEX_NOT_READY.to_string());
         let r = match (self.kind, name) {
+            (Kind::Pi, "name") => self.ask(|id| json!({"type": "set_session_name", "id": id, "name": arg}))?,
+            (Kind::Pi, "session") => self.ask(|id| json!({"type": "get_session_stats", "id": id}))?,
+            (Kind::Pi, "export") => self.ask(|id| json!({"type": "export_html", "id": id}))?,
+            (Kind::Pi, "fork") if arg.is_empty() => self.ask(|id| json!({"type": "get_fork_messages", "id": id}))?,
+            (Kind::Pi, "fork") => self.ask(|id| json!({"type": "fork", "id": id, "entryId": arg}))?,
+            (Kind::Codex, "status") => {
+                let mut r = self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "account/rateLimits/read", "params": {}}))?;
+                r["result"]["_model"] = json!(self.model.lock().unwrap().clone());
+                r
+            }
+            (Kind::Codex, "review") => {
+                let target = review_target(arg);
+                let th = codex_thread()?;
+                self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "review/start", "params": {"threadId": th, "target": target}}))?
+            }
             (Kind::Pi, "thinking") => self.ask(|id| json!({"type": "set_thinking_level", "id": id, "level": arg}))?,
             (Kind::Pi, "compact") => self.ask(|id| json!({"type": "compact", "id": id}))?,
             (Kind::Pi, "new") => self.ask(|id| json!({"type": "new_session", "id": id}))?,
             (Kind::Codex, "compact") => {
-                let th = self.thread.lock().unwrap().clone().ok_or(text::CODEX_NOT_READY)?;
+                let th = codex_thread()?;
                 self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "thread/compact/start", "params": {"threadId": th}}))?
             }
             (Kind::Codex, "new") => {
@@ -586,8 +612,26 @@ impl Ctl {
         if r["success"] == false || !r["error"].is_null() {
             return Err(r["error"]["message"].as_str().or(r["error"].as_str()).unwrap_or(text::BUILTIN_FAILED).to_string());
         }
-        Ok(())
+        let mut data = if self.kind == Kind::Codex { r["result"].clone() } else { r["data"].clone() };
+        // pi writes the export next to its working directory: report the full path
+        if let Some(p) = data["path"].as_str().filter(|p| !p.starts_with('/')) { data["path"] = json!(format!("{}/{p}", self.dir.trim_end_matches('/'))); }
+        if self.kind == Kind::Pi && matches!(name, "new" | "fork") && !(name == "fork" && arg.is_empty()) {
+            // pi now writes to another session: remember it, so a restart resumes that one
+            if let Ok(s) = self.ask(|id| json!({"type": "get_state", "id": id})) {
+                if !data.is_object() { data = json!({}); }
+                data["_session"] = s["data"]["sessionId"].clone();
+            }
+        }
+        Ok(data)
     }
+}
+
+/// /cx_review's argument: nothing for the uncommitted changes, a commit hash, or a base branch.
+pub fn review_target(arg: &str) -> Value {
+    let a = arg.trim();
+    if a.is_empty() { json!({"type": "uncommittedChanges"}) }
+    else if a.len() >= 7 && a.len() <= 40 && a.chars().all(|c| c.is_ascii_hexdigit()) { json!({"type": "commit", "sha": a}) }
+    else { json!({"type": "baseBranch", "branch": a}) }
 }
 
 fn codex_turn(thread: &str, text: &str, model: Option<String>) -> Value {
@@ -678,7 +722,7 @@ impl CodexLimits {
         for w in ["primary", "secondary"] {
             let Some(used) = r[w]["usedPercent"].as_i64() else { continue };
             let key = format!("{w}:{}", r[w]["resetsAt"]);
-            if used >= warn && self.warned.insert(key) { out.push(text::limit_near(w, &text::used_pct(used as f64), &resets(&r[w]))); }
+            if used >= warn && self.warned.insert(key) { out.push(text::limit_near(&text::window(r[w]["windowDurationMins"].as_i64()), &text::used_pct(used as f64), &resets(&r[w]))); }
         }
         out
     }

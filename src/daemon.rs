@@ -180,7 +180,6 @@ pub fn build_menu() -> Result<usize, String> {
         json!({"command": "stop", "description": text::MENU_STOP}),
         json!({"command": "exit", "description": text::MENU_EXIT}),
         json!({"command": "agent", "description": text::MENU_AGENT}),
-        json!({"command": "model", "description": text::MENU_MODEL}),
     ];
     for (k, n) in agents::BUILTINS {
         if dev["agents"].as_array().into_iter().flatten().any(|a| a["kind"] == k.name()) {
@@ -431,14 +430,11 @@ fn agent_names(dev: &str) -> Vec<String> {
     store::device(dev).map(|d| d["agents"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
-/// A command for exterior itself: /model, or a built-in of some kind of agent.
-enum Control { Model, Builtin(Kind, &'static str) }
-
 fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str) {
     let mut reply: Option<String> = None;
     let mut reply_buttons: Option<Value> = None;
     let mut transfer: Option<(String, String)> = None;
-    let mut ctl: Option<(agents::Ctl, Control, String)> = None;
+    let mut ctl: Option<(agents::Ctl, Kind, &'static str, String)> = None;
     {
         let mut ss = sessions.lock().unwrap();
         let Some(s) = ss.get_mut(chat) else { return };
@@ -453,7 +449,7 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
         let mut say: Option<String> = None;
         let head = t.split_whitespace().next().unwrap_or("");
         let arg = t[head.len()..].trim().to_string();
-        let control = if head == "/model" { Some(Control::Model) } else { agents::find_builtin(head).map(|(k, n)| Control::Builtin(k, n)) };
+        let builtin = agents::find_builtin(head);
         let own_prefix = Kind::ALL.iter().find(|k| head.starts_with(&format!("/{}_", k.prefix()))).copied();
         if head == "/exit" {
             if let Some(a) = s.agent.as_mut() { a.stop(); a.kill(); }
@@ -463,15 +459,13 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             store::note_set(chat, "from", Value::Null);
             set_status(chat, st::NEW);
             reply = Some(text::session_ended(&cur));
-        } else if let Some(c) = control {
-            if let Control::Builtin(k, _) = &c {
-                if Some(*k) != cur_kind { reply = Some(text::wrong_agent(k.label(), &cur)); }
-            }
-            if reply.is_none() {
+        } else if let Some((k, name)) = builtin {
+            if Some(k) != cur_kind { reply = Some(text::wrong_agent(k.label(), &cur)); }
+            else {
                 if s.agent.is_none() {
                     if let Err(e) = start_agent(s, tx) { reply = Some(text::start_failed(&cur, &e)); }
                 }
-                if let Some(a) = s.agent.as_ref() { ctl = Some((a.ctl(), c, arg.clone())); }
+                if let Some(a) = s.agent.as_ref() { ctl = Some((a.ctl(), k, name, arg.clone())); }
             }
         } else if head == "/stop" {
             match s.agent.as_mut() { Some(a) if s.pending => a.stop(), _ => reply = Some(text::NOTHING_RUNNING.into()) }
@@ -531,54 +525,95 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
     }
     if let Some((_, want)) = &transfer { send(own, sessions, chat, &text::transferring(want)); }
     if let Some(r) = reply { send_with(own, sessions, chat, &r, reply_buttons); }
-    if let Some((c, what, arg)) = ctl {
+    if let Some((c, kind, name, arg)) = ctl {
         let (own, sessions, chat) = (own.clone(), sessions.clone(), chat.to_string());
         std::thread::spawn(move || {
-            let (t, btns) = control(&c, &chat, what, &arg);
-            send_with(&own, &sessions, &chat, &t, btns);
+            let a = control(&c, &chat, kind, name, &arg);
+            if let Some(id) = &a.session { store::note_set(&chat, "session", json!(id)); }
+            if a.started {
+                // /cx_review runs as a turn: its result arrives like an answer
+                if let Some(s) = sessions.lock().unwrap().get_mut(&chat) { s.pending = true; }
+                set_status(&chat, st::RUNNING);
+            }
+            send_with(&own, &sessions, &chat, &a.text, a.buttons);
         });
     }
 }
 
-/// /model and the built-in commands, answered without holding the sessions lock.
-fn control(c: &agents::Ctl, chat: &str, what: Control, arg: &str) -> (String, Option<Value>) {
-    match what {
-        Control::Model if arg.is_empty() => match c.models() {
-            Err(e) => (text::models_failed(&e), None),
-            Ok(list) if list.is_empty() => (text::NO_MODELS.into(), None),
+/// What a built-in command answers in the topic, and what it changed.
+struct Answer { text: String, buttons: Option<Value>, session: Option<String>, started: bool }
+
+impl Answer {
+    fn say(t: impl Into<String>) -> Answer { Answer { text: t.into(), buttons: None, session: None, started: false } }
+    fn choose(t: impl Into<String>, b: Value) -> Answer { Answer { text: t.into(), buttons: Some(b), session: None, started: false } }
+}
+
+/// The agents' own commands that go through the protocol (agents::BUILTINS), answered without holding the sessions lock.
+fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> Answer {
+    let cmd = agents::builtin_command(kind, name);
+    match name {
+        "model" if arg.is_empty() => match c.models() {
+            Err(e) => Answer::say(text::models_failed(&e)),
+            Ok(list) if list.is_empty() => Answer::say(text::NO_MODELS),
             Ok(list) => {
                 let items: Vec<(String, String)> = list.iter().enumerate().map(|(i, m)| {
-                    let full = format!("/model {}", m.value);
-                    (m.label.clone(), if full.len() <= BUTTON_DATA_MAX { full } else { format!("/model {}", i + 1) })
+                    let full = format!("/{cmd} {}", m.value);
+                    (m.label.clone(), if full.len() <= BUTTON_DATA_MAX { full } else { format!("/{cmd} {}", i + 1) })
                 }).collect();
                 CHOICES.lock().unwrap().get_or_insert_with(HashMap::new).insert(chat.to_string(), list.into_iter().map(|m| m.value).collect());
-                (text::CHOOSE_MODEL.into(), Some(buttons(in_rows(items, 2))))
+                Answer::choose(text::CHOOSE_MODEL, buttons(in_rows(items, 2)))
             }
         },
-        Control::Model => {
+        "model" => {
             let value = match arg.parse::<usize>() {
                 Ok(i) => {
                     let cached = CHOICES.lock().unwrap().as_ref().and_then(|m| m.get(chat)).and_then(|l| l.get(i.wrapping_sub(1)).cloned());
                     match cached.or_else(|| c.models().ok().and_then(|l| l.get(i.wrapping_sub(1)).map(|m| m.value.clone()))) {
                         Some(v) => v,
-                        None => return (text::no_model_at(i), None),
+                        None => return Answer::say(text::no_model_at(i, &cmd)),
                     }
                 }
                 Err(_) => arg.to_string(),
             };
-            match c.set_model(&value) { Ok(()) => (text::model_set(&value), None), Err(e) => (text::model_failed(&e), None) }
+            match c.set_model(&value) { Ok(()) => Answer::say(text::model_set(&value)), Err(e) => Answer::say(text::model_failed(&e)) }
         }
-        Control::Builtin(k, "thinking") if arg.is_empty() => match c.thinking_levels() {
-            Ok(levels) => {
-                let cmd = agents::builtin_command(k, "thinking");
-                let items = levels.into_iter().map(|l| (l.clone(), format!("/{cmd} {l}"))).collect();
-                (text::CHOOSE_THINKING.into(), Some(buttons(in_rows(items, 3))))
-            }
-            Err(e) => (text::thinking_failed(&e), None),
+        "thinking" if arg.is_empty() => match c.thinking_levels() {
+            Ok(levels) => Answer::choose(text::CHOOSE_THINKING, buttons(in_rows(levels.into_iter().map(|l| (l.clone(), format!("/{cmd} {l}"))).collect(), 3))),
+            Err(e) => Answer::say(text::thinking_failed(&e)),
         },
-        Control::Builtin(_, name) => match c.builtin(name, arg) {
-            Ok(()) => (match name { "thinking" => text::thinking_set(arg), "compact" => text::COMPACTED.into(), _ => text::NEW_SESSION.into() }, None),
-            Err(e) => (text::failed(&e), None),
+        "name" if arg.is_empty() => Answer::say(text::name_needed(&cmd)),
+        _ => match c.builtin(name, arg) {
+            Err(e) => Answer::say(text::failed(&e)),
+            Ok(d) => {
+                let mut a = match name {
+                    "thinking" => Answer::say(text::thinking_set(arg)),
+                    "compact" => Answer::say(text::COMPACTED),
+                    "new" => Answer::say(text::NEW_SESSION),
+                    "name" => Answer::say(text::name_set(arg)),
+                    "session" => Answer::say(text::session_stats(&d)),
+                    "export" => Answer::say(text::exported(d["path"].as_str().unwrap_or("—"))),
+                    "fork" if arg.is_empty() => {
+                        let items: Vec<(String, String)> = d["messages"].as_array().into_iter().flatten().filter_map(|m| {
+                            let label: String = m["text"].as_str()?.chars().take(30).collect();
+                            Some((label, format!("/{cmd} {}", m["entryId"].as_str()?)))
+                        }).filter(|(_, data)| data.len() <= BUTTON_DATA_MAX).collect();
+                        if items.is_empty() { Answer::say(text::NO_FORK_POINTS) } else { Answer::choose(text::CHOOSE_FORK, buttons(in_rows(items, 1))) }
+                    }
+                    "fork" if d["cancelled"] == true => Answer::say(text::FORK_CANCELLED),
+                    "fork" => Answer::say(text::forked(d["text"].as_str().unwrap_or(""))),
+                    "status" => Answer::say(text::codex_status(d["_model"].as_str().unwrap_or(text::DEFAULT_MODEL), &d["rateLimits"])),
+                    "review" => {
+                        let t = agents::review_target(arg);
+                        let v = t["sha"].as_str().or(t["branch"].as_str()).unwrap_or("");
+                        let mut a = Answer::say(text::review_started(&text::review_target(t["type"].as_str().unwrap_or(""), v)));
+                        a.started = true;
+                        a
+                    }
+                    _ => Answer::say(text::BUILTIN_FAILED),
+                };
+                a.session = d["_session"].as_str().map(String::from);
+                a
+            }
         },
     }
 }
@@ -596,7 +631,25 @@ mod tests {
         assert!(matches!(agents::find_builtin("/pi_thinking"), Some((Kind::Pi, "thinking"))));
         assert!(matches!(agents::find_builtin("/cx_new"), Some((Kind::Codex, "new"))));
         assert!(agents::find_builtin("/cc_compact").is_none());
+        assert!(matches!(agents::find_builtin("/cc_model"), Some((Kind::Claude, "model"))));
+        assert!(matches!(agents::find_builtin("/pi_fork"), Some((Kind::Pi, "fork"))));
+        assert!(matches!(agents::find_builtin("/cx_review"), Some((Kind::Codex, "review"))));
+        assert!(agents::find_builtin("/model").is_none());
+        assert_eq!(agents::review_target("")["type"], "uncommittedChanges");
+        assert_eq!(agents::review_target("abc1234")["type"], "commit");
+        assert_eq!(agents::review_target("main")["branch"], "main");
         assert_eq!(text::status::from_legacy("运行中"), Some(text::status::RUNNING));
         assert_eq!(text::status::label("stopped"), "进程已关闭");
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use serde_json::json;
+    #[test]
+    fn status() {
+        let s = crate::text::codex_status("gpt", &json!({"credits": {"hasCredits": false}, "primary": {"usedPercent": 100, "windowDurationMins": 10080}, "secondary": null, "rateLimitReachedType": "x"}));
+        assert!(s.contains("7 天用量：100%") && s.contains("额度余额：无") && s.contains("已达上限：x"), "{s}");
+        assert_eq!(crate::text::window(Some(300)), "5 小时");
     }
 }

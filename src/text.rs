@@ -38,10 +38,13 @@ pub mod status {
 pub const MENU_STOP: &str = "停止当前回合";
 pub const MENU_EXIT: &str = "结束当前会话，下一条消息将开启新会话";
 pub const MENU_AGENT: &str = "切换 agent";
-pub const MENU_MODEL: &str = "切换模型";
 
 pub fn builtin_desc(agent: &str, name: &str) -> String {
-    let what = match name { "thinking" => "设置思考强度", "compact" => "压缩上下文", "new" => "开启新会话", other => other };
+    let what = match name {
+        "model" => "切换模型", "thinking" => "设置思考强度", "compact" => "压缩上下文", "new" => "开启新会话",
+        "name" => "设置会话名称", "session" => "查看会话统计", "fork" => "从先前的消息分叉出新会话", "export" => "将会话导出为 HTML",
+        "status" => "查看模型和用量", "review" => "审查代码改动", other => other,
+    };
     format!("{agent} · {what}")
 }
 
@@ -74,7 +77,50 @@ pub fn transferring(want: &str) -> String { format!("正在将上下文转交给
 pub fn no_such_command(head: &str) -> String { format!("不存在命令 /{head}。") }
 pub fn say_failed(e: &str) -> String { format!("{WARN} 无法将消息交给 agent：{e}") }
 pub fn models_failed(e: &str) -> String { format!("{WARN} 无法获取模型列表：{e}") }
-pub fn no_model_at(i: usize) -> String { format!("{WARN} 不存在第 {i} 个模型，请重新发送 /model 进行选择。") }
+pub fn no_model_at(i: usize, cmd: &str) -> String { format!("{WARN} 不存在第 {i} 个模型，请重新发送 /{cmd} 进行选择。") }
+pub fn name_needed(cmd: &str) -> String { format!("请在命令后写出名称，例如：/{cmd} 项目调研") }
+pub fn name_set(name: &str) -> String { format!("会话名称已设置为「{name}」。") }
+pub fn exported(path: &str) -> String { format!("会话已导出至：{path}") }
+pub const CHOOSE_FORK: &str = "请选择从哪条消息处分叉：";
+pub const NO_FORK_POINTS: &str = "当前会话中还没有可以分叉的消息。";
+pub fn forked(text: &str) -> String { format!("已从所选消息处分叉出新会话，之后的消息将在新会话中进行。所选消息原文：\n{text}") }
+pub const FORK_CANCELLED: &str = "分叉已被扩展取消。";
+pub fn review_started(target: &str) -> String { format!("已开始审查{target}，结果将在本话题中显示。") }
+pub fn review_target(kind: &str, v: &str) -> String {
+    match kind { "commit" => format!("提交 {v}"), "baseBranch" => format!("当前分支与 {v} 的差异"), _ => "尚未提交的改动".into() }
+}
+pub fn session_stats(d: &serde_json::Value) -> String {
+    let n = |v: &serde_json::Value| v.as_u64().map(|x| x.to_string()).unwrap_or_else(|| "—".into());
+    let t = &d["tokens"];
+    let ctx = &d["contextUsage"];
+    format!("会话 {}\n消息：你 {} 条，pi {} 条；工具调用 {} 次\n令牌：输入 {}，输出 {}，缓存读取 {}，缓存写入 {}，合计 {}\n费用：{}\n上下文：已用 {} / {}",
+        d["sessionId"].as_str().unwrap_or("—"), n(&d["userMessages"]), n(&d["assistantMessages"]), n(&d["toolCalls"]),
+        n(&t["input"]), n(&t["output"]), n(&t["cacheRead"]), n(&t["cacheWrite"]), n(&t["total"]),
+        d["cost"].as_f64().map(|c| format!("${c:.2}")).unwrap_or_else(|| "—".into()), n(&ctx["tokens"]), n(&ctx["contextWindow"]))
+}
+pub fn codex_status(model: &str, r: &serde_json::Value) -> String {
+    let mut s = format!("模型：{model}");
+    for k in ["primary", "secondary"] {
+        let w = &r[k];
+        if let Some(p) = w["usedPercent"].as_i64() {
+            let reset = w["resetsAt"].as_i64().map(|t| t - crate::store::now() as i64).filter(|l| *l > 0).map(|l| resets_in(l / 3600, l % 3600 / 60)).unwrap_or_default();
+            s.push_str(&format!("\n{}用量：{p}%{reset}", window(w["windowDurationMins"].as_i64())));
+        }
+    }
+    if r["credits"]["hasCredits"] == false && r["credits"]["unlimited"] != true { s.push_str("\n额度余额：无"); }
+    if let Some(t) = r["rateLimitReachedType"].as_str() { s.push_str(&format!("\n已达上限：{t}")); }
+    s
+}
+/// A rate-limit window's length, e.g. 「5 小时」「7 天」.
+pub fn window(mins: Option<i64>) -> String {
+    match mins {
+        Some(m) if m > 0 && m % 1440 == 0 => format!("{} 天", m / 1440),
+        Some(m) if m > 0 && m % 60 == 0 => format!("{} 小时", m / 60),
+        Some(m) if m > 0 => format!("{m} 分钟"),
+        _ => String::new(),
+    }
+}
+pub const DEFAULT_MODEL: &str = "默认模型";
 pub fn model_set(v: &str) -> String { format!("已切换到模型 {v}。") }
 pub fn model_failed(e: &str) -> String { format!("{WARN} 模型切换失败：{e}") }
 pub fn thinking_set(v: &str) -> String { format!("思考强度已设置为 {v}。") }
