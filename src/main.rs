@@ -27,7 +27,7 @@ fn probe(a: &[String]) {
     let dev = serde_json::json!({"name": "local", "host": "local", "root": a[2]});
     let (tx, rx) = std::sync::mpsc::channel();
     let spec = agents::Spec { tid: format!("{}0", brief::TOPIC_PREFIX), prompt: String::new(), topic: "probe".into(), dev,
-                              dir: a[2].clone(), command: a[1].clone(), kind, gen: 1, resume: None };
+                              dir: a[2].clone(), command: a[1].clone(), kind, gen: 1, resume: None, effort: None };
     let mut ag = agents::Agent::start(spec, tx).expect("start");
     let c = ag.ctl();
     match c.models() { Ok(l) => println!("models: {}", l.iter().map(|m| format!("{}={}", m.label, m.value)).collect::<Vec<_>>().join(", ")), Err(e) => println!("models error: {e}") }

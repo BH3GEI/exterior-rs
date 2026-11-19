@@ -78,7 +78,12 @@ pub struct Spec {
     pub kind: Kind,
     pub gen: u64,
     pub resume: Option<String>,
+    /// claude's effort level picked with /cc_effort; "/effort" only lasts for one process, so it is passed again at start
+    pub effort: Option<String>,
 }
+
+/// claude's /effort levels, offered as buttons.
+pub const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "auto"];
 
 type Pending = Arc<Mutex<HashMap<String, Sender<Value>>>>;
 
@@ -192,6 +197,7 @@ impl Agent {
         let mut args: Vec<String> = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                 "--include-partial-messages"].map(String::from).to_vec();
         args.extend(params::args("claude_args"));
+        if let Some(e) = self.spec.effort.as_ref().filter(|e| *e != "auto") { args.push("--effort".into()); args.push(e.clone()); }
         if let Some(id) = &self.spec.resume { args.push("--resume".into()); args.push(id.clone()); }
         if !self.spec.prompt.is_empty() { args.push("--append-system-prompt".into()); args.push(self.spec.prompt.clone()); }
         let (out, last) = self.spawn(args)?;
@@ -739,7 +745,7 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
         Kind::Pi => (vec!["--mode".into(), "rpc".into(), "--no-session".into()], json!({"type": "get_commands"})),
         Kind::Codex => return vec![],
     };
-    let Ok(mut child) = crate::host::agent(dev, dir, &env(&Spec { tid: String::new(), prompt: String::new(), topic: String::new(), dev: dev.clone(), dir: dir.into(), command: command.into(), kind, gen: 0, resume: None }), command, &args)
+    let Ok(mut child) = crate::host::agent(dev, dir, &env(&Spec { tid: String::new(), prompt: String::new(), topic: String::new(), dev: dev.clone(), dir: dir.into(), command: command.into(), kind, gen: 0, resume: None, effort: None }), command, &args)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return vec![] };
     let mut stdin = child.stdin.take().unwrap();
     let _ = writeln!(stdin, "{ask}");

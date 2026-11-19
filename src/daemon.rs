@@ -191,7 +191,8 @@ fn start_agent(s: &mut Session, tx: &Sender<Ev>) -> Result<(), String> {
     let global = s.dir == crate::prompt::global_dir(&dev);
     let prompt = crate::prompt::session_text(&dev, &s.name, &s.tid, &s.dir, global)?;
     let spec = Spec { tid: s.tid.clone(), prompt, topic: s.name.clone(), dev: dev.clone(), dir: s.dir.clone(),
-                      command: run_row["command"].as_str().unwrap_or("").to_string(), kind, gen: s.gen, resume: resume.clone() };
+                      command: run_row["command"].as_str().unwrap_or("").to_string(), kind, gen: s.gen, resume: resume.clone(),
+                      effort: n["effort"].as_str().map(String::from) };
     store::log(&format!("start {} ({}) for {} in {} resume {:?}", run_row["name"], spec.command, s.name, s.dir, resume));
     s.agent = Some(Agent::start(spec, tx.clone())?);
     set_status(&s.tid, st::RUNNING);
@@ -562,7 +563,13 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                 Some(e) => {
                     let orig = e[1].as_str().unwrap_or("");
                     if Some(kind) != cur_kind { reply = Some(text::wrong_agent(kind.label(), &cur)); }
-                    else { say = Some(format!("/{orig}{}{arg}", if arg.is_empty() { "" } else { " " })); }
+                    else if kind == Kind::Claude && orig == "effort" && arg.is_empty() {
+                        reply = Some(text::choose_effort(n["effort"].as_str()));
+                        reply_buttons = Some(buttons(in_rows(agents::CLAUDE_EFFORTS.iter().map(|l| (l.to_string(), format!("/{cmd} {l}"))).collect(), 3)));
+                    } else {
+                        // remembered, so a restarted process starts with the same level
+                        if kind == Kind::Claude && orig == "effort" && agents::CLAUDE_EFFORTS.contains(&arg.as_str()) { store::note_set(chat, "effort", json!(arg)); }
+                        say = Some(format!("/{orig}{}{arg}", if arg.is_empty() { "" } else { " " })); }
                 }
             }
         } else {
