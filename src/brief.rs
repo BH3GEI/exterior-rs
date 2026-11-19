@@ -31,12 +31,26 @@ pub fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, (u1
     if base.is_empty() || key.is_empty() { return Err((0, Value::String(crate::text::BRIEF_NOT_SET.into()))); }
     let mut c = Command::new("curl");
     c.args(["-s", "-m", "70", "-w", "\n%{http_code}", "-X", method, "-H", "@-"]).arg(format!("{base}{path}"));
-    if let Some(b) = body { c.args(["-H", "Content-Type: application/json", "--data-binary"]).arg(b.to_string()); }
+    // the body goes through a file: one command-line argument can hold at most 128 KB (a picture is more)
+    let file = body.map(|b| {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let f = crate::store::path(&format!("tmp/body-{}-{}.json", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+        let _ = std::fs::create_dir_all(crate::store::path("tmp"));
+        (std::fs::write(&f, b.to_string()), f)
+    });
+    if let Some((w, f)) = &file {
+        if let Err(e) = w { return Err((1, Value::String(e.to_string()))); }
+        c.args(["-H", "Content-Type: application/json", "--data-binary"]).arg(format!("@{f}"));
+    }
+    let gone = || if let Some((_, f)) = &file { let _ = std::fs::remove_file(f); };
     // the key goes in through stdin, so it never shows up in the process list
     c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
-    let Ok(mut ch) = c.spawn() else { return Err((0, Value::Null)) };
+    // curl that cannot start is not a network error: retrying will not help
+    let mut ch = match c.spawn() { Ok(ch) => ch, Err(e) => { gone(); return Err((1, Value::String(e.to_string()))); } };
     { use std::io::Write; let mut i = ch.stdin.take().unwrap(); let _ = writeln!(i, "Authorization: Bearer {key}"); }
-    let out = match ch.wait_with_output() { Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(), Err(_) => return Err((0, Value::Null)) };
+    let out = ch.wait_with_output();
+    gone();
+    let out = match out { Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(), Err(_) => return Err((0, Value::Null)) };
     let (body, code) = out.rsplit_once('\n').unwrap_or(("", "0"));
     let code: u16 = code.trim().parse().unwrap_or(0);
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
@@ -131,8 +145,10 @@ mod tests {
     fn fake(n: usize) -> u16 {
         let srv = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = srv.server_addr().to_ip().unwrap().port();
-        std::thread::spawn(move || for (i, r) in srv.incoming_requests().enumerate() {
-            let (code, body) = if i < n { (429, r#"{"error":"rate_limited","retry_after":1}"#) } else { (200, r#"{"id":7}"#) };
+        std::thread::spawn(move || for (i, mut r) in srv.incoming_requests().enumerate() {
+            let mut got = String::new();
+            let _ = std::io::Read::read_to_string(r.as_reader(), &mut got);
+            let (code, body) = if i < n { (429, r#"{"error":"rate_limited","retry_after":1}"#.to_string()) } else { (200, format!(r#"{{"id":7,"len":{}}}"#, got.len())) };
             let _ = r.respond(tiny_http::Response::from_string(body).with_status_code(code));
         });
         port
@@ -153,5 +169,8 @@ mod tests {
         assert_eq!(tg_post("/api/send", serde_json::json!({}), true).unwrap()["id"], 7);
         assert!(t.elapsed() >= Duration::from_secs(3), "waited {:?}", t.elapsed());
         assert!(!held());
+        // a picture is bigger than one command-line argument can hold: it still goes through, whole
+        let big = serde_json::json!({"data": "A".repeat(400_000)});
+        assert_eq!(call("POST", "/api/send_file", Some(&big)).unwrap()["len"], big.to_string().len());
     }
 }
