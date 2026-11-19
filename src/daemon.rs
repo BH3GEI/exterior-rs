@@ -503,13 +503,25 @@ fn control(c: &agents::Ctl, chat: &str, head: &str, arg: &str) -> (String, Optio
             Err(e) => (format!("⚠️ 拿不到模型列表：{e}"), None),
             Ok(list) if list.is_empty() => ("这个 agent 没有可选的模型。".into(), None),
             Ok(list) => {
-                let items: Vec<(String, String)> = list.iter().enumerate().map(|(i, m)| (m.label.clone(), format!("/model {}", i + 1))).collect();
+                let items: Vec<(String, String)> = list.iter().enumerate().map(|(i, m)| {
+                    let full = format!("/model {}", m.value);
+                    (m.label.clone(), if full.len() <= 64 { full } else { format!("/model {}", i + 1) })
+                }).collect();
                 CHOICES.lock().unwrap().get_or_insert_with(HashMap::new).insert(chat.to_string(), list.into_iter().map(|m| m.value).collect());
                 ("选一个模型：".into(), Some(buttons(in_rows(items, 2))))
             }
         },
         "/model" => {
-            let value = arg.parse::<usize>().ok().and_then(|i| CHOICES.lock().unwrap().as_ref().and_then(|m| m.get(chat)).and_then(|l| l.get(i.wrapping_sub(1)).cloned())).unwrap_or_else(|| arg.to_string());
+            let value = match arg.parse::<usize>() {
+                Ok(i) => {
+                    let cached = CHOICES.lock().unwrap().as_ref().and_then(|m| m.get(chat)).and_then(|l| l.get(i.wrapping_sub(1)).cloned());
+                    match cached.or_else(|| c.models().ok().and_then(|l| l.get(i.wrapping_sub(1)).map(|m| m.value.clone()))) {
+                        Some(v) => v,
+                        None => return (format!("⚠️ 没有第 {i} 个模型，请发 /model 重新选择。"), None),
+                    }
+                }
+                Err(_) => arg.to_string(),
+            };
             match c.set_model(&value) { Ok(()) => (format!("已换成 {value}。"), None), Err(e) => (format!("⚠️ 没换成：{e}"), None) }
         }
         "/pi_thinking" if arg.is_empty() => {
