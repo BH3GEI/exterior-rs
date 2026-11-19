@@ -1,5 +1,7 @@
 application:
   subdomain: exterior
+  public_path:
+    - /api/
   routes:
     - /=http://worker:3000/
 services:

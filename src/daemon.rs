@@ -25,13 +25,13 @@ const BUTTON_DATA_MAX: usize = 64;
 /// Telegram's limits on the command menu.
 const MENU_MAX: usize = 100;
 const COMMAND_NAME_MAX: usize = 32;
-const COMMAND_DESC_MAX: usize = 60;
+const COMMAND_DESC_MAX: usize = 120;
 
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 type Own = Arc<Mutex<HashSet<u64>>>;
 
 /// The last list of choices shown for each topic and command, for buttons whose value is too long to fit in a
-/// button (they say "/pi_resume 3" and the number is looked up here).
+/// button (they say "/resume 3" and the number is looked up here).
 static CHOICES: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
 
 /// Buttons "/<cmd> <value>", or "/<cmd> <n>" where the value is too long; remembers the values for the numbers.
@@ -87,23 +87,92 @@ fn send_with(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Optio
 }
 
 fn send_one(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Option<Value>) -> Option<u64> {
-    // a network error or a server error is not a reason to drop the message: try again until it is delivered
-    // (the only things that end it: delivered, topic deleted, or a refusal that retrying cannot change)
+    let mut body = json!({"chat": chat, "text": text});
+    if let Some(b) = &btns { body["buttons"] = b.clone(); }
+    let id = post(sessions, chat, "/api/send", body).ok()?["id"].as_u64();
+    if let Some(i) = id { own.lock().unwrap().insert(i); }
+    id
+}
+
+/// One request to brief that puts something in a chat. A network error or a server error is not a reason to drop
+/// it: try again until it is delivered (the only things that end it: delivered, topic deleted, or a refusal that
+/// retrying cannot change).
+fn post(sessions: &Sessions, chat: &str, path: &str, body: Value) -> Result<Value, String> {
     let mut tries = 0u64;
     loop {
-        let mut body = json!({"chat": chat, "text": text});
-        if let Some(b) = &btns { body["buttons"] = b.clone(); }
-        match brief::tg_post("/api/send", body, true) {
-            Ok(v) => { let id = v["id"].as_u64(); if let Some(i) = id { own.lock().unwrap().insert(i); } return id; }
-            Err((410, _)) => { gone(sessions, chat); return None; }
+        match brief::tg_post(path, body.clone(), true) {
+            Ok(v) => return Ok(v),
+            Err((410, v)) => { gone(sessions, chat); return Err(format!("410 {v}")); }
             Err((c, v)) if c == 0 || c >= 500 => {
                 tries += 1;
-                if tries == 1 || tries % 20 == 0 { store::log(&format!("send {chat}: {c} {v}; retrying (attempt {tries})")); }
+                if tries == 1 || tries % 20 == 0 { store::log(&format!("{path} {chat}: {c} {v}; retrying (attempt {tries})")); }
                 std::thread::sleep(params::secs("retry_wait_s"));
             }
-            Err((c, v)) => { store::log(&format!("send {chat} failed {c} {v}")); return None; }
+            Err((c, v)) => { store::log(&format!("{path} {chat} failed {c} {v}")); return Err(format!("{c} {v}")); }
         }
     }
+}
+
+/// Telegram takes files up to 50 MB from a bot.
+const FILE_MAX: usize = 50_000_000;
+
+/// A file on the topic's device, sent to `chat` with the agent's caption. A relative path is in the topic's folder.
+fn send_file(own: &Own, sessions: &Sessions, chat: &str, dev: &str, dir: &str, alt: &str, path: &str) -> Result<(), String> {
+    let device = store::device(dev).ok_or_else(|| text::device_missing(dev))?;
+    let word = if let Some(r) = path.strip_prefix("~/") { format!("\"$HOME\"/{}", crate::host::quote(r)) }
+               else if path.starts_with('/') { crate::host::quote(path) }
+               else { crate::host::quote(&format!("{}/{path}", dir.trim_end_matches('/'))) };
+    let data = crate::host::read_bytes(&device, &word, FILE_MAX)?;
+    if data.len() > FILE_MAX { return Err(text::file_too_big(FILE_MAX / 1_000_000)); }
+    let name = path.rsplit('/').next().unwrap_or(path).to_string();
+    let v = post(sessions, chat, "/api/send_file", json!({"chat": chat, "name": name, "data": brief::base64(&data), "text": alt}))?;
+    if let Some(i) = v["id"].as_u64() { own.lock().unwrap().insert(i); }
+    store::log(&format!("file to {chat}: {path}"));
+    Ok(())
+}
+
+/// Something the agent said, with the files it pointed to (`![说明](路径)`) sent in their places.
+fn deliver(own: &Own, sessions: &Sessions, chat: &str, msg: &str) -> Option<u64> {
+    let ps = text::pieces(msg);
+    if let [text::Piece::Text(t)] = ps.as_slice() { return send(own, sessions, chat, t); }
+    let (dev, dir) = { let ss = sessions.lock().unwrap(); ss.get(chat).map(|s| (s.dev.clone(), s.dir.clone())).unwrap_or_default() };
+    let mut id = None;
+    for p in ps {
+        match p {
+            text::Piece::Text(t) => id = send(own, sessions, chat, &t),
+            text::Piece::File { alt, path } => if let Err(e) = send_file(own, sessions, chat, &dev, &dir, &alt, &path) {
+                store::log(&format!("file to {chat} failed: {path}: {e}"));
+                send(own, sessions, chat, &text::file_not_sent(&path, &e));
+            },
+        }
+    }
+    id
+}
+
+/// `exterior send <话题> <内容>` from an agent: signed with the sending topic's name and sent to the other topic
+/// (or to any chat brief knows, by its id), files included. Not marked as exterior's own, so the receiving topic's
+/// agent gets it.
+pub fn relay(from: &str, to: &str, body: &str) -> Result<String, String> {
+    let sessions = LIVE.lock().unwrap().clone().ok_or(text::NOT_READY)?;
+    let to = to.trim();
+    let (name, dev, dir, target, names) = {
+        let ss = sessions.lock().unwrap();
+        let s = ss.get(from).filter(|s| !s.deleted).ok_or_else(|| text::relay_from_unknown(from))?;
+        let target = ss.values().find(|t| !t.deleted && (t.name == to || t.tid == to)).map(|t| t.tid.clone());
+        let names: Vec<String> = ss.values().filter(|t| !t.deleted).map(|t| t.name.clone()).collect();
+        (s.name.clone(), s.dev.clone(), s.dir.clone(), target, names.join("、"))
+    };
+    let target = target.or_else(|| to.contains(':').then(|| to.to_string())).ok_or_else(|| text::relay_to_unknown(to, &names))?;
+    if body.trim().is_empty() { return Err(text::RELAY_EMPTY.into()); }
+    let own: Own = Arc::new(Mutex::new(HashSet::new()));
+    for p in text::pieces(&format!("{name} {} {}", params::get("relay_mark"), body.trim())) {
+        match p {
+            text::Piece::Text(t) => for part in text::pack(vec![t]) { post(&sessions, &target, "/api/send", json!({"chat": target, "text": part}))?; },
+            text::Piece::File { alt, path } => send_file(&own, &sessions, &target, &dev, &dir, &alt, &path).map_err(|e| format!("{path}：{e}"))?,
+        }
+    }
+    store::log(&format!("relay {name} -> {to}"));
+    Ok(text::relayed(to))
 }
 
 /// The topic was deleted in Telegram: close the session, delete nothing.
@@ -200,40 +269,55 @@ fn start_agent(s: &mut Session, tx: &Sender<Ev>) -> Result<(), String> {
     Ok(())
 }
 
-/// The "/" menu: exterior's commands, the built-ins, then each agent's own commands with its kind's prefix.
+/// exterior's own commands carry its name, so every other command belongs to the topic's agent.
+pub const OWN: &str = "exterior_";
+
+/// "design-sync" → "design_sync": Telegram allows only lowercase letters, digits and _ in a command.
+fn menu_name(orig: &str) -> String {
+    let mut n: String = orig.to_lowercase().chars().map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' { c } else { '_' }).collect();
+    n.truncate(COMMAND_NAME_MAX);
+    n
+}
+
+/// The "/" menu: exterior's own commands, then the agents' commands without any prefix: claude's as claude lists
+/// them, pi's as pi lists them plus the table (agents::BUILTINS), codex's from the table. One entry per name; its
+/// grey description says which agents have it. The topic's current agent decides what a command does.
 pub fn build_menu() -> Result<usize, String> {
     let dev = store::default_device().ok_or(text::NO_DEVICE)?;
+    let has = |k: Kind| dev["agents"].as_array().into_iter().flatten().any(|a| a["kind"] == k.name());
     let mut cmds = vec![
-        json!({"command": "stop", "description": text::MENU_STOP}),
-        json!({"command": "exit", "description": text::MENU_EXIT}),
-        json!({"command": "agent", "description": text::MENU_AGENT}),
+        json!({"command": format!("{OWN}stop"), "description": text::MENU_STOP}),
+        json!({"command": format!("{OWN}exit"), "description": text::MENU_EXIT}),
+        json!({"command": format!("{OWN}agent"), "description": text::MENU_AGENT}),
     ];
-    if dev["agents"].as_array().into_iter().flatten().any(|a| a["kind"] == Kind::Claude.name()) {
-        cmds.push(json!({"command": "cc_account", "description": text::MENU_ACCOUNT}));
-    }
-    for (k, n) in agents::BUILTINS {
-        if dev["agents"].as_array().into_iter().flatten().any(|a| a["kind"] == k.name()) {
-            cmds.push(json!({"command": agents::builtin_command(*k, n), "description": text::builtin_desc(k.label(), n)}));
-        }
-    }
+    if has(Kind::Claude) { cmds.push(json!({"command": format!("{OWN}account"), "description": text::MENU_ACCOUNT})); }
+    // menu name → (agent kind → the agent's own name for it), and the first description found
+    let mut order: Vec<String> = Vec::new();
     let mut map = serde_json::Map::new();
-    let mut used: HashSet<String> = cmds.iter().filter_map(|c| c["command"].as_str().map(String::from)).collect();
+    let mut desc: HashMap<String, String> = HashMap::new();
     let root = crate::prompt::root(&dev);
     for kind in Kind::ALL {
         let Some(row) = dev["agents"].as_array().into_iter().flatten().find(|a| a["kind"] == kind.name()) else { continue };
-        for (orig, desc) in agents::commands(&dev, &root, row["command"].as_str().unwrap_or(""), kind) {
-            let mut tg: String = format!("{}_{}", kind.prefix(), orig.to_lowercase()).chars().map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' { c } else { '_' }).collect();
-            tg.truncate(COMMAND_NAME_MAX);
-            if !used.insert(tg.clone()) { continue; }
-            let d = if desc.trim().is_empty() { format!("/{orig}") } else { desc.trim().replace('\n', " ") };
-            let full = format!("{} · {d}", kind.label());
-            let d: String = if full.chars().count() > COMMAND_DESC_MAX { format!("{}…", full.chars().take(COMMAND_DESC_MAX - 1).collect::<String>()) } else { full };
-            // Telegram shows at most MENU_MAX commands; the rest still work when typed
-            if cmds.len() < MENU_MAX { cmds.push(json!({"command": tg.clone(), "description": d})); }
-            map.insert(tg, json!([kind.name(), orig]));
+        let table = agents::BUILTINS.iter().filter(|(k, _)| *k == kind).map(|(_, n)| (n.to_string(), text::builtin_desc(n)));
+        let own = agents::commands(&dev, &root, row["command"].as_str().unwrap_or(""), kind);
+        for (orig, d) in table.chain(own) {
+            let tg = menu_name(&orig);
+            if tg.is_empty() || tg.starts_with(OWN) { continue; }
+            let e = map.entry(tg.clone()).or_insert_with(|| { order.push(tg.clone()); json!({}) });
+            if e[kind.name()].is_null() { e[kind.name()] = json!(orig); }
+            let d = d.trim().replace('\n', " ");
+            if !d.is_empty() { desc.entry(tg).or_insert(d); }
         }
     }
     if map.is_empty() { return Err(text::NO_COMMANDS.into()); }
+    for tg in &order {
+        // Telegram shows at most MENU_MAX commands; the rest still work when typed
+        if cmds.len() >= MENU_MAX { break; }
+        let who: Vec<&str> = Kind::ALL.iter().filter(|k| !map[tg][k.name()].is_null()).map(|k| k.label()).collect();
+        let full = format!("{} · {}", who.join(" / "), desc.get(tg).cloned().unwrap_or_else(|| format!("/{tg}")));
+        let d: String = if full.chars().count() > COMMAND_DESC_MAX { format!("{}…", full.chars().take(COMMAND_DESC_MAX - 1).collect::<String>()) } else { full };
+        cmds.push(json!({"command": tg, "description": d}));
+    }
     let n = cmds.len();
     brief::post("/api/bots/commands", json!({"commands": cmds})).map_err(|(c, v)| format!("{c} {v}"))?;
     store::set_state("menu", Value::Object(map));
@@ -277,7 +361,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 if let Some(e) = &error { o.said.push(text::failed(e)); }
                 if o.said.is_empty() && !o.spoke { o.said.push(text::sys(text::DONE_EMPTY)); }
                 let msgs = take(&mut o);
-                for m in &msgs { if send(&own, &sessions, &tid, m).is_none() { store::log(&format!("answer for {tid} could not be delivered")); } }
+                for m in &msgs { if deliver(&own, &sessions, &tid, m).is_none() { store::log(&format!("answer for {tid} could not be delivered")); } }
                 let body = msgs.join("\n\n");
                 let who = {
                     let mut ss = sessions.lock().unwrap();
@@ -342,7 +426,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 };
                 if let Some(mut o) = outs.remove(&tid) {
                     settle(&mut o);
-                    if !o.said.is_empty() { o.said.push(text::sys_warn(text::CUT_SUFFIX)); for b in take(&mut o) { send(&own, &sessions, &tid, &b); } }
+                    if !o.said.is_empty() { o.said.push(text::sys_warn(text::CUT_SUFFIX)); for b in take(&mut o) { deliver(&own, &sessions, &tid, &b); } }
                 }
                 if current(&tid, gen) || warn {
                     let why = agents::last_lines(&why);
@@ -380,7 +464,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 let first = msgs.remove(0);
                 // what did not fit stays first in line for this topic
                 if !msgs.is_empty() { o.said = msgs; o.since = Some(Instant::now() - merge); }
-                send(&own, &sessions, &tid, &first);
+                deliver(&own, &sessions, &tid, &first);
             }
         }
     }
@@ -521,7 +605,7 @@ fn account_buttons(dev: &Value, cur: &str) -> Result<(String, Value), String> {
         if l.starts_with('#') { if let Some(t) = f.last().and_then(|t| t.parse::<u64>().ok()) { age = store::now().saturating_sub(t) / 60; } continue; }
         if f.len() < 4 || f[3] != "ok" || format!("cc{}", f[0]) == cur { continue; }
         if store::agent(dev, &format!("cc{}", f[0])).is_none() { continue; }
-        items.push((text::account_label(f[0], f[1], f[2]), format!("/cc_account {}", f[0])));
+        items.push((text::account_label(f[0], f[1], f[2]), format!("/{OWN}account {}", f[0])));
     }
     if items.is_empty() { return Err(text::NO_ACCOUNTS.into()); }
     Ok((text::choose_account(cur, age), buttons(in_rows(items, 1))))
@@ -643,9 +727,15 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
         let mut say: Option<String> = None;
         let head = t.split_whitespace().next().unwrap_or("");
         let arg = t[head.len()..].trim().to_string();
-        let builtin = agents::find_builtin(head);
-        let own_prefix = Kind::ALL.iter().find(|k| head.starts_with(&format!("/{}_", k.prefix()))).copied();
-        if head == "/exit" {
+        // a command: exterior's own (exterior_…), else the current agent's: from the table (pi, codex) or passed on
+        // as the agent's own command; anything the agent does not have goes to it as it is
+        let own_cmd = head.strip_prefix('/').and_then(|h| h.strip_prefix(OWN));
+        let agent_cmd: Option<String> = match (head.strip_prefix('/'), cur_kind) {
+            (Some(h), Some(k)) if own_cmd.is_none() => store::state("menu")[h][k.name()].as_str().map(String::from),
+            _ => None,
+        };
+        let builtin = match (&agent_cmd, cur_kind) { (Some(o), Some(k)) => agents::builtin(k, o).map(|n| (k, n)), _ => None };
+        if own_cmd == Some("exit") {
             if let Some(a) = s.agent.as_mut() { a.stop(); a.kill(); }
             s.agent = None; s.gen += 1; s.pending = false;
             store::note_set(chat, "session", Value::Null);
@@ -654,8 +744,7 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             set_status(chat, st::NEW);
             reply = Some(text::session_ended(&cur));
         } else if let Some((k, name)) = builtin {
-            if Some(k) != cur_kind { reply = Some(text::wrong_agent(k.label(), &cur)); }
-            else if agents::is_quit(name) {
+            if agents::is_quit(name) {
                 if let Some(a) = s.agent.as_mut() { a.stop(); a.kill(); }
                 s.agent = None; s.gen += 1; s.pending = false;
                 set_status(chat, st::STOPPED);
@@ -668,13 +757,13 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                 }
                 if let Some(a) = s.agent.as_ref() { ctl = Some((a.ctl(), k, name, arg.clone())); }
             }
-        } else if head == "/stop" {
+        } else if own_cmd == Some("stop") {
             match s.agent.as_mut() { Some(a) if s.pending => a.stop(), _ => reply = Some(text::NOTHING_RUNNING.into()) }
-        } else if head == "/agent" && arg.is_empty() {
+        } else if own_cmd == Some("agent") && arg.is_empty() {
             reply = Some(text::current_agent(&cur));
-            let names: Vec<(String, String)> = agent_names(&s.dev).into_iter().filter(|n| *n != cur).map(|n| (n.clone(), format!("/agent {n}"))).collect();
+            let names: Vec<(String, String)> = agent_names(&s.dev).into_iter().filter(|n| *n != cur).map(|n| (n.clone(), format!("/{OWN}agent {n}"))).collect();
             reply_buttons = Some(buttons(in_rows(names, 4)));
-        } else if head == "/agent" {
+        } else if own_cmd == Some("agent") {
             let want = arg.clone();
             match dev.as_ref().and_then(|d| store::agent(d, &want)) {
                 None => reply = Some(text::no_such_agent(&want, &agent_names(&s.dev).join("、"))),
@@ -695,7 +784,7 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                     }
                 }
             }
-        } else if head == "/cc_account" {
+        } else if own_cmd == Some("account") {
             let acct = n["resolved"].as_str().unwrap_or(&cur).to_string();
             if cur_kind != Some(Kind::Claude) { reply = Some(text::wrong_agent(Kind::Claude.label(), &cur)); }
             else if arg.is_empty() {
@@ -720,23 +809,13 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                     std::thread::spawn(move || switch_account(&sessions, &own, &tx, &chat, d, &acct, &want, sid));
                 }
             }
-        } else if let Some(kind) = own_prefix {
-            // one of an agent's own commands, as listed in the menu
-            let cmd = &head[1..];
-            match store::state("menu").get(cmd).cloned() {
-                None => reply = Some(text::no_such_command(cmd)),
-                Some(e) => {
-                    let orig = e[1].as_str().unwrap_or("");
-                    if Some(kind) != cur_kind { reply = Some(text::wrong_agent(kind.label(), &cur)); }
-                    else if kind == Kind::Claude && orig == "effort" && arg.is_empty() {
-                        reply = Some(text::choose_effort(n["effort"].as_str()));
-                        reply_buttons = Some(buttons(in_rows(agents::CLAUDE_EFFORTS.iter().map(|l| (l.to_string(), format!("/{cmd} {l}"))).collect(), 3)));
-                    } else {
-                        // remembered, so a restarted process starts with the same level
-                        if kind == Kind::Claude && orig == "effort" && agents::CLAUDE_EFFORTS.contains(&arg.as_str()) { store::note_set(chat, "effort", json!(arg)); }
-                        say = Some(format!("/{orig}{}{arg}", if arg.is_empty() { "" } else { " " })); }
-                }
-            }
+        } else if let Some(c) = own_cmd {
+            reply = Some(text::no_such_command(&format!("{OWN}{c}")));
+        } else if let Some(orig) = &agent_cmd {
+            // the agent's own command (claude's; pi's extensions, templates, skills), under the agent's own name.
+            // claude's effort is remembered so a restarted process keeps it
+            if cur_kind == Some(Kind::Claude) && orig == "effort" && agents::CLAUDE_EFFORTS.contains(&arg.as_str()) { store::note_set(chat, "effort", json!(arg)); }
+            say = Some(format!("/{orig}{}{arg}", if arg.is_empty() { "" } else { " " }));
         } else {
             say = Some(msg.to_string());
         }
@@ -768,80 +847,74 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             let a = control(&c, &chat, kind, name, &arg);
             if let Some(id) = &a.session { store::note_set(&chat, "session", json!(id)); }
             if a.started {
-                // /cx_review runs as a turn: its result arrives like an answer
+                // /review runs as a turn: its result arrives like an answer
                 if let Some(s) = sessions.lock().unwrap().get_mut(&chat) { s.pending = true; }
                 set_status(&chat, st::RUNNING);
             }
-            match a.file {
-                Some((name, data)) => {
-                    let r = brief::tg_post("/api/send_file", json!({"chat": chat, "name": name, "data": brief::base64(&data), "text": text::as_sys(&a.text)}), true);
-                    if let Err((c, v)) = r { send_with(&own, &sessions, &chat, &text::failed(&format!("{c} {v}")), None); }
-                }
-                None => { let t = if a.raw { a.text.clone() } else { text::as_sys(&a.text) }; send_with(&own, &sessions, &chat, &t, a.buttons); }
-            }
+            let t = if a.raw { a.text.clone() } else { text::as_sys(&a.text) };
+            send_with(&own, &sessions, &chat, &t, a.buttons);
         });
     }
 }
 
-/// What a built-in command answers in the topic, and what it changed.
-/// raw: the text is content the agent produced (a diff, a copied answer, a listing), shown as is; otherwise it is
-/// exterior's own reply and is shown as a notice.
-struct Answer { text: String, buttons: Option<Value>, session: Option<String>, started: bool, file: Option<(String, Vec<u8>)>, raw: bool }
+/// What a table command (pi, codex) answers in the topic, and what it changed.
+/// raw: what the agent itself answered, shown as it is; otherwise a notice of exterior's own (a choice to make,
+/// or a failure).
+struct Answer { text: String, buttons: Option<Value>, session: Option<String>, started: bool, raw: bool }
 
 impl Answer {
-    fn say(t: impl Into<String>) -> Answer { Answer { text: t.into(), buttons: None, session: None, started: false, file: None, raw: false } }
+    fn say(t: impl Into<String>) -> Answer { Answer { text: t.into(), buttons: None, session: None, started: false, raw: false } }
     fn raw(t: impl Into<String>) -> Answer { Answer { raw: true, ..Answer::say(t) } }
     fn choose(t: impl Into<String>, b: Value) -> Answer { Answer { buttons: Some(b), ..Answer::say(t) } }
 }
 
-/// The agents' own commands that go through the protocol (agents::BUILTINS), answered without holding the sessions lock.
+/// The agent's answer to a request, as it gave it; or a notice that it gave none.
+fn agent_said(kind: Kind, name: &str, d: &Value) -> Answer {
+    let empty = d.is_null() || d.as_object().map(|o| o.keys().all(|k| k.starts_with('_'))).unwrap_or(false) || d.as_str().map(|t| t.trim().is_empty()).unwrap_or(false);
+    if empty { return Answer::say(text::no_output(kind.label(), name)); }
+    Answer::raw(match d.as_str() { Some(t) => t.to_string(), None => text::shown(&text::show(d)) })
+}
+
+/// The table commands (agents::BUILTINS), answered without holding the sessions lock. What the agent answers is
+/// shown as it is; exterior adds only the buttons for a choice the agent offers.
 fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> Answer {
-    let cmd = agents::builtin_command(kind, name);
+    let cmd = name;
     match name {
         "model" if arg.is_empty() => match c.models() {
             Err(e) => Answer::say(text::models_failed(&e)),
             Ok(list) if list.is_empty() => Answer::say(text::NO_MODELS),
-            Ok(list) => Answer::choose(text::CHOOSE_MODEL, choice_buttons(chat, &cmd, list.into_iter().map(|m| (m.label, m.value)).collect(), 2)),
+            Ok(list) => Answer::choose(text::CHOOSE_MODEL, choice_buttons(chat, cmd, list.into_iter().map(|m| (m.label, m.value)).collect(), 2)),
         },
         "model" => {
             let value = match arg.parse::<usize>() {
-                Ok(i) => match chosen(chat, &cmd, arg).or_else(|| c.models().ok().and_then(|l| l.get(i.wrapping_sub(1)).map(|m| m.value.clone()))) {
+                Ok(i) => match chosen(chat, cmd, arg).or_else(|| c.models().ok().and_then(|l| l.get(i.wrapping_sub(1)).map(|m| m.value.clone()))) {
                     Some(v) => v,
-                    None => return Answer::say(text::no_model_at(i, &cmd)),
+                    None => return Answer::say(text::no_model_at(i, cmd)),
                 },
                 Err(_) => arg.to_string(),
             };
-            match c.set_model(&value) { Ok(()) => Answer::say(text::model_set(&value)), Err(e) => Answer::say(text::model_failed(&e)) }
+            match c.set_model(&value) {
+                // codex takes the model with each turn: exterior keeps it, codex has nothing to say yet
+                Ok(Value::Null) if kind == Kind::Codex => Answer::say(text::codex_model_kept(&value)),
+                Ok(d) => agent_said(kind, name, &d),
+                Err(e) => Answer::say(text::model_failed(&e)),
+            }
         }
         "thinking" if arg.is_empty() => match c.thinking_levels() {
             Ok(levels) => Answer::choose(text::CHOOSE_THINKING, buttons(in_rows(levels.into_iter().map(|l| (l.clone(), format!("/{cmd} {l}"))).collect(), 3))),
             Err(e) => Answer::say(text::thinking_failed(&e)),
         },
-        "name" | "rename" if arg.is_empty() => Answer::say(text::name_needed(&cmd)),
-        _ => match c.builtin(name, &chosen(chat, &cmd, arg).unwrap_or_else(|| arg.to_string())) {
+        "name" | "rename" if arg.is_empty() => Answer::say(text::name_needed(cmd)),
+        _ => match c.builtin(name, &chosen(chat, cmd, arg).unwrap_or_else(|| arg.to_string())) {
             Err(e) => Answer::say(text::failed(&e)),
             Ok(d) => {
                 let mut a = match name {
-                    "thinking" => Answer::say(text::thinking_set(arg)),
-                    "compact" => Answer::say(text::COMPACTED),
-                    "new" | "clear" => Answer::say(text::NEW_SESSION),
-                    "name" => Answer::say(text::name_set(arg)),
-                    "rename" => Answer::say(text::renamed(arg)),
-                    "clone" => Answer::say(text::cloned(d["_session"].as_str().unwrap_or("—"))),
-                    "archive" => Answer::say(text::archived(d["_session"].as_str().unwrap_or("—"))),
-                    "copy" => Answer::raw(d["text"].as_str().filter(|t| !t.trim().is_empty()).unwrap_or(text::NOTHING_TO_COPY)),
-                    "logout" => Answer::say(text::LOGGED_OUT),
-                    "goal" if arg == "clear" => Answer::say(text::GOAL_CLEARED),
-                    "goal" if !arg.is_empty() => Answer::say(text::goal_set(arg)),
-                    "diff" => {
-                        let out = d["stdout"].as_str().unwrap_or("").trim().to_string();
-                        if out.is_empty() { Answer::say(text::NO_DIFF) } else { Answer::raw(out) }
-                    }
+                    // the choices the agent offers, as buttons
                     "resume" if arg.is_empty() && kind == Kind::Pi => {
                         let dir = d["_dir"].as_str().unwrap_or("");
                         let items: Vec<(String, String)> = d["output"].as_str().unwrap_or("").lines().map(str::trim).filter(|f| f.ends_with(".jsonl"))
                             .map(|f| (f.chars().take(40).collect(), format!("{dir}/{f}"))).collect();
-                        if items.is_empty() { Answer::say(text::NO_SESSIONS) } else { Answer::choose(text::CHOOSE_SESSION, choice_buttons(chat, &cmd, items, 1)) }
+                        if items.is_empty() { agent_said(kind, name, &d) } else { Answer::choose(text::CHOOSE_SESSION, choice_buttons(chat, cmd, items, 1)) }
                     }
                     "resume" if arg.is_empty() => {
                         let items: Vec<(String, String)> = d["data"].as_array().into_iter().flatten().filter_map(|t| {
@@ -849,38 +922,23 @@ fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> An
                             let label = t["name"].as_str().or(t["preview"].as_str()).unwrap_or(id).chars().take(40).collect();
                             Some((label, id.to_string()))
                         }).collect();
-                        if items.is_empty() { Answer::say(text::NO_SESSIONS) } else { Answer::choose(text::CHOOSE_SESSION, choice_buttons(chat, &cmd, items, 1)) }
+                        if items.is_empty() { agent_said(kind, name, &d) } else { Answer::choose(text::CHOOSE_SESSION, choice_buttons(chat, cmd, items, 1)) }
                     }
-                    "resume" | "import" => Answer::say(text::resumed(d["_session"].as_str().unwrap_or(arg))),
-                    "fork" if kind == Kind::Codex => Answer::say(text::resumed(d["_session"].as_str().unwrap_or("—"))),
-                    "export" if kind == Kind::Claude => {
-                        let name = d["default_filename"].as_str().or(d["filename"].as_str()).unwrap_or("conversation.txt").to_string();
-                        let body = ["content", "text", "conversation"].iter().find_map(|k| d[*k].as_str()).unwrap_or("").to_string();
-                        let mut a = Answer::say(text::exported_file(&name));
-                        a.file = Some((name, body.into_bytes()));
-                        a
-                    }
-                    "session" => Answer::raw(text::session_stats(&d)),
-                    "export" => Answer::say(text::exported(d["path"].as_str().unwrap_or("—"))),
                     "fork" if arg.is_empty() && kind == Kind::Pi => {
                         let items: Vec<(String, String)> = d["messages"].as_array().into_iter().flatten().filter_map(|m| {
                             Some((m["text"].as_str()?.chars().take(30).collect(), m["entryId"].as_str()?.to_string()))
                         }).collect();
-                        if items.is_empty() { Answer::say(text::NO_FORK_POINTS) } else { Answer::choose(text::CHOOSE_FORK, choice_buttons(chat, &cmd, items, 1)) }
+                        if items.is_empty() { agent_said(kind, name, &d) } else { Answer::choose(text::CHOOSE_FORK, choice_buttons(chat, cmd, items, 1)) }
                     }
-                    "fork" if d["cancelled"] == true => Answer::say(text::FORK_CANCELLED),
-                    "fork" => Answer::raw(text::forked(d["text"].as_str().unwrap_or(""))),
-                    "status" if kind == Kind::Codex => Answer::raw(text::codex_status(d["_model"].as_str().unwrap_or(text::DEFAULT_MODEL), &d["rateLimits"])),
-                    "review" => {
-                        let t = agents::review_target(arg);
-                        let v = t["sha"].as_str().or(t["branch"].as_str()).unwrap_or("");
-                        let mut a = Answer::say(text::review_started(&text::review_target(t["type"].as_str().unwrap_or(""), v)));
-                        a.started = true;
-                        a
+                    // what a command printed, as it printed it
+                    "diff" | "copy" => {
+                        let out = d["stdout"].as_str().or(d["text"].as_str()).unwrap_or("").trim().to_string();
+                        if out.is_empty() { agent_said(kind, name, &d) } else { Answer::raw(out) }
                     }
-                    // the commands that only show information
-                    _ => Answer::raw(text::show(&d)),
+                    _ => agent_said(kind, name, &d),
                 };
+                // /review runs as a turn: its result arrives like an answer
+                if name == "review" { a.started = true; }
                 a.session = d["_session"].as_str().map(String::from);
                 a
             }
@@ -915,13 +973,12 @@ mod tests {
         assert_eq!(strip_bot_mention("邮件 a@b.c"), "邮件 a@b.c");
         assert_eq!(relay_split("测试 → 你好"), Some(("测试", "你好")));
         assert_eq!(relay_split("没有分隔符"), None);
-        assert!(matches!(agents::find_builtin("/pi_thinking"), Some((Kind::Pi, "thinking"))));
-        assert!(matches!(agents::find_builtin("/cx_new"), Some((Kind::Codex, "new"))));
-        assert!(agents::find_builtin("/cc_compact").is_none());
-        assert!(matches!(agents::find_builtin("/cc_model"), Some((Kind::Claude, "model"))));
-        assert!(matches!(agents::find_builtin("/pi_fork"), Some((Kind::Pi, "fork"))));
-        assert!(matches!(agents::find_builtin("/cx_review"), Some((Kind::Codex, "review"))));
-        assert!(agents::find_builtin("/model").is_none());
+        assert_eq!(agents::builtin(Kind::Pi, "thinking"), Some("thinking"));
+        assert_eq!(agents::builtin(Kind::Codex, "review"), Some("review"));
+        assert_eq!(agents::builtin(Kind::Claude, "model"), None);
+        assert_eq!(agents::builtin(Kind::Codex, "thinking"), None);
+        assert_eq!(menu_name("design-sync"), "design_sync");
+        assert_eq!(menu_name("skill:Foo.Bar"), "skill_foo_bar");
         assert_eq!(agents::review_target("")["type"], "uncommittedChanges");
         assert_eq!(agents::review_target("abc1234")["type"], "commit");
         assert_eq!(agents::review_target("main")["branch"], "main");
@@ -932,12 +989,10 @@ mod tests {
 
 #[cfg(test)]
 mod text_tests {
-    use serde_json::json;
     #[test]
     fn status() {
-        let s = crate::text::codex_status("gpt", &json!({"credits": {"hasCredits": false}, "primary": {"usedPercent": 100, "windowDurationMins": 10080}, "secondary": null, "rateLimitReachedType": "x"}));
-        assert!(s.contains("7 天用量：100%") && s.contains("额度余额：无") && s.contains("已达上限：x"), "{s}");
         assert_eq!(crate::text::window(Some(300)), "5 小时");
+        assert_eq!(crate::text::window(Some(10080)), "7 天");
     }
 }
 
@@ -948,10 +1003,30 @@ mod more_tests {
         assert_eq!(crate::brief::base64(b"hello"), "aGVsbG8=");
         assert_eq!(crate::brief::base64(b"ab"), "YWI=");
         assert_eq!(crate::brief::base64(b"abc"), "YWJj");
-        let b = super::choice_buttons("tgbot:1", "pi_resume", vec![("a".into(), "x".repeat(80)), ("b".into(), "short".into())], 1);
-        assert_eq!(b[0][0]["data"], "/pi_resume 1");
-        assert_eq!(b[1][0]["data"], "/pi_resume short");
-        assert_eq!(super::chosen("tgbot:1", "pi_resume", "1").as_deref(), Some("x".repeat(80).as_str()));
+        let b = super::choice_buttons("tgbot:1", "resume", vec![("a".into(), "x".repeat(80)), ("b".into(), "short".into())], 1);
+        assert_eq!(b[0][0]["data"], "/resume 1");
+        assert_eq!(b[1][0]["data"], "/resume short");
+        assert_eq!(super::chosen("tgbot:1", "resume", "1").as_deref(), Some("x".repeat(80).as_str()));
         assert!(crate::text::show(&serde_json::json!({"a": 1, "b": {"c": "d"}, "_x": 2})).contains("  c：d"));
+        // what an agent answers is shown as it is; nothing at all is said to be nothing
+        let a = super::agent_said(crate::agents::Kind::Pi, "compact", &serde_json::json!({"summary": "s", "tokensBefore": 5}));
+        assert!(a.raw && a.text.contains("summary：s") && a.text.starts_with("```"));
+        let a = super::agent_said(crate::agents::Kind::Codex, "compact", &serde_json::json!({}));
+        assert!(!a.raw && a.text.contains("Codex 执行了 /compact"));
+    }
+
+    #[test]
+    fn files_in_answers() {
+        use crate::text::{pieces, Piece};
+        let file = |a: &str, p: &str| Piece::File { alt: a.into(), path: p.into() };
+        assert_eq!(pieces("没有图"), vec![Piece::Text("没有图".into())]);
+        assert_eq!(pieces("看图：\n![结果](/tmp/a b.png)\n说明"), vec![Piece::Text("看图：".into()), file("结果", "/tmp/a b.png"), Piece::Text("说明".into())]);
+        assert_eq!(pieces("![x](<files/a (1).png>)"), vec![file("x", "files/a (1).png")]);
+        // web images, code and inline code are left alone
+        let keep = ["![x](https://a.com/b.png)", "```\n![x](/a.png)\n```", "`![x](/a.png)`", "````\n```\n![x](/a.png)\n```\n````"];
+        for k in keep { assert_eq!(pieces(k), vec![Piece::Text(k.into())], "{k}"); }
+        // a step's folded content is in a fence: never sent as a file
+        let step = crate::text::step("🔧 Read", "![x](/a.png)").join("");
+        assert_eq!(pieces(&step), vec![Piece::Text(step.clone())]);
     }
 }

@@ -54,7 +54,7 @@ fn probe(a: &[String]) {
             _ => "",
         };
         let r = c.builtin(name, arg);
-        println!("/{} {arg}: {:?}", agents::builtin_command(*k, name), r.as_ref().map(|v| v.to_string().chars().take(3000).collect::<String>()));
+        println!("/{name} {arg} ({}): {:?}", k.label(), r.as_ref().map(|v| v.to_string().chars().take(3000).collect::<String>()));
         if *name == "fork" {
             if let Some(e) = r.ok().and_then(|v| v["messages"][0]["entryId"].as_str().map(String::from)) {
                 println!("/pi_fork {e}: {:?}", c.builtin("fork", &e).map(|v| v.to_string()));

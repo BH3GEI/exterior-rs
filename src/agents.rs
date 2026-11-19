@@ -17,8 +17,6 @@ impl Kind {
     }
     pub fn name(&self) -> &'static str { match self { Kind::Claude => "claude", Kind::Pi => "pi", Kind::Codex => "codex" } }
     pub fn label(&self) -> &'static str { match self { Kind::Claude => "Claude", Kind::Pi => "Pi", Kind::Codex => "Codex" } }
-    /// The prefix of this kind's commands in the Telegram menu (cc_model, pi_compact, cx_new…).
-    pub fn prefix(&self) -> &'static str { match self { Kind::Claude => "cc", Kind::Pi => "pi", Kind::Codex => "cx" } }
     pub const ALL: [Kind; 3] = [Kind::Claude, Kind::Pi, Kind::Codex];
 }
 
@@ -26,8 +24,6 @@ impl Kind {
 /// the agent's own name (pi's /thinking is pi_thinking, codex's /model is cx_model); exterior only turns it into the
 /// protocol call. The menu, the dispatch and the "which agent is this for" check are all built from this table.
 pub const BUILTINS: &[(Kind, &str)] = &[
-    (Kind::Claude, "model"), (Kind::Claude, "status"), (Kind::Claude, "cost"), (Kind::Claude, "export"), (Kind::Claude, "hooks"),
-    (Kind::Claude, "permissions"), (Kind::Claude, "memory"), (Kind::Claude, "exit"),
     (Kind::Pi, "model"), (Kind::Pi, "thinking"), (Kind::Pi, "compact"), (Kind::Pi, "new"), (Kind::Pi, "name"), (Kind::Pi, "session"),
     (Kind::Pi, "fork"), (Kind::Pi, "clone"), (Kind::Pi, "tree"), (Kind::Pi, "export"), (Kind::Pi, "copy"), (Kind::Pi, "resume"),
     (Kind::Pi, "import"), (Kind::Pi, "quit"),
@@ -41,13 +37,9 @@ pub const BUILTINS: &[(Kind, &str)] = &[
 /// Built-ins that end the agent's process (the session is kept, so the next message resumes it).
 pub fn is_quit(name: &str) -> bool { matches!(name, "exit" | "quit") }
 
-/// The menu name of a built-in command, e.g. pi_thinking.
-pub fn builtin_command(kind: Kind, name: &str) -> String { format!("{}_{name}", kind.prefix()) }
-
-/// "/pi_thinking" → (Pi, "thinking").
-pub fn find_builtin(head: &str) -> Option<(Kind, &'static str)> {
-    let h = head.trim_start_matches('/');
-    BUILTINS.iter().find(|(k, n)| builtin_command(*k, n) == h).copied()
+/// The table entry for one of pi's or codex's commands (claude's own commands go to claude as they are).
+pub fn builtin(kind: Kind, name: &str) -> Option<&'static str> {
+    BUILTINS.iter().find(|(k, n)| *k == kind && *n == name).map(|(_, n)| *n)
 }
 
 /// The line that tells a new agent where the previous session is, in the previous agent's own words.
@@ -83,7 +75,7 @@ pub struct Spec {
     pub kind: Kind,
     pub gen: u64,
     pub resume: Option<String>,
-    /// claude's effort level picked with /cc_effort; "/effort" only lasts for one process, so it is passed again at start
+    /// claude's effort level picked with /effort; "/effort" only lasts for one process, so it is passed again at start
     pub effort: Option<String>,
 }
 
@@ -114,7 +106,9 @@ pub struct Agent {
 }
 
 fn env(spec: &Spec) -> Vec<(&'static str, String)> {
-    vec![("EXTERIOR_SESSION", spec.topic.clone()), ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1".into())]
+    // EXTERIOR_TOPIC: who is speaking when the agent runs `exterior send`; PATH: where that command is
+    vec![("EXTERIOR_SESSION", spec.topic.clone()), ("EXTERIOR_TOPIC", spec.tid.clone()), ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1".into()),
+         ("PATH", crate::prompt::bin_dir(&spec.dev))]
 }
 
 /// stderr: remember the last lines (for error messages) and notice "→ cc6" style picks.
@@ -475,7 +469,7 @@ impl Agent {
                         let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() });
                     }
                     "item/completed" if p["item"]["type"] == "exitedReviewMode" => {
-                        // the result of /cx_review
+                        // the result of codex's /review
                         if let Some(r) = p["item"]["review"].as_str() { reply.push_str(r); let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: r.to_string() }); }
                     }
                     "item/completed" if p["item"]["type"] == "agentMessage" => {
@@ -672,9 +666,11 @@ impl Ctl {
         }
     }
 
-    pub fn set_model(&self, value: &str) -> Result<(), String> {
+    /// Switch model. Returns what the agent answered (pi: the model it now uses). codex has no such request: the
+    /// model is passed with each turn, so nothing comes back (Null).
+    pub fn set_model(&self, value: &str) -> Result<Value, String> {
         let r = match self.kind {
-            Kind::Claude => self.ask(|id| json!({"type": "control_request", "request_id": id, "request": {"subtype": "set_model", "model": value}}))?,
+            Kind::Claude => return Err(text::NOT_SUPPORTED.into()),
             Kind::Pi => {
                 // pi wants the provider and the id separately: find the model in pi's own list
                 let list = self.models()?;
@@ -683,10 +679,10 @@ impl Ctl {
                 let (p, m) = (c.provider.clone().unwrap_or_default(), c.id.clone());
                 self.ask(|id| json!({"type": "set_model", "id": id, "provider": p, "modelId": m}))?
             }
-            Kind::Codex => { *self.model.lock().unwrap() = Some(value.to_string()); return Ok(()); }
+            Kind::Codex => { *self.model.lock().unwrap() = Some(value.to_string()); return Ok(Value::Null); }
         };
-        if r["subtype"] == "error" || r["success"] == false { return Err(r["error"].as_str().unwrap_or(text::SET_MODEL_FAILED).to_string()); }
-        Ok(())
+        if r["success"] == false { return Err(r["error"].as_str().unwrap_or(text::SET_MODEL_FAILED).to_string()); }
+        Ok(r["data"].clone())
     }
 
     /// The thinking levels the agent offers for its current model (pi).
@@ -707,15 +703,8 @@ impl Ctl {
         self.ready()?;
         let codex_thread = || self.thread.lock().unwrap().clone().ok_or_else(|| text::CODEX_NOT_READY.to_string());
         let start_params = || json!({"cwd": self.dir, "developerInstructions": self.prompt, "approvalPolicy": params::get("codex_approval"), "sandbox": params::get("codex_sandbox")});
-        let claude = |sub: &str| self.ask(|id| json!({"type": "control_request", "request_id": id, "request": {"subtype": sub}}));
         let codex = |method: &str, p: Value| self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": p}));
         let r = match (self.kind, name) {
-            (Kind::Claude, "status") => claude("get_status")?,
-            (Kind::Claude, "cost") => claude("get_session_cost")?,
-            (Kind::Claude, "export") => claude("export_conversation")?,
-            (Kind::Claude, "hooks") => claude("get_hooks_listing")?,
-            (Kind::Claude, "permissions") => claude("list_permission_rules")?,
-            (Kind::Claude, "memory") => claude("get_memory_dialog")?,
             (Kind::Pi, "clone") => self.ask(|id| json!({"type": "clone", "id": id}))?,
             (Kind::Pi, "tree") => self.ask(|id| json!({"type": "get_tree", "id": id}))?,
             (Kind::Pi, "copy") => self.ask(|id| json!({"type": "get_last_assistant_text", "id": id}))?,
@@ -808,7 +797,7 @@ impl Ctl {
 trait Pipe: Sized { fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T { f(self) } }
 impl<S> Pipe for S {}
 
-/// /cx_review's argument: nothing for the uncommitted changes, a commit hash, or a base branch.
+/// codex's /review argument: nothing for the uncommitted changes, a commit hash, or a base branch.
 pub fn review_target(arg: &str) -> Value {
     let a = arg.trim();
     if a.is_empty() { json!({"type": "uncommittedChanges"}) }

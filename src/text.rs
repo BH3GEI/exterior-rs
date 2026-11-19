@@ -35,10 +35,10 @@ pub mod status {
 
 // ---- "/" menu ----
 
-pub const MENU_STOP: &str = "停止当前回合";
-pub const MENU_EXIT: &str = "结束当前会话，下一条消息将开启新会话";
-pub const MENU_AGENT: &str = "切换 agent";
-pub const MENU_ACCOUNT: &str = "claude · 换账号继续当前会话";
+pub const MENU_STOP: &str = "exterior · 停止当前回合";
+pub const MENU_EXIT: &str = "exterior · 结束当前会话，下一条消息将开启新会话";
+pub const MENU_AGENT: &str = "exterior · 切换 agent";
+pub const MENU_ACCOUNT: &str = "exterior · 换一个 claude 账号继续当前会话";
 pub fn exhausted(acct: &str, why: &str) -> String { format!("{acct} 的额度已用完：{why}。可以换一个账号继续当前会话，上一条消息会自动重发；也可以等额度重置。") }
 pub fn choose_account(cur: &str, age_min: u64) -> String { format!("当前账号 {cur}。选择要换到的账号（用量是 {age_min} 分钟前的数据）：") }
 pub const NO_ACCOUNTS: &str = "没有其他可用的 claude 账号。";
@@ -50,13 +50,18 @@ pub fn account_switched(a: &str) -> String { format!("已换到 {a}，会话保�
 pub fn account_switched_resend(a: &str) -> String { format!("已换到 {a}，会话保持不变，正在重发上一条消息。") }
 pub fn account_copy_failed(e: &str) -> String { format!("换账号失败，会话记录复制不过去：{e}") }
 
-pub fn builtin_desc(agent: &str, name: &str) -> String {
-    let what = match name {
-        "model" => "切换模型", "thinking" => "设置思考强度", "compact" => "压缩上下文", "new" => "开启新会话",
-        "name" => "设置会话名称", "session" => "查看会话统计", "fork" => "从先前的消息分叉出新会话", "export" => "将会话导出为 HTML",
-        "status" => "查看模型和用量", "review" => "审查代码改动", other => other,
-    };
-    format!("{agent} · {what}")
+/// What the commands of exterior's table (pi, codex) do; the agents' own commands come with their own descriptions.
+pub fn builtin_desc(name: &str) -> String {
+    match name {
+        "model" => "切换模型", "thinking" => "设置思考强度", "compact" => "压缩上下文", "new" | "clear" => "开启新会话",
+        "name" => "设置会话名称", "rename" => "重命名会话", "session" => "查看会话统计", "fork" => "分叉出新会话",
+        "clone" => "复制当前会话", "tree" => "查看会话树", "export" => "导出会话", "copy" => "复制上一条回答",
+        "resume" => "恢复其他会话", "import" => "导入会话文件", "quit" | "exit" => "退出 agent 进程（会话保留）",
+        "status" => "查看模型和用量", "usage" => "查看用量", "review" => "审查代码改动", "diff" => "查看工作目录的改动",
+        "archive" => "归档当前会话", "goal" => "查看或设置目标", "mcp" => "查看 MCP 服务", "apps" => "查看应用",
+        "plugins" => "查看插件", "skills" => "查看技能", "hooks" => "查看 hook", "logout" => "退出登录",
+        other => other,
+    }.to_string()
 }
 
 // ---- Telegram messages ----
@@ -135,6 +140,59 @@ pub fn pack(pieces: Vec<String>) -> Vec<String> {
     if !cur.is_empty() { msgs.push(cur); }
     msgs
 }
+/// A message as it goes out: text, or a file the agent pointed to with `![说明](路径)`.
+#[derive(Debug, PartialEq)]
+pub enum Piece { Text(String), File { alt: String, path: String } }
+
+/// Split a message at the agent's `![说明](路径)` references to local files (not inside code), so each file goes out
+/// in its place. Web addresses are left as they are. A message without such references comes back whole.
+pub fn pieces(msg: &str) -> Vec<Piece> {
+    fn find(line: &str) -> Option<(usize, usize, String, String)> {
+        let mut from = 0;
+        while let Some(i) = line[from..].find("![").map(|i| i + from) {
+            from = i + 2;
+            // inside `inline code`
+            if line[..i].matches('`').count() % 2 == 1 { continue; }
+            let Some(j) = line[i + 2..].find("](").map(|j| j + i + 2) else { return None };
+            let rest = &line[j + 2..];
+            let (path, len) = if let Some(r) = rest.strip_prefix('<') {
+                match r.find(">)") { Some(k) => (&r[..k], k + 3), None => continue }
+            } else {
+                match rest.find(')') { Some(k) => (&rest[..k], k + 1), None => continue }
+            };
+            let path = path.trim();
+            if path.is_empty() || path.contains("://") || path.starts_with("data:") || path.starts_with('#') { continue; }
+            return Some((i, j + 2 + len, line[i + 2..j].to_string(), path.to_string()));
+        }
+        None
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut fence: Option<usize> = None;
+    for line in msg.split_inclusive('\n') {
+        let t = line.trim_start();
+        let ticks = t.chars().take_while(|c| *c == '`').count();
+        if let Some(n) = fence {
+            if ticks >= n && t.trim_end().chars().all(|c| c == '`') { fence = None; }
+            cur.push_str(line);
+            continue;
+        }
+        if ticks >= 3 { fence = Some(ticks); cur.push_str(line); continue; }
+        let mut rest = line;
+        while let Some((a, b, alt, path)) = find(rest) {
+            cur.push_str(&rest[..a]);
+            if !cur.trim().is_empty() { out.push(Piece::Text(cur.trim().to_string())); }
+            cur.clear();
+            out.push(Piece::File { alt: alt.trim().to_string(), path });
+            rest = &rest[b..];
+        }
+        cur.push_str(rest);
+    }
+    if out.is_empty() { return vec![Piece::Text(msg.to_string())]; }
+    if !cur.trim().is_empty() { out.push(Piece::Text(cur.trim().to_string())); }
+    out
+}
+
 pub const STOPPED_SUFFIX: &str = "本回合已停止。";
 pub const CUT_SUFFIX: &str = "输出中断。";
 pub const DONE_EMPTY: &str = "本回合已完成，没有文字输出。";
@@ -142,9 +200,6 @@ pub const NOTHING_RUNNING: &str = "当前没有正在执行的任务。";
 pub const CHOOSE_MODEL: &str = "请选择模型：";
 pub const NO_MODELS: &str = "该 agent 没有可选的模型。";
 pub const CHOOSE_THINKING: &str = "请选择思考强度：";
-pub fn choose_effort(cur: Option<&str>) -> String { format!("请选择 effort（当前：{}）：", cur.unwrap_or("auto")) }
-pub const COMPACTED: &str = "上下文已压缩。";
-pub const NEW_SESSION: &str = "已开启新会话。";
 pub const RESTART_CUT: &str = "exterior 重启时本回合尚未完成，请重新发送该消息。";
 pub const RESTART_RESEND: &str = "exterior 重启打断了本回合，已自动重新发送上一条消息。";
 /// what the agent gets when its turn is re-sent after a restart
@@ -159,8 +214,21 @@ pub fn exited(why: &str) -> String {
     let tail = if why.is_empty() { String::new() } else { format!("\n\n{why}") };
     sys_warn(&format!("agent 进程意外退出。下一条消息将恢复原会话。{tail}"))
 }
+/// a table command the agent answered with nothing
+pub fn no_output(agent: &str, name: &str) -> String { format!("{agent} 执行了 /{name}，没有返回内容。") }
+/// an agent's structured answer, shown as it is (key: value lines)
+pub fn shown(t: &str) -> String { format!("```\n{t}\n```") }
+pub fn codex_model_kept(v: &str) -> String { format!("codex 没有切换模型的请求，模型随每一轮发送：从下一轮起使用 {v}。") }
+pub fn file_not_sent(path: &str, e: &str) -> String { sys_warn(&format!("文件没有发出去：{path}：{e}")) }
+pub const FILE_MISSING: &str = "文件不存在";
+pub fn file_too_big(mb: usize) -> String { format!("文件超过 {mb} MB") }
+pub fn relay_from_unknown(from: &str) -> String { format!("exterior 不认识发送方话题「{from}」（`exterior send` 要在 exterior 启动的 agent 中运行）") }
+pub fn relay_to_unknown(to: &str, names: &str) -> String { format!("没有名为「{to}」的话题。现有话题：{names}") }
+pub const RELAY_EMPTY: &str = "内容为空";
+pub fn relayed(to: &str) -> String { format!("已发送到「{to}」") }
+pub const NOT_READY: &str = "exterior 尚未就绪";
 pub fn session_ended(agent: &str) -> String { format!("会话已结束。下一条消息将开启新的 {agent} 会话。") }
-pub fn wrong_agent(owner: &str, cur: &str) -> String { format!("该命令属于 {owner}，当前话题使用的是 {cur}。") }
+pub fn wrong_agent(owner: &str, cur: &str) -> String { format!("该命令只适用于 {owner}，当前话题使用的是 {cur}。") }
 pub fn start_failed(agent: &str, e: &str) -> String { sys_warn(&format!("无法启动 {agent}：{e}")) }
 pub fn current_agent(cur: &str) -> String { format!("当前使用 {cur}。请选择要切换到的 agent：") }
 pub fn no_such_agent(want: &str, list: &str) -> String { format!("不存在名为「{want}」的 agent。可用的 agent：{list}") }
@@ -172,38 +240,7 @@ pub fn say_failed(e: &str) -> String { sys_warn(&format!("无法将消息交给 
 pub fn models_failed(e: &str) -> String { sys_warn(&format!("无法获取模型列表：{e}")) }
 pub fn no_model_at(i: usize, cmd: &str) -> String { sys_warn(&format!("不存在第 {i} 个模型，请重新发送 /{cmd} 进行选择。")) }
 pub fn name_needed(cmd: &str) -> String { format!("请在命令后写出名称，例如：/{cmd} 项目调研") }
-pub fn name_set(name: &str) -> String { format!("会话名称已设置为「{name}」。") }
-pub fn exported(path: &str) -> String { format!("会话已导出至：{path}") }
 pub const CHOOSE_FORK: &str = "请选择从哪条消息处分叉：";
-pub const NO_FORK_POINTS: &str = "当前会话中还没有可以分叉的消息。";
-pub fn forked(text: &str) -> String { format!("已从所选消息处分叉出新会话，之后的消息将在新会话中进行。所选消息原文：\n{text}") }
-pub const FORK_CANCELLED: &str = "分叉已被扩展取消。";
-pub fn review_started(target: &str) -> String { format!("已开始审查{target}，结果将在本话题中显示。") }
-pub fn review_target(kind: &str, v: &str) -> String {
-    match kind { "commit" => format!("提交 {v}"), "baseBranch" => format!("当前分支与 {v} 的差异"), _ => "尚未提交的改动".into() }
-}
-pub fn session_stats(d: &serde_json::Value) -> String {
-    let n = |v: &serde_json::Value| v.as_u64().map(|x| x.to_string()).unwrap_or_else(|| "—".into());
-    let t = &d["tokens"];
-    let ctx = &d["contextUsage"];
-    format!("会话 {}\n消息：你 {} 条，pi {} 条；工具调用 {} 次\ntoken：输入 {}，输出 {}，缓存读取 {}，缓存写入 {}，合计 {}\n费用：{}\n上下文：已用 {} / {}",
-        d["sessionId"].as_str().unwrap_or("—"), n(&d["userMessages"]), n(&d["assistantMessages"]), n(&d["toolCalls"]),
-        n(&t["input"]), n(&t["output"]), n(&t["cacheRead"]), n(&t["cacheWrite"]), n(&t["total"]),
-        d["cost"].as_f64().map(|c| format!("${c:.2}")).unwrap_or_else(|| "—".into()), n(&ctx["tokens"]), n(&ctx["contextWindow"]))
-}
-pub fn codex_status(model: &str, r: &serde_json::Value) -> String {
-    let mut s = format!("模型：{model}");
-    for k in ["primary", "secondary"] {
-        let w = &r[k];
-        if let Some(p) = w["usedPercent"].as_i64() {
-            let reset = w["resetsAt"].as_i64().map(|t| t - crate::store::now() as i64).filter(|l| *l > 0).map(|l| resets_in(l / 3600, l % 3600 / 60)).unwrap_or_default();
-            s.push_str(&format!("\n{}用量：{p}%{reset}", window(w["windowDurationMins"].as_i64())));
-        }
-    }
-    if r["credits"]["hasCredits"] == false && r["credits"]["unlimited"] != true { s.push_str("\n额度余额：无"); }
-    if let Some(t) = r["rateLimitReachedType"].as_str() { s.push_str(&format!("\n已达上限：{t}")); }
-    s
-}
 /// A rate-limit window's length, e.g. 「5 小时」「7 天」.
 pub fn window(mins: Option<i64>) -> String {
     match mins {
@@ -213,21 +250,11 @@ pub fn window(mins: Option<i64>) -> String {
         _ => String::new(),
     }
 }
-pub const DEFAULT_MODEL: &str = "默认模型";
 pub const NO_SESSIONS: &str = "没有找到其他会话。";
 pub const CHOOSE_SESSION: &str = "请选择要恢复的会话：";
-pub fn resumed(id: &str) -> String { format!("已切换到会话 {id}，之后的消息将在该会话中进行。") }
-pub fn cloned(id: &str) -> String { format!("已复制当前会话，之后的消息将在副本 {id} 中进行。") }
-pub fn renamed(name: &str) -> String { format!("会话已重命名为「{name}」。") }
-pub fn archived(id: &str) -> String { format!("原会话已归档，之后的消息将在新会话 {id} 中进行。") }
-pub const GOAL_CLEARED: &str = "目标已清除。";
-pub fn goal_set(g: &str) -> String { format!("目标已设置为：{g}") }
-pub const LOGGED_OUT: &str = "已退出该 codex 账号的登录。";
 pub const QUIT: &str = "agent 进程已退出。下一条消息将恢复原会话。";
 pub const NOTHING_TO_COPY: &str = "还没有可复制的回答。";
-pub fn exported_file(name: &str) -> String { format!("会话已导出为文件 {name}。") }
 pub const EMPTY_RESULT: &str = "（无内容）";
-pub const NO_DIFF: &str = "工作目录中没有改动。";
 
 /// A result from an agent, shown as indented key: value lines (for the commands that only display information).
 pub fn show(v: &serde_json::Value) -> String {
@@ -252,9 +279,7 @@ pub fn show(v: &serde_json::Value) -> String {
     let out = out.trim_end().to_string();
     if out.is_empty() { EMPTY_RESULT.into() } else { out }
 }
-pub fn model_set(v: &str) -> String { format!("已切换到模型 {v}。") }
 pub fn model_failed(e: &str) -> String { sys_warn(&format!("模型切换失败：{e}")) }
-pub fn thinking_set(v: &str) -> String { format!("思考强度已设置为 {v}。") }
 pub fn thinking_failed(e: &str) -> String { sys_warn(&format!("无法获取思考强度选项：{e}")) }
 pub fn failed(e: &str) -> String { sys_warn(e) }
 pub fn note(t: &str) -> String { sys_warn(t) }

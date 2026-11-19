@@ -438,6 +438,22 @@ fn respond(mut req: Request) {
     let (path, _query) = url.split_once('?').unwrap_or((&url, ""));
     let path = path.to_string();
     let html = Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
+    // the only address open without the Lazycat login (public_path): `exterior send`, with exterior's key
+    if path.starts_with("/api/") {
+        let key = format!("Bearer {}", crate::prompt::send_key());
+        let authorized = req.headers().iter().any(|h| h.field.equiv("Authorization") && h.value.as_str() == key);
+        let (code, msg) = if path != "/api/send" || req.method() != &tiny_http::Method::Post { (404, "not found".to_string()) }
+            else if !authorized { (401, "unauthorized".to_string()) }
+            else {
+                let mut body = String::new();
+                let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
+                let f = form(&body);
+                let g = |k: &str| f.get(k).cloned().unwrap_or_default();
+                match daemon::relay(&g("from"), &g("to"), &g("text")) { Ok(m) => (200, m), Err(e) => (400, e) }
+            };
+        let _ = req.respond(Response::from_string(format!("{msg}\n")).with_status_code(code));
+        return;
+    }
     if req.method() == &tiny_http::Method::Post {
         let mut body = String::new();
         let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);

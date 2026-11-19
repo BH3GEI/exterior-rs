@@ -53,11 +53,46 @@ pub fn session_text(dev: &Value, name: &str, tid: &str, dir: &str, global: bool)
     Ok(t + "\n")
 }
 
-/// Put the brief key on a device.
+/// Where `exterior send` lives on a device (put in front of the agents' PATH).
+pub fn bin_dir(dev: &Value) -> String { format!("{}/.exterior/bin", root(dev)) }
+
+/// The address devices use to reach exterior.
+pub fn self_url() -> String {
+    let u = params::get("self_url");
+    if !u.is_empty() { return u.trim_end_matches('/').to_string(); }
+    std::env::var("LAZYCAT_APP_DOMAIN").map(|d| format!("https://{d}")).unwrap_or_default()
+}
+
+/// The key `exterior send` presents (made once, kept in config.json).
+pub fn send_key() -> String {
+    let mut c = crate::store::config();
+    if let Some(k) = c["send_key"].as_str().filter(|k| !k.is_empty()) { return k.to_string(); }
+    let mut b = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") { let _ = std::io::Read::read_exact(&mut f, &mut b); }
+    let k: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    c["send_key"] = serde_json::json!(k);
+    crate::store::set_config(&c);
+    k
+}
+
+/// `exterior send <话题> <内容>`: hands a message for another topic to exterior, which signs it and sends it.
+fn send_script(dev: &Value) -> String {
+    format!(r#"#!/bin/sh
+# exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
+# 由 exterior 安装，每次启动时覆盖。
+if [ "$1" != send ] || [ $# -lt 3 ]; then echo '用法：exterior send <话题名> <内容>' >&2; exit 2; fi
+to=$2; shift 2
+exec curl -sS --fail-with-body -H "Authorization: Bearer $(cat {key})" --data-urlencode "from=$EXTERIOR_TOPIC" --data-urlencode "to=$to" --data-urlencode "text=$*" {url}
+"#, key = host::quote(&format!("{}/.exterior-key", root(dev))), url = host::quote(&format!("{}/api/send", self_url())))
+}
+
+/// Put the brief key, the exterior key and `exterior send` on a device.
 pub fn install(dev: &Value) -> Result<(), String> {
     let root = root(dev);
     if root.is_empty() { return Err(text::NO_ROOT.into()); }
     let k = crate::brief::key();
     if !k.is_empty() { host::write(dev, &format!("{root}/.brief-key"), &k, "600")?; }
+    host::write(dev, &format!("{root}/.exterior-key"), &send_key(), "600")?;
+    host::write(dev, &format!("{}/exterior", bin_dir(dev)), &send_script(dev), "755")?;
     Ok(())
 }

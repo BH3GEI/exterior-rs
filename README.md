@@ -9,26 +9,29 @@ exterior 是运行在懒猫微服上的一个应用（单个 Rust 程序），�
 1. 在 Telegram 群组中新建一个话题并发送消息。brief 通过 Telegram Bot API 收到消息。
 2. exterior 通过 brief 的 `/api/wait` 读取新消息，为每个话题在设备上建立一个文件夹，并通过 SSH 在其中启动该话题的 agent。agent 保持运行，多轮对话共用一个会话。
 3. exterior 与 agent 通过标准输入输出交换 JSON：claude 使用 stream-json，pi 使用 rpc，codex 使用 app-server。agent 的回答在生成过程中持续写回话题。
-4. 图片和文件：你发送的图片和文件保存到话题文件夹的 `files/` 中，并告知 agent 路径；agent 可以通过 brief 的 `/api/send_file` 发送图片和文件。
-5. 会话之间：agent 可以通过 brief 向另一个话题发送以「名称 → 」开头的消息，exterior 将其转交给该话题的 agent。
+4. 图片和文件：你发送的图片和文件保存到话题文件夹的 `files/` 中，并告知 agent 路径。agent 在回答中写 `![说明](路径)`，exterior 就把该文件按原位置发到话题中（代码块里的不算）。
+5. 会话之间：agent 运行 `exterior send <话题名> <内容>`（exterior 装在设备的 `<根目录>/.exterior/bin` 中，并加入 agent 的 PATH），exterior 加上「名称 → 」署名后发到该话题，再转交给该话题的 agent。这是 exterior 唯一不需要懒猫登录的地址（`/api/send`），凭 `<根目录>/.exterior-key` 中的密钥访问。
 
 ## 话题中的命令
 
-原则：agent 自己有的命令，在话题中以相同的名称提供，前面加上表示 agent 的前缀（claude 为 `cc_`，pi 为 `pi_`，codex 为 `cx_`），含义与 agent 自身的命令相同。exterior 自己只有三个命令：
+原则：exterior 只转达和转发。不带前缀的命令都交给话题当前的 agent；exterior 自己的命令以 `exterior_` 开头：
 
 | 命令 | 作用 |
 |---|---|
-| `/stop` | 停止当前回合（相当于在 agent 中按 Esc） |
-| `/exit` | 结束 agent 进程，并删除该话题记录的会话编号，下一条消息开启全新的会话 |
-| `/agent` | 切换到另一个 agent；新 agent 会读取原会话的记录并继续 |
+| `/exterior_stop` | 停止当前回合（相当于在 agent 中按 Esc） |
+| `/exterior_exit` | 结束 agent 进程，并删除该话题记录的会话编号，下一条消息开启全新的会话 |
+| `/exterior_agent` | 切换到另一个 agent；新 agent 会读取原会话的记录并继续 |
+| `/exterior_account` | claude：换一个账号继续当前会话 |
 
-agent 的命令分两类：
+agent 的命令：
 
-1. agent 在无界面模式下自己能处理的命令（claude 的 `/compact`、`/context`、`/usage`，pi 的扩展和技能命令等）：exterior 启动时向 agent 读取列表，原样转交。
-2. agent 只在交互界面中提供、但协议中有对应请求的命令：exterior 转换为协议请求。目前包括：
-   - claude：`/cc_model`、`/cc_status`、`/cc_cost`、`/cc_export`、`/cc_hooks`、`/cc_permissions`、`/cc_memory`、`/cc_exit`
-   - pi：`/pi_model`、`/pi_thinking`、`/pi_compact`、`/pi_new`、`/pi_name`、`/pi_session`、`/pi_fork`、`/pi_clone`、`/pi_tree`、`/pi_export`、`/pi_copy`、`/pi_resume`、`/pi_import`、`/pi_quit`
-   - codex：`/cx_model`、`/cx_compact`、`/cx_new`、`/cx_clear`、`/cx_status`、`/cx_usage`、`/cx_review`、`/cx_diff`、`/cx_rename`、`/cx_resume`、`/cx_fork`、`/cx_archive`、`/cx_goal`、`/cx_mcp`、`/cx_apps`、`/cx_plugins`、`/cx_skills`、`/cx_hooks`、`/cx_copy`、`/cx_logout`、`/cx_quit`、`/cx_exit`
+1. claude、pi 自己报告的命令（claude 的 `/compact`、`/model`、`/effort`、`/goal`，pi 的扩展、模板和技能命令等）：exterior 启动时向 agent 读取列表和说明，原样转交，agent 的回答原样转发。
+2. pi 和 codex 只在交互界面中提供、但协议中有对应请求的命令，由 exterior 的表（`agents::BUILTINS`）转换为协议请求，agent 的回答原样显示：
+   - pi：`/model`、`/thinking`、`/compact`、`/new`、`/name`、`/session`、`/fork`、`/clone`、`/tree`、`/export`、`/copy`、`/resume`、`/import`、`/quit`
+   - codex：`/model`、`/compact`、`/new`、`/clear`、`/status`、`/usage`、`/review`、`/diff`、`/rename`、`/resume`、`/fork`、`/archive`、`/goal`、`/mcp`、`/apps`、`/plugins`、`/skills`、`/hooks`、`/copy`、`/logout`、`/quit`、`/exit`
+3. 当前 agent 没有的命令，作为普通消息原样交给它。
+
+菜单中同名的命令只列一次，灰色说明的开头写明哪些 agent 支持（例如「Claude / Pi / Codex · 压缩上下文」）。命令名中 Telegram 不允许的字符换成 `_`（例如 `design-sync` → `/design_sync`）。
 
 Telegram 的「/」菜单最多显示 100 条命令，超出的命令不显示在菜单中，但直接输入仍然有效。
 

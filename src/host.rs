@@ -37,7 +37,8 @@ pub fn agent(dev: &Value, dir: &str, env: &[(&str, String)], command: &str, args
     let mut inner = command.to_string();
     for a in args { inner.push(' '); inner.push_str(&quote(a)); }
     let mut s = format!("mkdir -p {d} && cd {d} && exec env", d = quote(dir));
-    for (k, v) in env { s.push_str(&format!(" {k}={}", quote(v))); }
+    // PATH is put in front of the device's own, not instead of it
+    for (k, v) in env { if *k == "PATH" { s.push_str(&format!(" PATH={}:\"$PATH\"", quote(v))); } else { s.push_str(&format!(" {k}={}", quote(v))); } }
     s.push_str(&format!(" \"${{SHELL:-/bin/sh}}\" -ic {}", quote(&inner)));
     line(dev, &s)
 }
@@ -85,4 +86,18 @@ pub fn write_bytes(dev: &Value, path: &str, data: &[u8]) -> Result<(), String> {
     }
     let out = wait(child, 120)?;
     if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
+}
+
+/// Read a file on the device, at most `max` + 1 bytes (so a caller can tell it was bigger). `path` is a shell word:
+/// quoted already, or starting with "$HOME"/.
+pub fn read_bytes(dev: &Value, path: &str, max: usize) -> Result<Vec<u8>, String> {
+    let mut c = line(dev, &format!("test -f {path} || exit 3; head -c {} {path}", max + 1));
+    c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = c.spawn().map_err(|e| crate::text::exec_failed(&e.to_string()))?;
+    let out = wait(child, 300)?;
+    match out.status.code() {
+        Some(0) => Ok(out.stdout),
+        Some(3) => Err(crate::text::FILE_MISSING.into()),
+        _ => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    }
 }
