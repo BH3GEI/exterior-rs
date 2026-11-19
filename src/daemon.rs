@@ -1,6 +1,7 @@
-//! Every Telegram topic Yao creates is a session. Messages in → the topic's agent; the agent's answer → the topic.
+//! Every Telegram topic the user creates is a session. Messages in → the topic's agent; the agent's answer → the topic.
 use crate::agents::{self, Agent, Ev, Kind, Spec};
-use crate::{brief, store};
+use crate::text::{self, status as st};
+use crate::{brief, params, store};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -19,12 +20,17 @@ pub struct Session {
     pub active: Instant,
 }
 
-const IDLE: Duration = Duration::from_secs(2 * 3600);
+/// Telegram's limit on a button's data.
+const BUTTON_DATA_MAX: usize = 64;
+/// Telegram's limits on the command menu.
+const MENU_MAX: usize = 100;
+const COMMAND_NAME_MAX: usize = 32;
+const COMMAND_DESC_MAX: usize = 60;
 
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 type Own = Arc<Mutex<HashSet<u64>>>;
 
-/// The last model list shown in each topic, so a button can say "/model 3".
+/// The last model list shown in each topic, for buttons whose model name is too long to fit (they say "/model 3").
 static CHOICES: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
 
 /// What the 会话 page shows about the running side (the rest is in the notes).
@@ -36,7 +42,14 @@ pub fn running(tid: &str) -> Option<(bool, bool)> {
     ss.get(tid).map(|s| (s.agent.is_some(), s.pending))
 }
 
-fn set_status(tid: &str, st: &str) { store::note_set(tid, "status", json!(st)); store::note_set(tid, "active", json!(store::now())); }
+fn set_status(tid: &str, status: &str) { store::note_set(tid, "status", json!(status)); store::note_set(tid, "active", json!(store::now())); }
+
+/// "名称 → 正文": a message from another session.
+fn relay_split(t: &str) -> Option<(&str, &str)> {
+    let mark = params::get("relay_mark");
+    if mark.is_empty() { return None; }
+    t.split_once(&format!(" {mark} "))
+}
 
 fn send(own: &Own, sessions: &Sessions, chat: &str, text: &str) -> Option<u64> { send_with(own, sessions, chat, text, None) }
 
@@ -48,13 +61,13 @@ fn buttons(rows: Vec<Vec<(String, String)>>) -> Value {
 fn in_rows(items: Vec<(String, String)>, per: usize) -> Vec<Vec<(String, String)>> { items.chunks(per).map(|c| c.to_vec()).collect() }
 
 fn send_with(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Option<Value>) -> Option<u64> {
-    for _ in 0..3 {
+    for _ in 0..params::num("send_retries").max(1) {
         let mut body = json!({"chat": chat, "text": brief::clip(text)});
         if let Some(b) = &btns { body["buttons"] = b.clone(); }
         match brief::post("/api/send", body) {
             Ok(v) => { let id = v["id"].as_u64(); if let Some(i) = id { own.lock().unwrap().insert(i); } return id; }
             Err((410, _)) => { gone(sessions, chat); return None; }
-            Err((c, v)) if c == 0 || c >= 500 => { store::log(&format!("send {chat}: {c} {v}; retry")); std::thread::sleep(Duration::from_secs(3)); }
+            Err((c, v)) if c == 0 || c >= 500 => { store::log(&format!("send {chat}: {c} {v}; retry")); std::thread::sleep(params::secs("retry_wait_s")); }
             Err((c, v)) => { store::log(&format!("send {chat} failed {c} {v}")); return None; }
         }
     }
@@ -75,28 +88,26 @@ fn gone(sessions: &Sessions, chat: &str) {
         if let Some(a) = s.agent.as_mut() { a.kill(); }
         s.agent = None;
         store::note_set(&s.tid, "deleted", json!(true));
-        store::note_set(&s.tid, "status", json!("已删除"));
+        store::note_set(&s.tid, "status", json!(st::DELETED));
     }
 }
 
 fn safe(name: &str) -> String {
     let s: String = name.trim().chars().map(|c| if matches!(c, '/' | ':' | '\\' | '\0') { '_' } else { c }).collect();
     let s = s.trim_matches('.').to_string();
-    if s.is_empty() { "话题".into() } else { s }
+    if s.is_empty() { text::UNNAMED_TOPIC.into() } else { s }
 }
 
-fn root_of(dev: &str) -> String {
-    store::device(dev).and_then(|d| d["root"].as_str().map(|s| s.trim_end_matches('/').to_string())).unwrap_or_default()
-}
-
-/// The folder of a topic on its device: what its note says; else <root>/<title>; 「全局」 is <root>/overview.
+/// The folder of a topic on its device: what its note says; else <root>/<title>; the global topic has its own folder.
 fn dir_for(dev: &str, tid: &str, name: &str) -> String {
     if let Some(d) = store::note(tid)["dir"].as_str() { return d.to_string(); }
-    let root = root_of(dev);
-    if name.trim() == "全局" { return format!("{root}/overview"); }
+    let Some(device) = store::device(dev) else { return String::new() };
+    if name.trim() == params::get("global_topic") { return crate::prompt::global_dir(&device); }
+    let root = crate::prompt::root(&device);
     let taken: Vec<String> = store::notes().iter().filter(|n| n["topic"] != tid).filter_map(|n| n["dir"].as_str().map(String::from)).collect();
     let mut d = format!("{root}/{}", safe(name));
-    if taken.contains(&d) || name.trim() == "overview" || name.trim() == "knowledge" { d = format!("{d}-{}", tid.trim_start_matches("tgbot:")); }
+    let reserved = [params::get("global_dir"), params::get("knowledge_dir")];
+    if taken.contains(&d) || reserved.iter().any(|r| r == name.trim()) { d = format!("{d}-{}", brief::topic_id(tid)); }
     d
 }
 
@@ -107,14 +118,14 @@ fn refresh(sessions: &Sessions) {
     let mut ss = sessions.lock().unwrap();
     for t in list.as_array().into_iter().flatten() {
         let chat = t["chat"].as_str().unwrap_or("").to_string();
-        let extra = std::env::var("EXTERIOR_EXTRA").unwrap_or_default();
-        if !(t["mine"] == true && (t["user_created"] == true || extra.split(',').any(|e| e == chat))) { continue; }
-        let name = t["name"].as_str().unwrap_or("").trim_start_matches("✓ ").to_string();
+        if !(t["mine"] == true && t["user_created"] == true) { continue; }
+        let name = t["name"].as_str().unwrap_or("").trim_start_matches(brief::DONE_MARK).to_string();
         if t["deleted"] == true {
             if let Some(s) = ss.get_mut(&chat) { if let Some(a) = s.agent.as_mut() { a.kill(); } s.agent = None; s.deleted = true; }
-            if store::note(&chat)["topic"].is_string() { store::note_set(&chat, "deleted", json!(true)); store::note_set(&chat, "status", json!("已删除")); }
+            if store::note(&chat)["topic"].is_string() { store::note_set(&chat, "deleted", json!(true)); store::note_set(&chat, "status", json!(st::DELETED)); }
             continue;
         }
+        if let Some(l) = t["link"].as_str() { if store::note(&chat)["link"].as_str() != Some(l) && store::note(&chat)["topic"].is_string() { store::note_set(&chat, "link", json!(l)); } }
         match ss.get_mut(&chat) {
             Some(s) => if s.name != name { store::log(&format!("renamed {} -> {name}", s.name)); s.name = name.clone(); store::note_set(&chat, "name", json!(name)); },
             None => {
@@ -125,12 +136,13 @@ fn refresh(sessions: &Sessions) {
                 if n["topic"].is_null() {
                     store::note_set(&chat, "topic", json!(chat));
                     store::note_set(&chat, "created", json!(store::now()));
-                    store::note_set(&chat, "status", json!("未启动"));
+                    store::note_set(&chat, "status", json!(st::NEW));
                     store::log(&format!("new session {name} ({chat}) -> {dir}"));
                 }
                 store::note_set(&chat, "name", json!(name));
                 store::note_set(&chat, "device", json!(dev));
                 store::note_set(&chat, "dir", json!(dir));
+                if let Some(l) = t["link"].as_str() { store::note_set(&chat, "link", json!(l)); }
                 if store::note(&chat)["agent"].is_null() {
                     if let Some(first) = store::device(&dev).and_then(|d| d["agents"][0]["name"].as_str().map(String::from)) { store::note_set(&chat, "agent", json!(first)); }
                 }
@@ -142,57 +154,57 @@ fn refresh(sessions: &Sessions) {
 
 /// Start the topic's current agent: resume its session if it has one.
 fn start_agent(s: &mut Session, tx: &Sender<Ev>) -> Result<(), String> {
-    let dev = store::device(&s.dev).ok_or(format!("设备「{}」不存在了", s.dev))?;
+    let dev = store::device(&s.dev).ok_or_else(|| text::device_missing(&s.dev))?;
     let n = store::note(&s.tid);
     let name = n["agent"].as_str().unwrap_or("").to_string();
-    let row = store::agent(&dev, &name).ok_or(format!("设备「{}」上没有 agent「{name}」", s.dev))?;
-    let kind = Kind::parse(row["kind"].as_str().unwrap_or("")).ok_or("agent 类型不对")?;
+    let row = store::agent(&dev, &name).ok_or_else(|| text::agent_missing(&s.dev, &name))?;
+    let kind = Kind::parse(row["kind"].as_str().unwrap_or("")).ok_or(text::BAD_KIND)?;
     let resume = n["session"].as_str().map(String::from);
     // cc0 picked cc6 last time: the session lives in cc6, so resume through cc6
     let run_row = if resume.is_some() { n["resolved"].as_str().and_then(|r| store::agent(&dev, r)).unwrap_or(row.clone()) } else { row.clone() };
     s.gen += 1;
-    let root = root_of(&s.dev);
-    let prompt = crate::prompt::session_text(&dev, &s.name, &s.tid, &s.dir, s.dir == format!("{root}/overview"));
+    let global = s.dir == crate::prompt::global_dir(&dev);
+    let prompt = crate::prompt::session_text(&dev, &s.name, &s.tid, &s.dir, global)?;
     let spec = Spec { tid: s.tid.clone(), prompt, topic: s.name.clone(), dev: dev.clone(), dir: s.dir.clone(),
                       command: run_row["command"].as_str().unwrap_or("").to_string(), kind, gen: s.gen, resume: resume.clone() };
     store::log(&format!("start {} ({}) for {} in {} resume {:?}", run_row["name"], spec.command, s.name, s.dir, resume));
     s.agent = Some(Agent::start(spec, tx.clone())?);
-    set_status(&s.tid, "运行中");
+    set_status(&s.tid, st::RUNNING);
     Ok(())
 }
 
-/// The "/" menu: exterior's commands, the built-ins, then each agent's own commands with its prefix (cc_ claude, pi_ pi).
+/// The "/" menu: exterior's commands, the built-ins, then each agent's own commands with its kind's prefix.
 pub fn build_menu() -> Result<usize, String> {
-    let dev = store::default_device().ok_or("还没有设备")?;
+    let dev = store::default_device().ok_or(text::NO_DEVICE)?;
     let mut cmds = vec![
-        json!({"command": "stop", "description": "停下当前这一轮（Esc）"}),
-        json!({"command": "exit", "description": "结束这个会话，下一条消息开新的"}),
-        json!({"command": "agent", "description": "切换 agent"}),
-        json!({"command": "model", "description": "换模型"}),
-        json!({"command": "pi_thinking", "description": "Pi · 思考强度"}),
-        json!({"command": "pi_compact", "description": "Pi · 压缩上下文"}),
-        json!({"command": "pi_new", "description": "Pi · 开新会话"}),
-        json!({"command": "cx_compact", "description": "Codex · 压缩上下文"}),
-        json!({"command": "cx_new", "description": "Codex · 开新会话"}),
+        json!({"command": "stop", "description": text::MENU_STOP}),
+        json!({"command": "exit", "description": text::MENU_EXIT}),
+        json!({"command": "agent", "description": text::MENU_AGENT}),
+        json!({"command": "model", "description": text::MENU_MODEL}),
     ];
+    for (k, n) in agents::BUILTINS {
+        if dev["agents"].as_array().into_iter().flatten().any(|a| a["kind"] == k.name()) {
+            cmds.push(json!({"command": agents::builtin_command(*k, n), "description": text::builtin_desc(k.label(), n)}));
+        }
+    }
     let mut map = serde_json::Map::new();
     let mut used: HashSet<String> = cmds.iter().filter_map(|c| c["command"].as_str().map(String::from)).collect();
-    let root = dev["root"].as_str().unwrap_or("/").to_string();
-    for (kind, prefix) in [(Kind::Claude, "cc"), (Kind::Pi, "pi")] {
+    let root = crate::prompt::root(&dev);
+    for kind in Kind::ALL {
         let Some(row) = dev["agents"].as_array().into_iter().flatten().find(|a| a["kind"] == kind.name()) else { continue };
         for (orig, desc) in agents::commands(&dev, &root, row["command"].as_str().unwrap_or(""), kind) {
-            if cmds.len() >= 100 { break; }
-            let mut tg: String = format!("{prefix}_{}", orig.to_lowercase()).chars().map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' { c } else { '_' }).collect();
-            tg.truncate(32);
+            if cmds.len() >= MENU_MAX { break; }
+            let mut tg: String = format!("{}_{}", kind.prefix(), orig.to_lowercase()).chars().map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' { c } else { '_' }).collect();
+            tg.truncate(COMMAND_NAME_MAX);
             if !used.insert(tg.clone()) { continue; }
             let d = if desc.trim().is_empty() { format!("/{orig}") } else { desc.trim().replace('\n', " ") };
             let full = format!("{} · {d}", kind.label());
-            let d: String = if full.chars().count() > 60 { format!("{}…", full.chars().take(59).collect::<String>()) } else { full };
+            let d: String = if full.chars().count() > COMMAND_DESC_MAX { format!("{}…", full.chars().take(COMMAND_DESC_MAX - 1).collect::<String>()) } else { full };
             cmds.push(json!({"command": tg, "description": d}));
             map.insert(tg, json!([kind.name(), orig]));
         }
     }
-    if map.is_empty() { return Err("没取到 agent 的命令列表（agent 没有回应）".into()); }
+    if map.is_empty() { return Err(text::NO_COMMANDS.into()); }
     let n = cmds.len();
     brief::post("/api/bots/commands", json!({"commands": cmds})).map_err(|(c, v)| format!("{c} {v}"))?;
     store::set_state("menu", Value::Object(map));
@@ -206,8 +218,9 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
     let mut outs: HashMap<String, Out> = HashMap::new();
     loop {
         let ev = match rx.recv_timeout(Duration::from_millis(500)) { Ok(e) => Some(e), Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None, Err(_) => return };
+        let flush = Duration::from_millis(params::num("flush_ms"));
         for (tid, o) in outs.iter_mut() {
-            if !o.buf.trim().is_empty() && o.shown.elapsed() > Duration::from_millis(1500) {
+            if !o.buf.trim().is_empty() && o.shown.elapsed() > flush {
                 match o.id { None => o.id = send(&own, &sessions, tid, &o.buf), Some(i) => edit(&sessions, tid, i, &o.buf) }
                 o.shown = Instant::now();
             }
@@ -220,12 +233,12 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 if gen > o.gen { *o = Out { gen, buf: String::new(), id: None, shown: Instant::now() }; }
                 if gen == o.gen { o.buf.push_str(&delta); }
             }
-            Ev::Done { tid, gen, text, stopped, error } => {
+            Ev::Done { tid, gen, text: answer, stopped, error } => {
                 let o = outs.remove(&tid).filter(|o| o.gen == gen).unwrap_or(Out { gen, buf: String::new(), id: None, shown: Instant::now() });
-                let mut body = if stopped { o.buf.clone() } else { text.filter(|t| !t.trim().is_empty()).unwrap_or(o.buf.clone()) };
-                if stopped { body.push_str("\n\n（已停）"); }
-                if let Some(e) = &error { body = format!("{body}\n\n⚠️ {e}").trim().to_string(); }
-                if body.trim().is_empty() { body = "✓ 完成（没有文字输出）".into(); }
+                let mut body = if stopped { o.buf.clone() } else { answer.filter(|t| !t.trim().is_empty()).unwrap_or(o.buf.clone()) };
+                if stopped { body = format!("{body}\n\n{}", text::STOPPED_SUFFIX).trim().to_string(); }
+                if let Some(e) = &error { body = format!("{body}\n\n{}", text::failed(e)).trim().to_string(); }
+                if body.trim().is_empty() { body = text::DONE_EMPTY.into(); }
                 match o.id { None => { send(&own, &sessions, &tid, &body); } Some(i) => edit(&sessions, &tid, i, &body) }
                 let who = {
                     let mut ss = sessions.lock().unwrap();
@@ -235,7 +248,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                     if let Some(dev) = store::device(&d) { std::thread::spawn(move || crate::infra::commit(&dev, &name)); }
                 }
                 if current(&tid, gen) {
-                    set_status(&tid, if error.is_some() { "出错" } else { "空闲" });
+                    set_status(&tid, if error.is_some() { st::ERROR } else { st::IDLE });
                     store::note_set(&tid, "last_error", error.map(Value::String).unwrap_or(Value::Null));
                     store::note_set(&tid, "from", Value::Null);
                 }
@@ -243,8 +256,8 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
             Ev::Session { tid, gen, id } => {
                 if current(&tid, gen) && store::note(&tid)["session"].as_str() != Some(&id) { store::note_set(&tid, "session", json!(id)); }
             }
-            Ev::Note { tid, gen, text } => {
-                if current(&tid, gen) { send(&own, &sessions, &tid, &format!("⚠️ {text}")); }
+            Ev::Note { tid, gen, text: t } => {
+                if current(&tid, gen) { send(&own, &sessions, &tid, &text::note(&t)); }
             }
             Ev::Resolved { tid, gen, name } => {
                 if current(&tid, gen) { store::note_set(&tid, "resolved", json!(name)); }
@@ -258,18 +271,17 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                     }
                 };
                 if let Some(o) = outs.remove(&tid) {
-                    if !o.buf.trim().is_empty() { let b = format!("{}\n\n（中断）", o.buf); match o.id { None => { send(&own, &sessions, &tid, &b); } Some(i) => edit(&sessions, &tid, i, &b) } }
+                    if !o.buf.trim().is_empty() { let b = format!("{}\n\n{}", o.buf, text::CUT_SUFFIX); match o.id { None => { send(&own, &sessions, &tid, &b); } Some(i) => edit(&sessions, &tid, i, &b) } }
                 }
                 if current(&tid, gen) || warn {
-                    let why = why.trim().lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                    let why = agents::last_lines(&why);
                     if warn {
                         store::log(&format!("agent exited mid-turn in {tid}: {why}"));
-                        set_status(&tid, "出错");
+                        set_status(&tid, st::ERROR);
                         store::note_set(&tid, "last_error", json!(why));
-                        let tail = if why.is_empty() { String::new() } else { format!("\n\n{why}") };
-                        send(&own, &sessions, &tid, &format!("⚠️ agent 意外退出了。下一条消息会接着原来的会话继续。{tail}"));
-                    } else if store::note(&tid)["status"] != "已删除" {
-                        set_status(&tid, "未运行");
+                        send(&own, &sessions, &tid, &text::exited(&why));
+                    } else if store::note(&tid)["status"] != st::DELETED {
+                        set_status(&tid, st::STOPPED);
                     }
                 }
             }
@@ -287,21 +299,24 @@ fn run(sessions: Sessions) {
     loop {
         if brief::configured() && store::default_device().is_some() {
             match brief::post("/api/bots/adopt", json!({})) {
-                Ok(_) => { store::set_state("telegram", json!({"ok": true, "time": store::now(), "msg": "已接管群里新建的话题"})); break; }
-                Err((c, v)) => store::set_state("telegram", json!({"ok": false, "time": store::now(), "msg": format!("接管失败：{c} {v}")})),
+                Ok(_) => { store::set_state("telegram", json!({"ok": true, "time": store::now(), "msg": text::TG_ADOPTED})); break; }
+                Err((c, v)) => store::set_state("telegram", json!({"ok": false, "time": store::now(), "msg": text::tg_adopt_failed(&format!("{c} {v}"))})),
             }
         } else {
-            store::set_state("telegram", json!({"ok": false, "time": store::now(), "msg": "还没有设置 brief 地址和密钥，或还没有设备"}));
+            store::set_state("telegram", json!({"ok": false, "time": store::now(), "msg": text::TG_NOT_SET}));
         }
-        std::thread::sleep(Duration::from_secs(15));
+        std::thread::sleep(params::secs("reconnect_s"));
     }
     store::log("exterior started");
-    // nothing runs right after a restart: a topic still marked running had its turn cut off
     for n in store::notes() {
         let tid = n["topic"].as_str().unwrap_or("").to_string();
-        if matches!(n["status"].as_str(), Some("运行中") | Some("转移中")) && !tid.is_empty() {
-            store::note_set(&tid, "status", json!("出错"));
-            store::note_set(&tid, "last_error", json!("exterior 重启时这一轮还没答完；再发一次就好"));
+        if tid.is_empty() { continue; }
+        // notes written before 0.7 stored the status label itself
+        if let Some(k) = n["status"].as_str().and_then(st::from_legacy) { store::note_set(&tid, "status", json!(k)); }
+        // nothing runs right after a restart: a topic still marked running had its turn cut off
+        if matches!(store::note(&tid)["status"].as_str(), Some(st::RUNNING) | Some(st::MOVING)) {
+            store::note_set(&tid, "status", json!(st::ERROR));
+            store::note_set(&tid, "last_error", json!(text::RESTART_CUT));
             store::log(&format!("{}: turn cut off by restart", n["name"]));
         }
     }
@@ -309,9 +324,12 @@ fn run(sessions: Sessions) {
     let (tx, rx) = channel();
     { let (s, o) = (sessions.clone(), own.clone()); std::thread::spawn(move || output(rx, s, o)); }
     std::thread::spawn(|| for _ in 0..5 {
-        match build_menu() { Ok(n) => { store::log(&format!("menu: {n} commands")); break; } Err(e) => { store::log(&format!("menu failed: {e}; retry in 5 min")); std::thread::sleep(Duration::from_secs(300)); } }
+        match build_menu() {
+            Ok(n) => { store::log(&format!("menu: {n} commands")); break; }
+            Err(e) => { store::log(&format!("menu failed: {e}; retrying")); std::thread::sleep(Duration::from_secs(params::num("menu_retry_min") * 60)); }
+        }
     });
-    std::thread::spawn(|| for d in store::devices() { if let Err(e) = crate::prompt::install(&d) { store::log(&format!("install prompt on {}: {e}", d["name"])); } });
+    std::thread::spawn(|| for d in store::devices() { if let Err(e) = crate::prompt::install(&d) { store::log(&format!("install brief key on {}: {e}", d["name"])); } });
     refresh(&sessions);
     let mut last = store::state("last_id").as_u64().unwrap_or(0);
     if last == 0 {
@@ -320,52 +338,50 @@ fn run(sessions: Sessions) {
     }
     let mut refreshed = Instant::now();
     loop {
-        if refreshed.elapsed() > Duration::from_secs(60) {
+        if refreshed.elapsed() > params::secs("refresh_s") {
             refresh(&sessions);
             refreshed = Instant::now();
+            let idle = Duration::from_secs(params::num("idle_hours") * 3600);
             for s in sessions.lock().unwrap().values_mut() {
-                if s.agent.is_some() && !s.pending && s.active.elapsed() > IDLE {
+                if s.agent.is_some() && !s.pending && s.active.elapsed() > idle {
                     store::log(&format!("idle, closing process of {}", s.name));
                     if let Some(a) = s.agent.as_mut() { a.kill(); }
                     s.agent = None; s.gen += 1;
-                    set_status(&s.tid, "未运行");
+                    set_status(&s.tid, st::STOPPED);
                 }
             }
         }
-        let msgs = match brief::call("GET", &format!("/api/wait?source=telegram&all=1&after_id={last}&timeout=20&limit=200"), None) {
-            Ok(v) => { store::set_state("telegram", json!({"ok": true, "time": store::now(), "msg": "已连接"})); v }
+        let wait = format!("/api/wait?source=telegram&all=1&after_id={last}&timeout={}&limit=200", params::num("wait_s"));
+        let msgs = match brief::call("GET", &wait, None) {
+            Ok(v) => { store::set_state("telegram", json!({"ok": true, "time": store::now(), "msg": text::TG_CONNECTED})); v }
             Err((c, v)) => {
-                store::set_state("telegram", json!({"ok": false, "time": store::now(), "msg": format!("连不上 brief：{c} {v}")}));
-                std::thread::sleep(Duration::from_secs(5)); continue;
+                store::set_state("telegram", json!({"ok": false, "time": store::now(), "msg": text::tg_unreachable(&format!("{c} {v}"))}));
+                std::thread::sleep(params::secs("reconnect_s")); continue;
             }
         };
         for m in msgs.as_array().into_iter().flatten() {
             let id = m["id"].as_u64().unwrap_or(0);
             last = last.max(id);
             let chat = m["chat"].as_str().unwrap_or("").to_string();
-            if !chat.starts_with("tgbot:") { continue; }
+            if !chat.starts_with(brief::TOPIC_PREFIX) { continue; }
             if !sessions.lock().unwrap().contains_key(&chat) { refresh(&sessions); refreshed = Instant::now(); }
-            let mut text = m["text"].as_str().unwrap_or("").replace("@exterior_bot", "");
-            let mut from_user = m["sender"] == "我";
-            // test mode only: a message starting with 「测试员 → 」 in an EXTERIOR_EXTRA topic counts as Yao's
-            if !from_user && std::env::var("EXTERIOR_EXTRA").map(|e| e.split(',').any(|c| c == chat)).unwrap_or(false) && !own.lock().unwrap().contains(&id) {
-                if let Some(b) = text.strip_prefix("测试员 → ") { text = b.to_string(); from_user = true; }
-            }
+            let mut text = strip_bot_mention(m["text"].as_str().unwrap_or(""));
+            let from_user = brief::from_user(m);
             let to_name = {
                 let ss = sessions.lock().unwrap();
                 let Some(s) = ss.get(&chat) else { continue };
                 if s.deleted { continue; }
                 if !from_user {
                     if own.lock().unwrap().contains(&id) { continue; }
-                    let Some((who, _)) = text.split_once(" → ") else { continue };
+                    let Some((who, _)) = relay_split(&text) else { continue };
                     if who.trim().is_empty() || who.trim() == s.name || who.contains('\n') { continue; }
                 }
                 s.name.clone()
             };
             if from_user {
                 let c = chat.clone();
-                std::thread::spawn(move || { let _ = brief::post("/api/react", json!({"chat": c, "id": id, "emoji": "👀"})); });
-            } else if let Some((who, body)) = text.split_once(" → ") {
+                std::thread::spawn(move || { let _ = brief::post("/api/react", json!({"chat": c, "id": id, "emoji": params::get("ack_emoji")})); });
+            } else if let Some((who, body)) = relay_split(&text) {
                 store::append("messages.jsonl", &json!({"time": store::now(), "from": who.trim(), "to": to_name, "text": body.chars().take(500).collect::<String>()}));
             }
             if from_user && m["media"]["url"].is_string() {
@@ -377,37 +393,48 @@ fn run(sessions: Sessions) {
     }
 }
 
-/// Yao sent a picture or a file: put it in the topic's folder and tell the agent where it is.
-fn with_file(sessions: &Sessions, chat: &str, id: u64, media: &Value, text: &str) -> String {
-    let (dev, dir) = { let ss = sessions.lock().unwrap(); match ss.get(chat) { Some(s) => (s.dev.clone(), s.dir.clone()), None => return text.to_string() } };
-    let kind = if media["kind"] == "image" { "图片" } else { "文件" };
+/// "/model@some_bot 3" → "/model 3": in groups Telegram adds the bot's name to commands.
+fn strip_bot_mention(t: &str) -> String {
+    if !t.starts_with('/') { return t.to_string(); }
+    let head = t.split_whitespace().next().unwrap_or("");
+    match head.split_once('@') { Some((cmd, _)) => format!("{cmd}{}", &t[head.len()..]), None => t.to_string() }
+}
+
+/// The user sent a picture or a file: put it in the topic's folder and tell the agent where it is.
+fn with_file(sessions: &Sessions, chat: &str, id: u64, media: &Value, msg: &str) -> String {
+    let (dev, dir) = { let ss = sessions.lock().unwrap(); match ss.get(chat) { Some(s) => (s.dev.clone(), s.dir.clone()), None => return msg.to_string() } };
+    let kind = text::file_kind(media["kind"] == "image");
     let name: String = media["name"].as_str().unwrap_or("file").chars().map(|c| if c == '/' || c == '\\' || c.is_control() { '_' } else { c }).collect();
     let path = format!("{dir}/files/{id}_{name}");
-    let r = store::device(&dev).ok_or("设备不存在".to_string())
+    let r = store::device(&dev).ok_or_else(|| text::device_missing(&dev))
         .and_then(|d| brief::download(media["url"].as_str().unwrap_or("")).and_then(|b| crate::host::write_bytes(&d, &path, &b)));
-    let base = text.trim();
-    match r {
-        Ok(()) => { store::log(&format!("file for {chat}: {path}")); format!("{base}\n\n[Yao 发来一个{kind}：{path}]").trim().to_string() }
-        Err(e) => { store::log(&format!("file for {chat} failed: {e}")); format!("{base}\n\n[Yao 发来一个{kind}，但 exterior 没能取下来：{e}]").trim().to_string() }
-    }
+    let (base, user) = (msg.trim(), params::get("user_name"));
+    let line = match r {
+        Ok(()) => { store::log(&format!("file for {chat}: {path}")); text::file_saved(&user, kind, &path) }
+        Err(e) => { store::log(&format!("file for {chat} failed: {e}")); text::file_failed(&user, kind, &e) }
+    };
+    format!("{base}\n\n{line}").trim().to_string()
 }
 
-fn agent_names(dev: &str) -> String {
-    store::device(dev).map(|d| d["agents"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str()).collect::<Vec<_>>().join("、")).unwrap_or_default()
+fn agent_names(dev: &str) -> Vec<String> {
+    store::device(dev).map(|d| d["agents"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
-fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, text: &str) {
+/// A command for exterior itself: /model, or a built-in of some kind of agent.
+enum Control { Model, Builtin(Kind, &'static str) }
+
+fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str) {
     let mut reply: Option<String> = None;
     let mut reply_buttons: Option<Value> = None;
-    let mut transfer: Option<String> = None;
-    let mut ctl: Option<(agents::Ctl, String, String)> = None;
+    let mut transfer: Option<(String, String)> = None;
+    let mut ctl: Option<(agents::Ctl, Control, String)> = None;
     {
         let mut ss = sessions.lock().unwrap();
         let Some(s) = ss.get_mut(chat) else { return };
         s.active = Instant::now();
         store::note_set(chat, "active", json!(store::now()));
-        store::log(&format!("<- {}: {}", s.name, text.chars().take(80).collect::<String>()));
-        let t = text.trim();
+        store::log(&format!("<- {}: {}", s.name, msg.chars().take(80).collect::<String>()));
+        let t = msg.trim();
         let n = store::note(chat);
         let cur = n["agent"].as_str().unwrap_or("").to_string();
         let dev = store::device(&s.dev);
@@ -415,35 +442,37 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, text: &st
         let mut say: Option<String> = None;
         let head = t.split_whitespace().next().unwrap_or("");
         let arg = t[head.len()..].trim().to_string();
+        let control = if head == "/model" { Some(Control::Model) } else { agents::find_builtin(head).map(|(k, n)| Control::Builtin(k, n)) };
+        let own_prefix = Kind::ALL.iter().find(|k| head.starts_with(&format!("/{}_", k.prefix()))).copied();
         if head == "/exit" {
             if let Some(a) = s.agent.as_mut() { a.stop(); a.kill(); }
             s.agent = None; s.gen += 1; s.pending = false;
             store::note_set(chat, "session", Value::Null);
             store::note_set(chat, "resolved", Value::Null);
             store::note_set(chat, "from", Value::Null);
-            set_status(chat, "未启动");
-            reply = Some(format!("已退出。下一条消息会开一个新的 {cur} 会话。"));
-        } else if matches!(head, "/model" | "/pi_thinking" | "/pi_compact" | "/pi_new" | "/cx_compact" | "/cx_new") {
-            let need = match head { "/model" => None, h if h.starts_with("/pi_") => Some(Kind::Pi), _ => Some(Kind::Codex) };
-            if need.is_some() && need != cur_kind {
-                reply = Some(format!("这是 {} 的命令，这个话题现在是 {cur}。", need.map(|k| k.name()).unwrap_or("")));
-            } else {
-                if s.agent.is_none() {
-                    if let Err(e) = start_agent(s, tx) { reply = Some(format!("⚠️ 启动 {cur} 失败：{e}")); }
-                }
-                if let Some(a) = s.agent.as_ref() { ctl = Some((a.ctl(), head.to_string(), arg.clone())); }
+            set_status(chat, st::NEW);
+            reply = Some(text::session_ended(&cur));
+        } else if let Some(c) = control {
+            if let Control::Builtin(k, _) = &c {
+                if Some(*k) != cur_kind { reply = Some(text::wrong_agent(k.label(), &cur)); }
             }
-        } else if t == "/stop" || t.starts_with("/stop ") {
-            match s.agent.as_mut() { Some(a) if s.pending => a.stop(), _ => reply = Some("现在没有在运行的任务。".into()) }
-        } else if t == "/agent" {
-            reply = Some(format!("现在是 {cur}。换成："));
-            let names: Vec<(String, String)> = agent_names(&s.dev).split('、').filter(|n| !n.is_empty() && *n != cur).map(|n| (n.to_string(), format!("/agent {n}"))).collect();
+            if reply.is_none() {
+                if s.agent.is_none() {
+                    if let Err(e) = start_agent(s, tx) { reply = Some(text::start_failed(&cur, &e)); }
+                }
+                if let Some(a) = s.agent.as_ref() { ctl = Some((a.ctl(), c, arg.clone())); }
+            }
+        } else if head == "/stop" {
+            match s.agent.as_mut() { Some(a) if s.pending => a.stop(), _ => reply = Some(text::NOTHING_RUNNING.into()) }
+        } else if head == "/agent" && arg.is_empty() {
+            reply = Some(text::current_agent(&cur));
+            let names: Vec<(String, String)> = agent_names(&s.dev).into_iter().filter(|n| *n != cur).map(|n| (n.clone(), format!("/agent {n}"))).collect();
             reply_buttons = Some(buttons(in_rows(names, 4)));
-        } else if let Some(want) = t.strip_prefix("/agent ") {
-            let want = want.trim().to_string();
+        } else if head == "/agent" {
+            let want = arg.clone();
             match dev.as_ref().and_then(|d| store::agent(d, &want)) {
-                None => reply = Some(format!("没有「{want}」。可用：{}", agent_names(&s.dev))),
-                Some(_) if want == cur => reply = Some(format!("现在就是 {cur}。")),
+                None => reply = Some(text::no_such_agent(&want, &agent_names(&s.dev).join("、"))),
+                Some(_) if want == cur => reply = Some(text::already_agent(&cur)),
                 Some(_) => {
                     let old_session = n["session"].as_str().map(String::from);
                     let prev = old_session.as_ref().and_then(|id| cur_kind.map(|k| agents::resume_line(k, n["resolved"].as_str().unwrap_or(&cur), id)));
@@ -455,85 +484,108 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, text: &st
                     store::note_set(chat, "last_error", Value::Null);
                     store::log(&format!("{}: {cur} -> {want} (prev {prev:?})", s.name));
                     match prev {
-                        None => { set_status(chat, "未启动"); reply = Some(format!("已切换到 {want}。")); }
-                        Some(p) => { store::note_set(chat, "from", json!(p)); transfer = Some(p); }
+                        None => { set_status(chat, st::NEW); reply = Some(text::switched_agent(&want)); }
+                        Some(p) => { store::note_set(chat, "from", json!(p)); transfer = Some((p, want.clone())); }
                     }
                 }
             }
-        } else if let Some(cmd) = t.strip_prefix('/').filter(|c| c.split_whitespace().next().map(|h| h.starts_with("cc_") || h.starts_with("pi_")).unwrap_or(false)) {
-            let (head, args) = cmd.split_once(char::is_whitespace).unwrap_or((cmd, ""));
-            match store::state("menu").get(head).cloned() {
-                None => reply = Some(format!("没有 /{head} 这个命令。")),
+        } else if let Some(kind) = own_prefix {
+            // one of an agent's own commands, as listed in the menu
+            let cmd = &head[1..];
+            match store::state("menu").get(cmd).cloned() {
+                None => reply = Some(text::no_such_command(cmd)),
                 Some(e) => {
-                    let (k, orig) = (e[0].as_str().unwrap_or(""), e[1].as_str().unwrap_or(""));
-                    if Some(k) != cur_kind.map(|k| k.name()) { reply = Some(format!("这是 {k} 的命令，这个话题现在是 {cur}。")); }
-                    else { say = Some(format!("/{orig}{}{args}", if args.is_empty() { "" } else { " " })); }
+                    let orig = e[1].as_str().unwrap_or("");
+                    if Some(kind) != cur_kind { reply = Some(text::wrong_agent(kind.label(), &cur)); }
+                    else { say = Some(format!("/{orig}{}{arg}", if arg.is_empty() { "" } else { " " })); }
                 }
             }
         } else {
-            say = Some(text.to_string());
+            say = Some(msg.to_string());
         }
-        if let Some(p) = &transfer { say = Some(p.clone()); }
-        if let Some(t) = say {
+        if let Some((p, _)) = &transfer { say = Some(p.clone()); }
+        if let Some(line) = say {
             if s.agent.is_none() {
-                if let Err(e) = start_agent(s, tx) { reply = Some(format!("⚠️ 启动 {} 失败：{e}", store::note(chat)["agent"].as_str().unwrap_or(""))); set_status(chat, "出错"); store::note_set(chat, "last_error", json!(e)); transfer = None; }
+                if let Err(e) = start_agent(s, tx) {
+                    reply = Some(text::start_failed(store::note(chat)["agent"].as_str().unwrap_or(""), &e));
+                    set_status(chat, st::ERROR); store::note_set(chat, "last_error", json!(e)); transfer = None;
+                }
             }
             if let Some(a) = s.agent.as_mut() {
                 s.pending = true;
-                if let Err(e) = a.say(&t) { s.pending = false; reply = Some(format!("⚠️ 交给 agent 失败：{e}")); }
-                else if transfer.is_some() { set_status(chat, "转移中"); }
+                if let Err(e) = a.say(&line) { s.pending = false; reply = Some(text::say_failed(&e)); }
+                else if transfer.is_some() { set_status(chat, st::MOVING); }
             }
         }
     }
-    if transfer.is_some() { send(own, sessions, chat, "正在转移上下文"); }
+    if let Some((_, want)) = &transfer { send(own, sessions, chat, &text::transferring(want)); }
     if let Some(r) = reply { send_with(own, sessions, chat, &r, reply_buttons); }
-    if let Some((c, head, arg)) = ctl {
+    if let Some((c, what, arg)) = ctl {
         let (own, sessions, chat) = (own.clone(), sessions.clone(), chat.to_string());
         std::thread::spawn(move || {
-            let (text, btns) = control(&c, &chat, &head, &arg);
-            send_with(&own, &sessions, &chat, &text, btns);
+            let (t, btns) = control(&c, &chat, what, &arg);
+            send_with(&own, &sessions, &chat, &t, btns);
         });
     }
 }
 
 /// /model and the built-in commands, answered without holding the sessions lock.
-fn control(c: &agents::Ctl, chat: &str, head: &str, arg: &str) -> (String, Option<Value>) {
-    match head {
-        "/model" if arg.is_empty() => match c.models() {
-            Err(e) => (format!("⚠️ 拿不到模型列表：{e}"), None),
-            Ok(list) if list.is_empty() => ("这个 agent 没有可选的模型。".into(), None),
+fn control(c: &agents::Ctl, chat: &str, what: Control, arg: &str) -> (String, Option<Value>) {
+    match what {
+        Control::Model if arg.is_empty() => match c.models() {
+            Err(e) => (text::models_failed(&e), None),
+            Ok(list) if list.is_empty() => (text::NO_MODELS.into(), None),
             Ok(list) => {
                 let items: Vec<(String, String)> = list.iter().enumerate().map(|(i, m)| {
                     let full = format!("/model {}", m.value);
-                    (m.label.clone(), if full.len() <= 64 { full } else { format!("/model {}", i + 1) })
+                    (m.label.clone(), if full.len() <= BUTTON_DATA_MAX { full } else { format!("/model {}", i + 1) })
                 }).collect();
                 CHOICES.lock().unwrap().get_or_insert_with(HashMap::new).insert(chat.to_string(), list.into_iter().map(|m| m.value).collect());
-                ("选一个模型：".into(), Some(buttons(in_rows(items, 2))))
+                (text::CHOOSE_MODEL.into(), Some(buttons(in_rows(items, 2))))
             }
         },
-        "/model" => {
+        Control::Model => {
             let value = match arg.parse::<usize>() {
                 Ok(i) => {
                     let cached = CHOICES.lock().unwrap().as_ref().and_then(|m| m.get(chat)).and_then(|l| l.get(i.wrapping_sub(1)).cloned());
                     match cached.or_else(|| c.models().ok().and_then(|l| l.get(i.wrapping_sub(1)).map(|m| m.value.clone()))) {
                         Some(v) => v,
-                        None => return (format!("⚠️ 没有第 {i} 个模型，请发 /model 重新选择。"), None),
+                        None => return (text::no_model_at(i), None),
                     }
                 }
                 Err(_) => arg.to_string(),
             };
-            match c.set_model(&value) { Ok(()) => (format!("已换成 {value}。"), None), Err(e) => (format!("⚠️ 没换成：{e}"), None) }
+            match c.set_model(&value) { Ok(()) => (text::model_set(&value), None), Err(e) => (text::model_failed(&e), None) }
         }
-        "/pi_thinking" if arg.is_empty() => {
-            let items = ["off", "minimal", "low", "medium", "high", "xhigh"].iter().map(|l| (l.to_string(), format!("/pi_thinking {l}"))).collect();
-            ("思考强度：".into(), Some(buttons(in_rows(items, 3))))
-        }
-        _ => {
-            let name = head.trim_start_matches("/pi_").trim_start_matches("/cx_");
-            match c.builtin(name, arg) {
-                Ok(_) => (match name { "thinking" => format!("思考强度已设为 {arg}。"), "compact" => "已压缩上下文。".into(), _ => "已开新会话。".into() }, None),
-                Err(e) => (format!("⚠️ {e}"), None),
+        Control::Builtin(k, "thinking") if arg.is_empty() => match c.thinking_levels() {
+            Ok(levels) => {
+                let cmd = agents::builtin_command(k, "thinking");
+                let items = levels.into_iter().map(|l| (l.clone(), format!("/{cmd} {l}"))).collect();
+                (text::CHOOSE_THINKING.into(), Some(buttons(in_rows(items, 3))))
             }
-        }
+            Err(e) => (text::thinking_failed(&e), None),
+        },
+        Control::Builtin(_, name) => match c.builtin(name, arg) {
+            Ok(()) => (match name { "thinking" => text::thinking_set(arg), "compact" => text::COMPACTED.into(), _ => text::NEW_SESSION.into() }, None),
+            Err(e) => (text::failed(&e), None),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parsing() {
+        assert_eq!(strip_bot_mention("/model@exterior_bot 3"), "/model 3");
+        assert_eq!(strip_bot_mention("/stop@x"), "/stop");
+        assert_eq!(strip_bot_mention("邮件 a@b.c"), "邮件 a@b.c");
+        assert_eq!(relay_split("测试 → 你好"), Some(("测试", "你好")));
+        assert_eq!(relay_split("没有分隔符"), None);
+        assert!(matches!(agents::find_builtin("/pi_thinking"), Some((Kind::Pi, "thinking"))));
+        assert!(matches!(agents::find_builtin("/cx_new"), Some((Kind::Codex, "new"))));
+        assert!(agents::find_builtin("/cc_compact").is_none());
+        assert_eq!(text::status::from_legacy("运行中"), Some(text::status::RUNNING));
+        assert_eq!(text::status::label("stopped"), "进程已关闭");
     }
 }

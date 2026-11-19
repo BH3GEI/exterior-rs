@@ -1,0 +1,51 @@
+//! Adjustable settings. Each one has a default here and can be changed on the 设置 page
+//! (stored in config.json under "params"). Nothing else in the code carries these values.
+
+pub struct Param { pub key: &'static str, pub label: &'static str, pub default: &'static str }
+
+pub const PARAMS: &[Param] = &[
+    Param { key: "user_name", label: "用户称呼（启动说明和文件提示中使用）", default: "Yao" },
+    Param { key: "global_topic", label: "全局话题的名称", default: "全局" },
+    Param { key: "global_dir", label: "全局话题的文件夹名", default: "overview" },
+    Param { key: "knowledge_dir", label: "knowledge 文件夹名（设备未单独指定时使用）", default: "knowledge" },
+    Param { key: "session_prompt", label: "启动说明文件（相对 knowledge）", default: "rules/exterior-session.md" },
+    Param { key: "global_prompt", label: "全局话题追加说明文件（相对 knowledge）", default: "rules/exterior-global.md" },
+    Param { key: "test_prompt", label: "测试 agent 时发送的问题所在文件（相对 knowledge）", default: "rules/exterior-test.md" },
+    Param { key: "relay_mark", label: "会话之间转发消息的分隔符", default: "→" },
+    Param { key: "pick_mark", label: "启动命令选定账号时输出的前缀", default: "→" },
+    Param { key: "claude_args", label: "claude 的额外启动参数", default: "--dangerously-skip-permissions" },
+    Param { key: "codex_approval", label: "codex 的审批策略（approvalPolicy）", default: "never" },
+    Param { key: "codex_sandbox", label: "codex 的沙箱模式（sandbox）", default: "danger-full-access" },
+    Param { key: "ack_emoji", label: "收到消息时添加的回应表情", default: "👀" },
+    Param { key: "idle_hours", label: "会话空闲多少小时后关闭进程", default: "2" },
+    Param { key: "flush_ms", label: "回复刷新间隔（毫秒）", default: "1500" },
+    Param { key: "ask_timeout_s", label: "等待 agent 响应请求的时间（秒）", default: "30" },
+    Param { key: "codex_ready_s", label: "等待 codex 就绪的时间（秒）", default: "40" },
+    Param { key: "notice_every", label: "重试提示的发送间隔（每多少次重试发一条）", default: "3" },
+    Param { key: "error_lines", label: "报错保留的行数", default: "3" },
+    Param { key: "error_chars", label: "报错保留的字数", default: "300" },
+    Param { key: "refresh_s", label: "同步话题列表的间隔（秒）", default: "60" },
+    Param { key: "wait_s", label: "向 brief 等待新消息的时长（秒）", default: "20" },
+    Param { key: "retry_wait_s", label: "发送失败后等待多少秒再重试", default: "3" },
+    Param { key: "reconnect_s", label: "brief 连接失败后等待多少秒再重连", default: "5" },
+    Param { key: "send_retries", label: "发送失败时的重试次数", default: "3" },
+    Param { key: "menu_retry_min", label: "命令菜单生成失败后的重试间隔（分钟）", default: "5" },
+    Param { key: "commands_timeout_s", label: "读取 agent 命令列表的时限（秒）", default: "90" },
+    Param { key: "test_timeout_s", label: "agent 测试的时限（秒）", default: "180" },
+    Param { key: "git_timeout_s", label: "knowledge 提交和推送的时限（秒）", default: "90" },
+];
+
+/// The current value of a setting (what the 设置 page saved, else the default).
+pub fn get(key: &str) -> String {
+    let saved = crate::store::config()["params"][key].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    saved.unwrap_or_else(|| PARAMS.iter().find(|p| p.key == key).map(|p| p.default.to_string()).unwrap_or_default())
+}
+
+pub fn num(key: &str) -> u64 {
+    get(key).parse().unwrap_or_else(|_| PARAMS.iter().find(|p| p.key == key).and_then(|p| p.default.parse().ok()).unwrap_or(0))
+}
+
+/// A setting that is a list of command-line arguments, split at spaces.
+pub fn args(key: &str) -> Vec<String> { get(key).split_whitespace().map(String::from).collect() }
+
+pub fn secs(key: &str) -> std::time::Duration { std::time::Duration::from_secs(num(key)) }

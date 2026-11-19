@@ -1,6 +1,7 @@
 //! The interface. Every page shows real state read from where it lives; nothing is written in by hand.
 use crate::agents::{self, Kind};
-use crate::{brief, crypt, daemon, store};
+use crate::text::status as st;
+use crate::{brief, crypt, daemon, params, store, text};
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 use tiny_http::{Header, Request, Response, Server};
@@ -92,7 +93,7 @@ const JS: &str = r#"<script>
     var doc=new DOMParser().parseFromString(t,"text/html");morph(doc);schedule(fast(doc));}).catch(function(){schedule(false);});}
   function schedule(f){clearTimeout(timer);timer=setTimeout(poll,f?2000:12000);}
   schedule(!!document.querySelector(".badge.run"));
-  var words={"保存":"保存中","测试":"测试中","测试连接":"连接中","删除":"删除中","添加":"添加中","重新生成":"生成中","重新写入":"写入中","立即同步并备份":"同步中","全部测试":"测试中"};
+  var words={"保存":"保存中","测试":"测试中","测试连接":"连接中","删除":"删除中","添加":"添加中","重新生成":"生成中","重新写入 brief 密钥":"写入中","全部测试":"测试中","测试推送":"检查中","撤回":"撤回中"};
   document.addEventListener("submit",function(e){
     var f=e.target,b=e.submitter||f.querySelector("button");
     if(f.method.toLowerCase()!=="post")return;
@@ -144,30 +145,32 @@ fn sessions_page() -> String {
     let mut any_running = false;
     for n in notes.iter().filter(|n| n["deleted"] != true) {
         let tid = n["topic"].as_str().unwrap_or("");
-        let status = n["status"].as_str().unwrap_or("未启动");
+        let status = n["status"].as_str().unwrap_or(st::NEW);
         let (live, pending) = daemon::running(tid).unwrap_or((false, false));
-        let shown = if status == "运行中" && !pending && live { "空闲".to_string() } else { status.to_string() };
-        if pending || status == "转移中" { any_running = true; }
-        let cls = match shown.as_str() { "运行中" | "转移中" => Some(true), "出错" => Some(false), _ => None };
-        let running_now = matches!(shown.as_str(), "运行中" | "转移中");
+        let key = if status == st::RUNNING && !pending && live { st::IDLE } else { status };
+        if pending || status == st::MOVING { any_running = true; }
+        let running_now = matches!(key, st::RUNNING | st::MOVING);
+        let cls = if running_now { Some(true) } else if key == st::ERROR { Some(false) } else { None };
+        let shown = st::label(key).to_string();
         let agent = n["agent"].as_str().unwrap_or("—");
         let agent = match n["resolved"].as_str() { Some(r) if r != agent => format!("{agent} → {r}"), _ => agent.to_string() };
-        let from = n["from"].as_str().map(|f| format!("<div class=\"msg\">从 {} 转来</div>", esc(f))).unwrap_or_default();
+        let from = n["from"].as_str().map(|f| format!("<div class=\"msg\">由 {} 转交</div>", esc(f))).unwrap_or_default();
         let err = n["last_error"].as_str().map(|e| format!("<div class=\"msg\">{}</div>", esc(e))).unwrap_or_default();
-        let link = format!("https://t.me/c/GROUP_ID/{}", tid.trim_start_matches("tgbot:"));
+        let name = esc(n["name"].as_str().unwrap_or(""));
+        let title = match n["link"].as_str() { Some(l) => format!("<a href=\"{}\">{name}</a>", esc(l)), None => name };
         rows.push_str(&format!(
-            "<tr data-k=\"s:{}\"><td><a href=\"{link}\">{}</a><div class=\"mute\">{}</div></td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}{}{}{}</td><td>{}</td><td class=\"msg\">{}</td></tr>",
-            esc(tid), esc(n["name"].as_str().unwrap_or("")), esc(tid), esc(n["device"].as_str().unwrap_or("")), esc(&agent),
-            esc(n["session"].as_str().unwrap_or("—")), if running_now { format!("<span class=\"badge run\">{}</span>", esc(&shown)) } else { badge(cls, &shown) }, if live { " <span class=\"mute\">进程在</span>" } else { "" }, from, err,
+            "<tr data-k=\"s:{}\"><td>{title}<div class=\"mute\">{}</div></td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}{}{}{}</td><td>{}</td><td class=\"msg\">{}</td></tr>",
+            esc(tid), esc(tid), esc(n["device"].as_str().unwrap_or("")), esc(&agent),
+            esc(n["session"].as_str().unwrap_or("—")), if running_now { format!("<span class=\"badge run\">{}</span>", esc(&shown)) } else { badge(cls, &shown) }, if live { " <span class=\"mute\">进程运行中</span>" } else { "" }, from, err,
             ago(n["active"].as_u64().unwrap_or(0)), esc(n["dir"].as_str().unwrap_or(""))));
     }
-    if rows.is_empty() { rows = "<tr><td colspan=7 class=\"mute\">还没有会话。在 Telegram 群里新建一个话题，发一句话。</td></tr>".into(); }
+    if rows.is_empty() { rows = "<tr><td colspan=7 class=\"mute\">尚无会话。在 Telegram 群组中新建话题并发送消息后，会话将显示在此处。</td></tr>".into(); }
     let deleted = notes.iter().filter(|n| n["deleted"] == true).count();
     let tg = store::state("telegram");
     let body = format!(
         "<h2>会话</h2><div class=\"row\">brief：{} <span class=\"mute\">{}</span></div><div class=\"card\"><table><tr><th>话题</th><th>设备</th><th>Agent</th><th>会话编号</th><th>状态</th><th>最后活动</th><th>文件夹</th></tr>{rows}</table></div>{}",
         badge(Some(tg["ok"] == true), tg["msg"].as_str().unwrap_or("未知")), ago(tg["time"].as_u64().unwrap_or(0)),
-        if deleted > 0 { format!("<p class=\"mute\">另有 {deleted} 个话题已在 Telegram 里删除，它们的文件夹和记录都还在。</p>") } else { String::new() });
+        if deleted > 0 { format!("<p class=\"mute\">另有 {deleted} 个话题已在 Telegram 中删除，其文件夹和记录仍然保留。</p>") } else { String::new() });
     page("/", "会话", &body, any_running)
 }
 
@@ -190,14 +193,14 @@ fn devices_page() -> String {
 <form class="inline" method="post" action="/devices/delete" onsubmit="return confirm('删除设备「{}」？')"><input type="hidden" name="i" value="{i}"><button class="danger">删除</button></form>
 <span data-k="dev:{}">{}</span></div>"#,
             esc(dn), esc(d["host"].as_str().unwrap_or("")), d["port"].as_u64().unwrap_or(22), esc(d["user"].as_str().unwrap_or("")),
-            if has_pw { "（已加密保存）" } else { "" }, if has_pw { "不改就留空" } else { "" }, esc(d["root"].as_str().unwrap_or("")), esc(dn), esc(dn), result_cell(conn)));
-        body.push_str(&format!("<h2>Agent{}</h2><div class=\"row\"><form class=\"inline\" method=\"post\" action=\"/agents/testall\"><input type=\"hidden\" name=\"i\" value=\"{i}\"><button>全部测试</button></form><span class=\"mute\">逐个测试这台设备上的所有 agent</span></div><table><tr><th>名称</th><th>启动命令</th><th>类型</th><th></th><th>测试结果</th></tr>", if i == 0 { "（第一行是新话题的默认 agent）" } else { "" }, i = i));
+            if has_pw { "（已加密保存）" } else { "" }, if has_pw { "如不修改请留空" } else { "" }, esc(d["root"].as_str().unwrap_or("")), esc(dn), esc(dn), result_cell(conn)));
+        body.push_str(&format!("<h2>Agent{}</h2><div class=\"row\"><form class=\"inline\" method=\"post\" action=\"/agents/testall\"><input type=\"hidden\" name=\"i\" value=\"{i}\"><button>全部测试</button></form><span class=\"mute\">依次测试本设备上的所有 agent</span></div><table><tr><th>名称</th><th>启动命令</th><th>类型</th><th></th><th>测试结果</th></tr>", if i == 0 { "（第一行为新话题的默认 agent）" } else { "" }, i = i));
         for (j, a) in d["agents"].as_array().into_iter().flatten().enumerate() {
             let an = a["name"].as_str().unwrap_or("");
             let r = &tests[format!("agent:{dn}:{an}")];
             if r["running"] == true { testing = true; }
             let kind = a["kind"].as_str().unwrap_or("");
-            let opts: String = ["claude", "codex", "pi"].iter().map(|k| format!("<option value=\"{k}\"{}>{}</option>", if *k == kind { " selected" } else { "" }, Kind::parse(k).unwrap().label())).collect();
+            let opts: String = Kind::ALL.iter().map(|k| format!("<option value=\"{}\"{}>{}</option>", k.name(), if k.name() == kind { " selected" } else { "" }, k.label())).collect();
             body.push_str(&format!(r#"<tr><form method="post" action="/agents/save"><input type="hidden" name="i" value="{i}"><input type="hidden" name="j" value="{j}">
 <td><input name="name" value="{}" size="8"></td><td><input name="command" value="{}" size="22"></td><td><select name="kind">{opts}</select></td>
 <td style="white-space:nowrap"><button>保存</button></form>
@@ -206,7 +209,8 @@ fn devices_page() -> String {
 <td data-k="a:{}:{}">{}</td></tr>"#, esc(an), esc(a["command"].as_str().unwrap_or("")), esc(dn), esc(an), result_cell(r)));
         }
         body.push_str(&format!(r#"<tr><form method="post" action="/agents/save"><input type="hidden" name="i" value="{i}"><input type="hidden" name="j" value="new">
-<td><input name="name" placeholder="名称" size="8"></td><td><input name="command" placeholder="启动命令" size="22"></td><td><select name="kind"><option value="claude">Claude</option><option value="codex">Codex</option><option value="pi">Pi</option></select></td><td><button>添加</button></td><td></td></form></tr></table></div>"#));
+<td><input name="name" placeholder="名称" size="8"></td><td><input name="command" placeholder="启动命令" size="22"></td><td><select name="kind">{}</select></td><td><button>添加</button></td><td></td></form></tr></table></div>"#,
+            Kind::ALL.iter().map(|k| format!("<option value=\"{}\">{}</option>", k.name(), k.label())).collect::<String>()));
     }
     body.push_str(r#"<h2>添加设备</h2><div class="card"><form method="post" action="/devices/save"><input type="hidden" name="i" value="new">
 <div class="grid"><div><label class="mute">名称</label><br><input name="name"></div><div><label class="mute">地址</label><br><input name="host" placeholder="local 表示本机"></div>
@@ -221,9 +225,10 @@ fn memory_page() -> String {
     for d in store::devices() {
         let dn = d["name"].as_str().unwrap_or("").to_string();
         let p = crate::prompt::infra(&d);
-        let tree = crate::host::run(&d, &format!("cd {} 2>/dev/null || {{ echo '没有这个目录'; exit 0; }}; find . -name '*.md' -not -path './.git/*' -not -path './archive/*' | sed 's#^./##' | sort", crate::host::quote(&p)), 30).unwrap_or_else(|e| format!("读不到：{e}"));
+        let tree = crate::host::run(&d, &format!("cd {} && find . -name '*.md' -not -path './.git/*' -not -path './archive/*' | sed 's#^./##' | sort", crate::host::quote(&p)), 30).unwrap_or_else(|e| text::read_failed(&e));
+        let remote = crate::infra::remote(&d);
         let last = &store::state("infra")[&dn];
-        let status = if last.is_null() { "<span class=\"mute\">exterior 还没提交过</span>".to_string() } else {
+        let status = if last.is_null() { "<span class=\"mute\">exterior 尚未提交过修改</span>".to_string() } else {
             format!("{} <span class=\"mute\">{} · {}</span> <span class=\"msg\">{}</span>", badge(Some(last["ok"] == true), if last["ok"] == true { "已推送" } else { "推送失败" }),
                 ago(last["time"].as_u64().unwrap_or(0)), esc(last["topic"].as_str().unwrap_or("")), esc(last["msg"].as_str().unwrap_or("")))
         };
@@ -236,11 +241,11 @@ fn memory_page() -> String {
             } else { rows.push_str(&format!("<div class=\"msg\">{}</div>", esc(l))); }
         }
         let r = &store::state("tests")[format!("revert:{dn}")];
-        body.push_str(&format!(r#"<h2>{}：{}</h2><div class="card"><div class="row mute">关于 Yao 的知识只放这一处（GitHub：BH3GEI/exterior-knowledge）。agent 用到时自己查；学到新东西直接改对应文件，exterior 每轮结束自动提交并推送。</div><div class="row">最近一次：{}</div><div class="row"><form class="inline" method="post" action="/infra/test"><input type="hidden" name="d" value="{}"><button>测试推送</button></form>{}</div></div>
+        body.push_str(&format!(r#"<h2>{}：{}</h2><div class="card"><div class="row mute">关于 {} 的知识只存放在此处（远程仓库：{}）。agent 在需要时自行查阅；获得新信息时直接修改对应文件，exterior 在每个回合结束后自动提交并推送。</div><div class="row">最近一次：{}</div><div class="row"><form class="inline" method="post" action="/infra/test"><input type="hidden" name="d" value="{}"><button>测试推送</button></form>{}</div></div>
 <h2>最近的修改</h2><div class="card">{}<div class="row">{}</div></div><h2>文件</h2><div class="card"><pre>{}</pre></div>"#,
-            esc(&dn), esc(&p), status, esc(&dn), result_cell(&store::state("tests")[format!("infra:{dn}")]), if rows.is_empty() { "<div class=\"mute\">没有记录</div>".into() } else { rows }, result_cell(r), esc(&tree)));
+            esc(&dn), esc(&p), esc(&params::get("user_name")), esc(&remote), status, esc(&dn), result_cell(&store::state("tests")[format!("infra:{dn}")]), if rows.is_empty() { "<div class=\"mute\">暂无记录</div>".into() } else { rows }, result_cell(r), esc(&tree)));
     }
-    if body.is_empty() { body = "<p class=\"mute\">还没有设备。</p>".into(); }
+    if body.is_empty() { body = "<p class=\"mute\">尚未添加设备。</p>".into(); }
     page("/memory", "记忆", &body, false)
 }
 
@@ -250,20 +255,20 @@ fn messages_page() -> String {
     let mut rows: Vec<String> = store::tail("messages.jsonl", 200).iter().rev().filter_map(|l| serde_json::from_str::<Value>(l).ok()).map(|m| {
         format!("<tr><td class=\"mute\" style=\"white-space:nowrap\">{}</td><td>{}</td><td>{}</td><td class=\"msg\">{}</td></tr>", fmt_time(m["time"].as_u64().unwrap_or(0)), esc(m["from"].as_str().unwrap_or("")), esc(m["to"].as_str().unwrap_or("")), esc(m["text"].as_str().unwrap_or("")))
     }).collect();
-    if rows.is_empty() { rows.push("<tr><td colspan=4 class=\"mute\">还没有会话之间的消息。</td></tr>".into()); }
+    if rows.is_empty() { rows.push("<tr><td colspan=4 class=\"mute\">暂无会话之间的消息。</td></tr>".into()); }
     page("/messages", "消息记录", &format!("<h2>会话之间的消息</h2><div class=\"card\"><table><tr><th>时间</th><th>发送方</th><th>接收方</th><th>内容</th></tr>{}</table></div>", rows.join("")), false)
 }
 
 fn prompt_page() -> String {
-    let mut body = String::from("<h2>启动说明</h2><p class=\"mute\">exterior 启动 agent 时，把下面这段直接交给它（claude 和 pi 用 --append-system-prompt，codex 用 developer_instructions），不往文件夹里写文件。话题名、文件夹按实际话题填。各工具自己的全局说明只剩红线和 knowledge 的位置。</p>");
+    let mut body = String::from("<h2>启动说明</h2><p class=\"mute\">exterior 启动 agent 时，读取 knowledge 中的说明文件，填入话题信息后交给 agent（claude 和 pi 通过 --append-system-prompt，codex 通过 developerInstructions），不在话题文件夹中写入文件。说明文件的位置可在「设置」中修改；修改说明本身请直接编辑这些文件。</p>");
     for d in store::devices() {
+        let dn = d["name"].as_str().unwrap_or("").to_string();
+        let r = &store::state("tests")[format!("prompt:{dn}")];
         let root = crate::prompt::root(&d);
-        let r = &store::state("tests")[format!("prompt:{}", d["name"].as_str().unwrap_or(""))];
-        let sample = crate::prompt::session_text(&d, "某话题", "tgbot:话题号", &format!("{root}/某话题"), false);
-        let global = crate::prompt::session_text(&d, "全局", "tgbot:话题号", &format!("{root}/overview"), true);
-        let extra = global.strip_prefix(sample.replace("某话题", "全局").replace(&format!("{root}/全局"), &format!("{root}/overview")).as_str()).unwrap_or("").trim().to_string();
-        body.push_str(&format!("<h2>{}</h2><div class=\"card\"><pre>{}</pre><div class=\"row mute\">「全局」话题另加一段：</div><pre>{}</pre><div class=\"row\"><form method=\"post\" action=\"/prompt/install\"><input type=\"hidden\" name=\"d\" value=\"{}\"><button>重新写入 brief 密钥</button></form>{}</div></div>",
-            esc(d["name"].as_str().unwrap_or("")), esc(&sample), esc(&extra), esc(d["name"].as_str().unwrap_or("")), result_cell(r)));
+        let sample = crate::prompt::session_text(&d, text::SAMPLE_TOPIC, text::SAMPLE_TID, &format!("{root}/{}", text::SAMPLE_TOPIC), false).unwrap_or_else(|e| e);
+        let global = crate::prompt::session_text(&d, &params::get("global_topic"), text::SAMPLE_TID, &crate::prompt::global_dir(&d), true).unwrap_or_else(|e| e);
+        body.push_str(&format!("<h2>{}</h2><div class=\"card\"><div class=\"row mute\">普通话题：{}</div><pre>{}</pre><div class=\"row mute\">「{}」话题（追加 {}）：</div><pre>{}</pre><div class=\"row\"><form method=\"post\" action=\"/prompt/install\"><input type=\"hidden\" name=\"d\" value=\"{}\"><button>重新写入 brief 密钥</button></form>{}</div></div>",
+            esc(&dn), esc(&crate::prompt::file(&d, "session_prompt")), esc(&sample), esc(&params::get("global_topic")), esc(&crate::prompt::file(&d, "global_prompt")), esc(&global), esc(&dn), result_cell(r)));
     }
     page("/prompt", "启动说明", &body, false)
 }
@@ -278,9 +283,12 @@ fn settings_page() -> String {
 <div class="grid"><div><label class="mute">brief 地址</label><br><input name="brief_url" value="{}" size="34"></div><div><label class="mute">brief 密钥{}</label><br><input name="brief_key" type="password" placeholder="{}" autocomplete="new-password"></div></div>
 <div class="row"><button class="primary">保存</button></div></form><div class="row">状态：{} <span class="mute">{}</span></div>
 <div class="row">「/」命令菜单：{} 条 agent 命令，更新于 {} <form class="inline" method="post" action="/settings/menu"><button>重新生成</button></form> {}</div></div>"#,
-        esc(c["brief"]["url"].as_str().unwrap_or("")), if has_key { "（已加密保存）" } else { "" }, if has_key { "不改就留空" } else { "" },
+        esc(c["brief"]["url"].as_str().unwrap_or("")), if has_key { "（已加密保存）" } else { "" }, if has_key { "如不修改请留空" } else { "" },
         badge(Some(tg["ok"] == true), tg["msg"].as_str().unwrap_or("未知")), ago(tg["time"].as_u64().unwrap_or(0)),
         menu_n, ago(store::state("menu_time").as_u64().unwrap_or(0)), result_cell(r));
+    let fields: String = params::PARAMS.iter().map(|p| format!("<div><label class=\"mute\">{}</label><br><input name=\"p_{}\" value=\"{}\" placeholder=\"{}\"></div>",
+        esc(p.label), p.key, esc(&params::get(p.key)), esc(p.default))).collect();
+    let body = format!("{body}<h2>参数</h2><div class=\"card\"><form method=\"post\" action=\"/settings/params\"><div class=\"grid\">{fields}</div><div class=\"row\"><button class=\"primary\">保存</button><span class=\"mute\">清空某一项即恢复默认值。</span></div></form></div>");
     page("/settings", "设置", &body, r["running"] == true)
 }
 
@@ -361,7 +369,7 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
                 if !a.is_null() {
                     let key = format!("agent:{}:{}", d["name"].as_str().unwrap_or(""), a["name"].as_str().unwrap_or(""));
                     background(key, move || {
-                        let dir = format!("{}/overview", d["root"].as_str().unwrap_or("").trim_end_matches('/'));
+                        let dir = crate::prompt::global_dir(&d);
                         agents::test(&d, &dir, a["command"].as_str().unwrap_or(""), Kind::parse(a["kind"].as_str().unwrap_or("")).unwrap_or(Kind::Claude))
                     });
                 }
@@ -374,7 +382,7 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
                 let rows: Vec<Value> = d["agents"].as_array().cloned().unwrap_or_default();
                 for a in &rows { set_test(&format!("agent:{dn}:{}", a["name"].as_str().unwrap_or("")), json!({"running": true, "time": store::now()})); }
                 std::thread::spawn(move || {
-                    let dir = format!("{}/overview", d["root"].as_str().unwrap_or("").trim_end_matches('/'));
+                    let dir = crate::prompt::global_dir(&d);
                     for a in rows {
                         let key = format!("agent:{dn}:{}", a["name"].as_str().unwrap_or(""));
                         let r = agents::test(&d, &dir, a["command"].as_str().unwrap_or(""), Kind::parse(a["kind"].as_str().unwrap_or("")).unwrap_or(Kind::Claude));
@@ -397,7 +405,7 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
         }
         "/prompt/install" => {
             if let Some(d) = store::device(&g("d")) {
-                background(format!("prompt:{}", g("d")), move || crate::prompt::install(&d).map(|_| "已写入".to_string()));
+                background(format!("prompt:{}", g("d")), move || crate::prompt::install(&d).map(|_| text::KEY_WRITTEN.to_string()));
             }
             "/prompt".into()
         }
@@ -409,7 +417,16 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
             store::set_config(&c);
             "/settings".into()
         }
-        "/settings/menu" => { background("menu".into(), || daemon::build_menu().map(|n| format!("已设置 {n} 条命令"))); "/settings".into() }
+        "/settings/params" => {
+            if !c["params"].is_object() { c["params"] = json!({}); }
+            for p in params::PARAMS {
+                let v = g(&format!("p_{}", p.key));
+                if v.is_empty() || v == p.default { c["params"].as_object_mut().unwrap().remove(p.key); } else { c["params"][p.key] = json!(v); }
+            }
+            store::set_config(&c);
+            "/settings".into()
+        }
+        "/settings/menu" => { background("menu".into(), || daemon::build_menu().map(text::menu_set)); "/settings".into() }
         _ => "/".into(),
     }
 }
@@ -435,7 +452,7 @@ fn respond(mut req: Request) {
         "/settings" => settings_page(),
         "/log" => log_page(),
         "/healthz" => { let _ = req.respond(Response::from_string("ok")); return; }
-        _ => { let _ = req.respond(Response::from_string("没有这个页面").with_status_code(404)); return; }
+        _ => { let _ = req.respond(Response::from_string("页面不存在").with_status_code(404)); return; }
     };
     let _ = req.respond(Response::from_string(out).with_header(html));
 }

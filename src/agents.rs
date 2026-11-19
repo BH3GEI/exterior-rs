@@ -6,6 +6,7 @@ use std::process::{Child, ChildStdin, Stdio};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use crate::{params, text};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind { Claude, Pi, Codex }
@@ -16,6 +17,22 @@ impl Kind {
     }
     pub fn name(&self) -> &'static str { match self { Kind::Claude => "claude", Kind::Pi => "pi", Kind::Codex => "codex" } }
     pub fn label(&self) -> &'static str { match self { Kind::Claude => "Claude", Kind::Pi => "Pi", Kind::Codex => "Codex" } }
+    /// The prefix of this kind's commands in the Telegram menu (cc_model, pi_compact, cx_new…).
+    pub fn prefix(&self) -> &'static str { match self { Kind::Claude => "cc", Kind::Pi => "pi", Kind::Codex => "cx" } }
+    pub const ALL: [Kind; 3] = [Kind::Claude, Kind::Pi, Kind::Codex];
+}
+
+/// Commands that are requests to the agent rather than prompts, per kind. The menu, the dispatch and the
+/// "which agent is this for" check are all built from this one table.
+pub const BUILTINS: &[(Kind, &str)] = &[(Kind::Pi, "thinking"), (Kind::Pi, "compact"), (Kind::Pi, "new"), (Kind::Codex, "compact"), (Kind::Codex, "new")];
+
+/// The menu name of a built-in command, e.g. pi_thinking.
+pub fn builtin_command(kind: Kind, name: &str) -> String { format!("{}_{name}", kind.prefix()) }
+
+/// "/pi_thinking" → (Pi, "thinking").
+pub fn find_builtin(head: &str) -> Option<(Kind, &'static str)> {
+    let h = head.trim_start_matches('/');
+    BUILTINS.iter().find(|(k, n)| builtin_command(*k, n) == h).copied()
 }
 
 /// The line that tells a new agent where the previous session is, in the previous agent's own words.
@@ -27,7 +44,7 @@ pub enum Ev {
     Text { tid: String, gen: u64, delta: String },
     Done { tid: String, gen: u64, text: Option<String>, stopped: bool, error: Option<String> },
     Session { tid: String, gen: u64, id: String },
-    /// side notice worth showing Yao: rate limit, model fallback, API retry
+    /// side notice worth showing the user: rate limit, model fallback, API retry
     Note { tid: String, gen: u64, text: String },
     /// the command picked a concrete account (cc0 → cc6): later restarts use that one
     Resolved { tid: String, gen: u64, name: String },
@@ -78,7 +95,8 @@ fn watch_stderr(err: std::process::ChildStderr, tx: Sender<Ev>, tid: String, gen
     std::thread::spawn(move || {
         for line in BufReader::new(err).lines().map_while(Result::ok) {
             let l = line.trim();
-            if let Some(n) = l.strip_prefix("→ ") {
+            let mark = params::get("pick_mark");
+            if let Some(n) = l.strip_prefix(mark.as_str()).filter(|_| !mark.is_empty()) {
                 let n = n.trim();
                 if !n.is_empty() && !n.contains(' ') { let _ = tx.send(Ev::Resolved { tid: tid.clone(), gen, name: n.to_string() }); }
             }
@@ -93,7 +111,7 @@ fn watch_stderr(err: std::process::ChildStderr, tx: Sender<Ev>, tid: String, gen
 
 fn put(stdin: &Arc<Mutex<Option<ChildStdin>>>, v: &Value) -> Result<(), String> {
     let mut g = stdin.lock().unwrap();
-    let s = g.as_mut().ok_or("agent 没在运行")?;
+    let s = g.as_mut().ok_or(text::NOT_RUNNING)?;
     writeln!(s, "{v}").and_then(|_| s.flush()).map_err(|e| e.to_string())
 }
 
@@ -104,8 +122,8 @@ fn route(pending: &Pending, id: Option<String>, v: &Value) -> bool {
     false
 }
 
-/// A model to choose: what to send back, and what to show.
-pub struct Choice { pub value: String, pub label: String }
+/// A model to choose: what to send back, what to show, and (pi) the provider and id it is made of.
+pub struct Choice { pub value: String, pub label: String, pub provider: Option<String>, pub id: String }
 
 /// The part of a running agent that answers questions (models, built-in commands). Cheap to clone, so it can be
 /// used without holding the sessions lock.
@@ -155,7 +173,8 @@ impl Agent {
 
     fn start_claude(&mut self) -> Result<(), String> {
         let mut args: Vec<String> = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-                "--include-partial-messages", "--dangerously-skip-permissions"].map(String::from).to_vec();
+                "--include-partial-messages"].map(String::from).to_vec();
+        args.extend(params::args("claude_args"));
         if let Some(id) = &self.spec.resume { args.push("--resume".into()); args.push(id.clone()); }
         if !self.spec.prompt.is_empty() { args.push("--append-system-prompt".into()); args.push(self.spec.prompt.clone()); }
         let (out, last) = self.spawn(args)?;
@@ -178,7 +197,7 @@ impl Agent {
                 if v["type"] == "result" {
                     *busy.lock().unwrap() = false;
                     let stopped = v["subtype"] == "error_during_execution";
-                    let error = if v["is_error"] == true && !stopped { Some(v["result"].as_str().unwrap_or("出错了").to_string()) } else { None };
+                    let error = if v["is_error"] == true && !stopped { Some(v["result"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or(text::AGENT_ERROR).to_string()) } else { None };
                     let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: v["result"].as_str().map(String::from), stopped, error });
                 }
             }
@@ -192,7 +211,7 @@ impl Agent {
     }
 
     fn start_pi(&mut self) -> Result<(), String> {
-        let sid = self.spec.resume.clone().unwrap_or_else(|| format!("exterior-{}-{}", self.spec.tid.trim_start_matches("tgbot:"), crate::store::now()));
+        let sid = self.spec.resume.clone().unwrap_or_else(|| format!("exterior-{}-{}", crate::brief::topic_id(&self.spec.tid), crate::store::now()));
         let mut args: Vec<String> = vec!["--mode".into(), "rpc".into(), "--session-id".into(), sid.clone()];
         if !self.spec.prompt.is_empty() { args.push("--append-system-prompt".into()); args.push(self.spec.prompt.clone()); }
         let (out, last) = self.spawn(args)?;
@@ -214,21 +233,22 @@ impl Agent {
                             .filter(|c| c["type"] == "text").filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("");
                         if !t.is_empty() { last_text = Some(t); }
                         if v["message"]["stopReason"] == "error" {
-                            let m = v["message"]["errorMessage"].as_str().unwrap_or("模型出错了");
-                            let inner = serde_json::from_str::<Value>(m.splitn(2, ' ').nth(1).unwrap_or("")).ok()
+                            let m = v["message"]["errorMessage"].as_str().unwrap_or(text::MODEL_ERROR);
+                            // pi writes "<status> <json body>": show the status and the body's message
+                            let inner = serde_json::from_str::<Value>(m.split_once(' ').map(|x| x.1).unwrap_or("")).ok()
                                 .and_then(|j| j["error"]["message"].as_str().map(String::from));
-                            last_err = Some(match inner { Some(i) => format!("{} {i}", m.split(' ').next().unwrap_or("")), None => m.chars().take(300).collect() });
+                            last_err = Some(match inner { Some(i) => format!("{} {i}", m.split(' ').next().unwrap_or("")), None => clip(m) });
                         } else { last_err = None; }
                     }
                     Some("auto_retry_start") => {
                         let a = v["attempt"].as_i64().unwrap_or(0);
-                        if a == 1 || a % 3 == 0 {
-                            let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: format!("模型出错，正在重试 {a}/{}：{}", v["maxAttempts"].as_i64().unwrap_or(0), v["errorMessage"].as_str().unwrap_or("").chars().take(200).collect::<String>()) });
+                        if worth_noting(a) {
+                            let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::retrying(text::Source::Model, a, v["maxAttempts"].as_i64().unwrap_or(0), &clip(v["errorMessage"].as_str().unwrap_or(""))) });
                         }
                     }
                     Some("extension_error") => {
                         let e = v["error"].as_str().map(String::from).unwrap_or_else(|| v.to_string());
-                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: format!("pi 扩展出错：{}", e.chars().take(200).collect::<String>()) });
+                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::extension_error(&clip(&e)) });
                     }
                     Some("agent_settled") => {
                         *busy.lock().unwrap() = false;
@@ -236,7 +256,7 @@ impl Agent {
                     }
                     Some("response") if v["success"] == false => {
                         *busy.lock().unwrap() = false;
-                        let err = v["error"].as_str().unwrap_or("pi 拒绝了这条命令").to_string();
+                        let err = v["error"].as_str().unwrap_or(text::PI_REJECTED).to_string();
                         let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: None, stopped: false, error: Some(err) });
                     }
                     _ => {}
@@ -255,7 +275,7 @@ impl Agent {
         let (tx, tid, gen, child, busy, pending) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone());
         let (stdin, queue, thread, turn, model) = (self.stdin.clone(), self.queue.clone(), self.thread.clone(), self.turn.clone(), self.model.clone());
         std::thread::spawn(move || {
-            let (mut reply, mut error): (String, Option<String>) = (String::new(), None);
+            let (mut reply, mut error, mut retries): (String, Option<String>, i64) = (String::new(), None, 0);
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                 let method = v["method"].as_str().unwrap_or("");
@@ -267,7 +287,7 @@ impl Agent {
                     // a request from codex (approvals): we run without approvals, so say yes; anything else, decline
                     let res = if method.ends_with("requestApproval") { json!({"id": v["id"], "result": {"decision": "accept"}}) }
                               else if method == "execCommandApproval" || method == "applyPatchApproval" { json!({"id": v["id"], "result": {"decision": "approved"}}) }
-                              else { json!({"id": v["id"], "error": {"code": -32601, "message": "exterior 不处理这个请求"}}) };
+                              else { json!({"id": v["id"], "error": {"code": -32601, "message": text::CODEX_UNHANDLED}}) };
                     let _ = put(&stdin, &res);
                     continue;
                 }
@@ -279,7 +299,7 @@ impl Agent {
                             let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: t.to_string() });
                         }
                     }
-                    "turn/started" => { *turn.lock().unwrap() = p["turn"]["id"].as_str().map(String::from); }
+                    "turn/started" => { *turn.lock().unwrap() = p["turn"]["id"].as_str().map(String::from); retries = 0; }
                     "item/agentMessage/delta" => {
                         let d = p["delta"].as_str().unwrap_or("");
                         reply.push_str(d);
@@ -289,13 +309,16 @@ impl Agent {
                         if !reply.is_empty() && !reply.ends_with("\n\n") { reply.push_str("\n\n"); let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
                     }
                     "error" if p["willRetry"] == true => {
-                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: format!("codex 出错，正在重试：{}", p["error"]["message"].as_str().unwrap_or("")) });
+                        retries += 1;
+                        if worth_noting(retries) {
+                            let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::retrying(text::Source::Codex, retries, 0, &clip(p["error"]["message"].as_str().unwrap_or(""))) });
+                        }
                     }
-                    "error" if p["willRetry"] != true => { error = p["error"]["message"].as_str().map(String::from).or(Some("codex 出错了".into())); }
+                    "error" => { error = Some(p["error"]["message"].as_str().unwrap_or(text::CODEX_ERROR).to_string()); }
                     "turn/completed" => {
                         *turn.lock().unwrap() = None;
                         let st = p["turn"]["status"].as_str().unwrap_or("");
-                        if st == "failed" && error.is_none() { error = Some(p["turn"]["error"]["message"].as_str().unwrap_or("codex 出错了").to_string()); }
+                        if st == "failed" && error.is_none() { error = Some(p["turn"]["error"]["message"].as_str().unwrap_or(text::CODEX_ERROR).to_string()); }
                         let text = reply.trim().to_string();
                         let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: if text.is_empty() { None } else { Some(text) }, stopped: st == "interrupted", error: error.take() });
                         reply.clear();
@@ -320,11 +343,11 @@ impl Agent {
                 c.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": {"clientInfo": {"name": "exterior", "version": env!("CARGO_PKG_VERSION")}}}))?;
                 put(&stdin, &json!({"jsonrpc": "2.0", "method": "initialized"}))?;
                 let mut params = match &spec.resume { Some(t) => json!({"threadId": t}), None => json!({}) };
-                for (k, v) in [("cwd", json!(spec.dir)), ("developerInstructions", json!(spec.prompt)), ("approvalPolicy", json!("never")), ("sandbox", json!("danger-full-access"))] { params[k] = v; }
+                for (k, v) in [("cwd", json!(spec.dir)), ("developerInstructions", json!(spec.prompt)), ("approvalPolicy", json!(params::get("codex_approval"))), ("sandbox", json!(params::get("codex_sandbox")))] { params[k] = v; }
                 let method = if spec.resume.is_some() { "thread/resume" } else { "thread/start" };
                 let r = c.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
-                if let Some(e) = r["error"]["message"].as_str() { return Err(format!("codex：{e}")); }
-                r["result"]["thread"]["id"].as_str().map(String::from).ok_or("codex 没给会话编号".into())
+                if let Some(e) = r["error"]["message"].as_str() { return Err(e.to_string()); }
+                r["result"]["thread"]["id"].as_str().map(String::from).ok_or(text::CODEX_NO_THREAD.into())
             })();
             match r {
                 Ok(t) => {
@@ -339,7 +362,7 @@ impl Agent {
                 Err(e) => {
                     queue.lock().unwrap().clear();
                     *busy.lock().unwrap() = false;
-                    let _ = tx.send(Ev::Done { tid: spec.tid.clone(), gen: spec.gen, text: None, stopped: false, error: Some(format!("codex 没启动起来：{e}")) });
+                    let _ = tx.send(Ev::Done { tid: spec.tid.clone(), gen: spec.gen, text: None, stopped: false, error: Some(text::codex_start_failed(&e)) });
                 }
             }
         });
@@ -389,21 +412,26 @@ impl Agent {
 }
 
 impl Ctl {
-    /// codex: wait (up to 40 s) until the background handshake is done.
+    /// codex: wait until the background handshake is done.
     fn ready(&self) -> Result<(), String> {
         if self.kind != Kind::Codex { return Ok(()); }
-        for _ in 0..80 { if self.thread.lock().unwrap().is_some() { return Ok(()); } std::thread::sleep(std::time::Duration::from_millis(500)); }
-        Err("codex 还没准备好".into())
+        let until = std::time::Instant::now() + params::secs("codex_ready_s");
+        while std::time::Instant::now() < until {
+            if self.thread.lock().unwrap().is_some() { return Ok(()); }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        Err(text::CODEX_NOT_READY.into())
     }
 
-    /// Send a request and wait for its answer (up to 30 s). `make` puts the id into the request.
+    /// Send a request and wait for its answer. `make` puts the id into the request.
     pub fn ask(&self, make: impl FnOnce(&str) -> Value) -> Result<Value, String> {
         let id = format!("x{}", self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1);
         let (w, r) = std::sync::mpsc::channel();
         self.pending.lock().unwrap().insert(id.clone(), w);
         let v = make(&id);
         if let Err(e) = put(&self.stdin, &v) { self.pending.lock().unwrap().remove(&id); return Err(e); }
-        r.recv_timeout(std::time::Duration::from_secs(30)).map_err(|_| { self.pending.lock().unwrap().remove(&id); "agent 没有回应".to_string() })
+        let secs = params::num("ask_timeout_s");
+        r.recv_timeout(std::time::Duration::from_secs(secs)).map_err(|_| { self.pending.lock().unwrap().remove(&id); text::no_response(secs) })
     }
 
     /// The models this agent can switch to.
@@ -411,17 +439,25 @@ impl Ctl {
         self.ready()?;
         match self.kind {
             Kind::Claude => {
-                for _ in 0..30 { if !self.info.lock().unwrap().is_null() { break; } std::thread::sleep(std::time::Duration::from_secs(1)); }
+                let until = std::time::Instant::now() + params::secs("ask_timeout_s");
+                while self.info.lock().unwrap().is_null() && std::time::Instant::now() < until { std::thread::sleep(std::time::Duration::from_millis(200)); }
                 let info = self.info.lock().unwrap().clone();
-                Ok(info["models"].as_array().into_iter().flatten().filter_map(|m| Some(Choice { value: m["value"].as_str()?.to_string(), label: m["displayName"].as_str().unwrap_or(m["value"].as_str()?).to_string() })).collect())
+                if info.is_null() { return Err(text::no_response(params::num("ask_timeout_s"))); }
+                Ok(info["models"].as_array().into_iter().flatten().filter_map(|m| { let v = m["value"].as_str()?; Some(Choice { value: v.into(), label: m["displayName"].as_str().unwrap_or(v).into(), provider: None, id: v.into() }) }).collect())
             }
             Kind::Pi => {
                 let r = self.ask(|id| json!({"type": "get_available_models", "id": id}))?;
-                Ok(r["data"]["models"].as_array().into_iter().flatten().filter_map(|m| Some(Choice { value: format!("{}/{}", m["provider"].as_str()?, m["id"].as_str()?), label: m["name"].as_str().unwrap_or(m["id"].as_str()?).to_string() })).collect())
+                Ok(r["data"]["models"].as_array().into_iter().flatten().filter_map(|m| {
+                    let (p, id) = (m["provider"].as_str()?, m["id"].as_str()?);
+                    Some(Choice { value: format!("{p}/{id}"), label: m["name"].as_str().unwrap_or(id).into(), provider: Some(p.into()), id: id.into() })
+                }).collect())
             }
             Kind::Codex => {
                 let r = self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "model/list", "params": {}}))?;
-                Ok(r["result"]["data"].as_array().into_iter().flatten().filter(|m| m["hidden"] != true).filter_map(|m| Some(Choice { value: m["model"].as_str().or(m["id"].as_str())?.to_string(), label: m["displayName"].as_str().unwrap_or(m["id"].as_str()?).to_string() })).collect())
+                Ok(r["result"]["data"].as_array().into_iter().flatten().filter(|m| m["hidden"] != true).filter_map(|m| {
+                    let v = m["model"].as_str().or(m["id"].as_str())?;
+                    Some(Choice { value: v.into(), label: m["displayName"].as_str().unwrap_or(v).into(), provider: None, id: v.into() })
+                }).collect())
             }
         }
     }
@@ -430,36 +466,52 @@ impl Ctl {
         let r = match self.kind {
             Kind::Claude => self.ask(|id| json!({"type": "control_request", "request_id": id, "request": {"subtype": "set_model", "model": value}}))?,
             Kind::Pi => {
-                let (p, m) = value.split_once('/').ok_or("模型要写成 provider/id")?;
+                // pi wants the provider and the id separately: find the model in pi's own list
+                let list = self.models()?;
+                let c = list.iter().find(|c| c.value == value).or_else(|| list.iter().find(|c| c.id == value || c.label == value))
+                    .ok_or_else(|| text::model_unknown(self.kind.label(), value))?;
+                let (p, m) = (c.provider.clone().unwrap_or_default(), c.id.clone());
                 self.ask(|id| json!({"type": "set_model", "id": id, "provider": p, "modelId": m}))?
             }
             Kind::Codex => { *self.model.lock().unwrap() = Some(value.to_string()); return Ok(()); }
         };
-        if r["subtype"] == "error" || r["success"] == false { return Err(r["error"].as_str().unwrap_or("没换成").to_string()); }
+        if r["subtype"] == "error" || r["success"] == false { return Err(r["error"].as_str().unwrap_or(text::SET_MODEL_FAILED).to_string()); }
         Ok(())
     }
 
-    /// Built-in commands that are not prompts: pi's thinking/compact/new, codex's compact/new.
-    pub fn builtin(&self, name: &str, arg: &str) -> Result<String, String> {
+    /// The thinking levels the agent offers for its current model (pi).
+    pub fn thinking_levels(&self) -> Result<Vec<String>, String> {
+        match self.kind {
+            Kind::Pi => {
+                let r = self.ask(|id| json!({"type": "get_available_thinking_levels", "id": id}))?;
+                if r["success"] == false { return Err(r["error"].as_str().unwrap_or(text::BUILTIN_FAILED).to_string()); }
+                Ok(r["data"]["levels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from)).collect())
+            }
+            _ => Err(text::NOT_SUPPORTED.into()),
+        }
+    }
+
+    /// Built-in commands that are not prompts (see BUILTINS).
+    pub fn builtin(&self, name: &str, arg: &str) -> Result<(), String> {
         self.ready()?;
         let r = match (self.kind, name) {
             (Kind::Pi, "thinking") => self.ask(|id| json!({"type": "set_thinking_level", "id": id, "level": arg}))?,
             (Kind::Pi, "compact") => self.ask(|id| json!({"type": "compact", "id": id}))?,
             (Kind::Pi, "new") => self.ask(|id| json!({"type": "new_session", "id": id}))?,
             (Kind::Codex, "compact") => {
-                let th = self.thread.lock().unwrap().clone().ok_or("codex 还没准备好")?;
+                let th = self.thread.lock().unwrap().clone().ok_or(text::CODEX_NOT_READY)?;
                 self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "thread/compact/start", "params": {"threadId": th}}))?
             }
             (Kind::Codex, "new") => {
-                let p = json!({"cwd": self.dir, "developerInstructions": self.prompt, "approvalPolicy": "never", "sandbox": "danger-full-access"});
+                let p = json!({"cwd": self.dir, "developerInstructions": self.prompt, "approvalPolicy": params::get("codex_approval"), "sandbox": params::get("codex_sandbox")});
                 self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "thread/start", "params": p}))?
             }
-            _ => return Err("没有这个命令".into()),
+            _ => return Err(text::NOT_SUPPORTED.into()),
         };
         if r["success"] == false || !r["error"].is_null() {
-            return Err(r["error"]["message"].as_str().or(r["error"].as_str()).unwrap_or("失败了").to_string());
+            return Err(r["error"]["message"].as_str().or(r["error"].as_str()).unwrap_or(text::BUILTIN_FAILED).to_string());
         }
-        Ok("好了".into())
+        Ok(())
     }
 }
 
@@ -469,35 +521,35 @@ fn codex_turn(thread: &str, text: &str, model: Option<String>) -> Value {
     json!({"jsonrpc": "2.0", "id": format!("turn-{}", crate::store::now()), "method": "turn/start", "params": p})
 }
 
-/// One question, one answer: used by the 测试 button on the Agent page.
+/// One question, one answer: used by the 测试 button on the 设备 page.
 pub fn test(dev: &Value, dir: &str, command: &str, kind: Kind) -> Result<String, String> {
-    let q = "只回复两个字母：OK";
+    let q = crate::prompt::read(dev, "test_prompt")?;
+    let q = q.as_str();
     let args: Vec<String> = match kind {
-        Kind::Claude => vec!["-p".into(), q.into(), "--dangerously-skip-permissions".into()],
+        Kind::Claude => [vec!["-p".into(), q.into()], params::args("claude_args")].concat(),
         Kind::Pi => vec!["-p".into(), "--no-session".into(), q.into()],
         Kind::Codex => vec!["exec".into(), "--skip-git-repo-check".into(), q.into()],
     };
     let mut c = crate::host::agent(dev, dir, &[("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1".into())], command, &args);
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = c.spawn().map_err(|e| e.to_string())?;
-    let out = crate::host::wait(child, 180)?;
+    let out = crate::host::wait(child, params::num("test_timeout_s"))?;
     let so = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let picked = se.lines().filter_map(|l| l.trim().strip_prefix("→ ")).last().map(|n| format!("（{command} 选了 {n}）")).unwrap_or_default();
+    let mark = params::get("pick_mark");
+    let picked = se.lines().filter_map(|l| l.trim().strip_prefix(mark.as_str()).filter(|_| !mark.is_empty())).last().map(|n| text::picked(command, n.trim())).unwrap_or_default();
     if out.status.success() && !so.is_empty() {
-        let tail: String = so.lines().last().unwrap_or("").chars().take(200).collect();
-        Ok(format!("{tail}{picked}"))
+        Ok(format!("{}{picked}", clip(so.lines().last().unwrap_or(""))))
     } else {
         let msg = if se.is_empty() { so } else { se };
-        let tail: Vec<&str> = msg.lines().rev().take(3).collect();
-        Err(format!("退出码 {:?}：{}", out.status.code(), tail.into_iter().rev().collect::<Vec<_>>().join(" / ")))
+        Err(text::exit_code(out.status.code(), &last_lines(&msg).replace('\n', " / ")))
     }
 }
 
 /// The agent's own slash commands, with descriptions (no model call).
 pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(String, String)> {
     let (args, ask): (Vec<String>, Value) = match kind {
-        Kind::Claude => (["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"].map(String::from).to_vec(),
+        Kind::Claude => ([["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"].map(String::from).to_vec(), params::args("claude_args")].concat(),
                          json!({"type": "control_request", "request_id": "init", "request": {"subtype": "initialize"}})),
         Kind::Pi => (vec!["--mode".into(), "rpc".into(), "--no-session".into()], json!({"type": "get_commands"})),
         Kind::Codex => return vec![],
@@ -507,10 +559,10 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
     let mut stdin = child.stdin.take().unwrap();
     let _ = writeln!(stdin, "{ask}");
     let _ = stdin.flush();
-    // never wait forever: if the agent does not answer in 90 s, close it
+    // never wait forever: if the agent does not answer in time, close it
     let stdout = child.stdout.take().unwrap();
     let child = Arc::new(Mutex::new(child));
-    { let c = child.clone(); std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_secs(90)); let _ = c.lock().unwrap().kill(); }); }
+    { let c = child.clone(); std::thread::spawn(move || { std::thread::sleep(params::secs("commands_timeout_s")); let _ = c.lock().unwrap().kill(); }); }
     let mut out = vec![];
     let lines = BufReader::new(stdout).lines();
     for line in lines.map_while(Result::ok).take(500) {
@@ -528,9 +580,28 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
     out
 }
 
-/// Claude's side notices that Yao should see (limits, fallback to another model, retries).
+/// Whether a retry is worth a message: the first one, then every `notice_every`-th.
+fn worth_noting(attempt: i64) -> bool {
+    let every = params::num("notice_every").max(1) as i64;
+    attempt == 1 || attempt % every == 0
+}
+
+/// Keep an error short enough for a message.
+pub fn clip(s: &str) -> String {
+    let n = params::num("error_chars") as usize;
+    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n).collect::<String>()) }
+}
+
+/// The last few lines of an error output.
+pub fn last_lines(s: &str) -> String {
+    let n = params::num("error_lines") as usize;
+    let v: Vec<&str> = s.trim().lines().collect();
+    v[v.len().saturating_sub(n)..].join("\n")
+}
+
+/// Claude's side notices that the user should see. Claude marks its own warnings with `level`; limits and
+/// retries come as their own events.
 pub fn claude_note(v: &Value) -> Option<String> {
-    let model = |k: &str| v[k].as_str().unwrap_or("?").to_string();
     match (v["type"].as_str()?, v["subtype"].as_str().unwrap_or("")) {
         ("rate_limit_event", _) => {
             let i = &v["rate_limit_info"];
@@ -539,24 +610,31 @@ pub fn claude_note(v: &Value) -> Option<String> {
             let kind = i["rateLimitType"].as_str().unwrap_or("");
             let when = i["resetsAt"].as_i64().map(|t| {
                 let t = if t > 1_000_000_000_000 { t / 1000 } else { t };
-                let left = t - std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(t);
-                if left > 0 { format!("，约 {} 小时 {} 分后恢复", left / 3600, left % 3600 / 60) } else { String::new() }
+                let left = t - crate::store::now() as i64;
+                if left > 0 { text::resets_in(left / 3600, left % 3600 / 60) } else { String::new() }
             }).unwrap_or_default();
-            let pct = i["utilization"].as_f64().map(|u| format!("（已用 {:.0}%）", if u <= 1.0 { u * 100.0 } else { u })).unwrap_or_default();
-            Some(match st { "rejected" => format!("额度用完了 {kind}{when}"), _ => format!("额度快用完 {kind}{pct}{when}") })
-        }
-        ("system", "model_fallback") | ("system", "model_refusal_fallback") | ("system", "model_consent_fallback") => {
-            let c = v["content"].as_str().unwrap_or("").trim();
-            Some(if c.is_empty() { format!("降级：{} → {}", model("original_model"), model("fallback_model")) } else { c.to_string() })
+            let pct = i["utilization"].as_f64().map(|u| text::used_pct(if u <= 1.0 { u * 100.0 } else { u })).unwrap_or_default();
+            Some(if st == "rejected" { text::limit_reached(kind, &when) } else { text::limit_near(kind, &pct, &when) })
         }
         ("system", "api_retry") => {
             let a = v["attempt"].as_i64().unwrap_or(0);
-            if a != 1 && a % 3 != 0 { return None; }
-            Some(format!("接口出错，正在重试 {a}/{}：{}", v["max_retries"].as_i64().unwrap_or(0), v["error"].as_str().map(String::from).unwrap_or_else(|| v["error_status"].to_string())))
+            if !worth_noting(a) { return None; }
+            let e = v["error"].as_str().map(String::from).unwrap_or_else(|| v["error_status"].to_string());
+            Some(text::retrying(text::Source::Api, a, v["max_retries"].as_i64().unwrap_or(0), &clip(&e)))
         }
         ("system", "notification") => {
             let t = v["text"].as_str()?.trim();
             if t.is_empty() || v["priority"] == "low" { None } else { Some(t.to_string()) }
+        }
+        ("system", _) if matches!(v["level"].as_str(), Some("warning") | Some("error")) => {
+            let c = v["content"].as_str().unwrap_or("").trim();
+            if !c.is_empty() { return Some(c.to_string()); }
+            let (from, to) = (v["original_model"].as_str(), v["fallback_model"].as_str());
+            match (from, to) { (Some(f), Some(t)) => Some(text::fallback(f, t)), _ => None }
+        }
+        ("system", "model_fallback") => {
+            let c = v["content"].as_str().unwrap_or("").trim();
+            Some(if c.is_empty() { text::fallback(v["original_model"].as_str().unwrap_or("?"), v["fallback_model"].as_str().unwrap_or("?")) } else { c.to_string() })
         }
         _ => None,
     }
@@ -569,8 +647,10 @@ mod note_tests {
     #[test]
     fn notes() {
         assert_eq!(claude_note(&json!({"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}})), None);
-        assert!(claude_note(&json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":4102444800i64}})).unwrap().starts_with("额度用完了 five_hour，约"));
-        assert_eq!(claude_note(&json!({"type":"system","subtype":"model_fallback","original_model":"claude-opus-5-5","fallback_model":"claude-opus-4-8","content":""})).unwrap(), "降级：claude-opus-5-5 → claude-opus-4-8");
+        assert!(claude_note(&json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":4102444800i64}})).unwrap().starts_with("用量已达上限（five_hour），预计"));
+        assert_eq!(claude_note(&json!({"type":"system","subtype":"model_fallback","original_model":"claude-opus-5-5","fallback_model":"claude-opus-4-8","content":""})).unwrap(), "模型已从 claude-opus-5-5 切换为 claude-opus-4-8");
+        assert_eq!(claude_note(&json!({"type":"system","subtype":"model_refusal_fallback","level":"warning","content":"已切换模型"})).unwrap(), "已切换模型");
+        assert_eq!(claude_note(&json!({"type":"system","subtype":"init"})), None);
         assert!(claude_note(&json!({"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"error":"overloaded"})).unwrap().contains("1/10"));
         assert_eq!(claude_note(&json!({"type":"system","subtype":"api_retry","attempt":2})), None);
         assert_eq!(claude_note(&json!({"type":"assistant"})), None);

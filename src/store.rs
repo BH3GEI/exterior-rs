@@ -1,5 +1,5 @@
 //! Everything exterior keeps, in one folder (on Lazycat: /lzcapp/var):
-//! config.json (devices, agents, brief, GitHub), secret.key, sessions/<topic>.json, state.json,
+//! config.json (devices, agents, brief, settings), secret.key, sessions/<topic>.json, state.json,
 //! messages.jsonl (session → session), exterior.log.
 use serde_json::{json, Value};
 use std::io::Write;
@@ -46,8 +46,7 @@ pub fn config() -> Value {
     let _g = LOCK.lock().unwrap();
     let mut c = load(&path("config.json"));
     if !c["devices"].is_array() { c["devices"] = json!([]); }
-    if !c["brief"].is_object() { c["brief"] = json!({"url": "https://brief.example.com"}); }
-    if !c["github"].is_object() { c["github"] = json!({"remote": ""}); }
+    if !c["brief"].is_object() { c["brief"] = json!({"url": ""}); }
     c
 }
 
@@ -66,7 +65,7 @@ pub fn agent(dev: &Value, name: &str) -> Option<Value> {
 
 // ---- per-topic notes ----
 
-fn note_path(tid: &str) -> String { path(&format!("sessions/{}.json", tid.trim_start_matches("tgbot:"))) }
+fn note_path(tid: &str) -> String { path(&format!("sessions/{}.json", crate::brief::topic_id(tid))) }
 pub fn note(tid: &str) -> Value { let _g = LOCK.lock().unwrap(); load(&note_path(tid)) }
 pub fn note_set(tid: &str, k: &str, v: Value) {
     let _g = LOCK.lock().unwrap();

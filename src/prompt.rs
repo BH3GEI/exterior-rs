@@ -1,39 +1,63 @@
 //! What exterior tells an agent when it starts it. Passed on the command line (claude and pi:
-//! --append-system-prompt; codex: -c developer_instructions), so nothing is written into the folders.
-//! Everything about Yao lives in knowledge; the agent looks things up there when it needs them.
+//! --append-system-prompt; codex: developerInstructions), so nothing is written into the topic folders.
+//! The text is not in this program: it is a file in knowledge on the device (see the session_prompt and
+//! global_prompt settings), read at every start. exterior only fills in the placeholders.
+use crate::agents::Kind;
+use crate::{host, params, text};
 use serde_json::Value;
 
 /// Where knowledge lives on a device.
 pub fn infra(dev: &Value) -> String {
-    dev["infra"].as_str().filter(|s| !s.is_empty()).map(String::from).unwrap_or_else(|| format!("{}/knowledge", root(dev))).trim_end_matches('/').to_string()
+    dev["infra"].as_str().filter(|s| !s.is_empty()).map(String::from)
+        .unwrap_or_else(|| format!("{}/{}", root(dev), params::get("knowledge_dir"))).trim_end_matches('/').to_string()
 }
 
 pub fn root(dev: &Value) -> String { dev["root"].as_str().unwrap_or("").trim_end_matches('/').to_string() }
 
-pub fn session_text(dev: &Value, name: &str, tid: &str, dir: &str, global: bool) -> String {
-    let (root, infra) = (root(dev), infra(dev));
-    let brief = crate::store::config()["brief"]["url"].as_str().unwrap_or("").trim_end_matches('/').to_string();
-    let mut t = format!(r#"# exterior
+/// The folder of the global topic on a device.
+pub fn global_dir(dev: &Value) -> String { format!("{}/{}", root(dev), params::get("global_dir")) }
 
-你在 exterior 里，对应 Telegram 话题「{name}」（{tid}）。Yao 在话题里对你说话，你的回答直接发到话题里；他多半在手机上看，回答要短、直接。启动目录 {dir} 放这件事的文件。
+/// The full path of a text file in knowledge named by a setting ("session_prompt", "global_prompt", "test_prompt").
+pub fn file(dev: &Value, which: &str) -> String { format!("{}/{}", infra(dev), params::get(which).trim_start_matches('/')) }
 
-- 第一条消息如果只是一条恢复会话的命令（如 `cc3 --resume <编号>`、`pi --session <编号>`、`cx3 resume <编号>`），表示 Yao 把这个话题从那个会话换到了你这里：找到那个会话的记录读一下，接着做，不用问他。
-- 开头是「某某 → 」的消息来自另一个会话，不是 Yao。
-- 别的会话、微信和 Telegram 消息：用 brief API {brief}，请求头 `Authorization: Bearer $(cat {root}/.brief-key)`，先看 `GET /api/help?for=all`。给别的会话发话用 `POST /api/send`，文字以「{name} → 」开头。给 Yao 发图片或文件：`POST /api/send_file`，`{{"chat": "{tid}", "name": "图.png", "data": "<base64>", "text": "说明"}}`，图片会直接显示。Yao 发来的图片和文件，exterior 会放进你文件夹的 files/ 里，并在消息末尾写明路径。往外给别人发消息只会进草稿，要 Yao 确认。
-- 关于 Yao 的一切（规矩、机器、项目、工具用法）在 {infra}，用到时先看那一层的 README.md 再翻具体文件，不用提前读。
-- 学到以后还用得上的事（Yao 纠正你的、机器和项目的新事实），直接改 {infra} 里对应的那个文件；新机器、新项目才新建文件，并更新那层的 README.md。不要另起记忆文件，不要自己跑 git，exterior 会提交。
-"#);
-    if global {
-        t.push_str("\n你是「全局」：Yao 在这里闲聊、问各话题的进度。聊出值得单独做的事，建议他开新话题，并把来龙去脉发过去，自己不在这里埋头干大活。\n");
+/// Read a template from the device, without its <!-- --> comments.
+pub fn read(dev: &Value, which: &str) -> Result<String, String> {
+    let path = file(dev, which);
+    let raw = host::run(dev, &format!("cat {}", host::quote(&path)), 30).map_err(|e| text::prompt_unreadable(&path, &e))?;
+    let mut out = String::new();
+    let mut rest = raw.as_str();
+    while let Some(i) = rest.find("<!--") {
+        out.push_str(&rest[..i]);
+        rest = rest[i..].find("-->").map(|j| &rest[i + j + 3..]).unwrap_or("");
     }
-    t
+    out.push_str(rest);
+    Ok(out.trim().to_string())
+}
+
+/// Example resume lines, one per kind of agent the device has, written the way each agent writes them.
+fn resume_examples(dev: &Value) -> String {
+    Kind::ALL.iter().filter_map(|k| {
+        let row = dev["agents"].as_array().into_iter().flatten().find(|a| a["kind"] == k.name())?;
+        Some(format!("`{}`", crate::agents::resume_line(*k, row["name"].as_str()?, crate::text::ID_PLACEHOLDER)))
+    }).collect::<Vec<_>>().join("、")
+}
+
+pub fn session_text(dev: &Value, name: &str, tid: &str, dir: &str, global: bool) -> Result<String, String> {
+    let brief = crate::store::config()["brief"]["url"].as_str().unwrap_or("").trim_end_matches('/').to_string();
+    let mut t = read(dev, "session_prompt")?;
+    if global { t = format!("{t}\n\n{}", read(dev, "global_prompt")?); }
+    let vars = [("{name}", name.to_string()), ("{tid}", tid.to_string()), ("{dir}", dir.to_string()), ("{brief}", brief),
+                ("{root}", root(dev)), ("{infra}", infra(dev)), ("{user}", params::get("user_name")), ("{mark}", params::get("relay_mark")),
+                ("{global_topic}", params::get("global_topic")), ("{resume_examples}", resume_examples(dev))];
+    for (k, v) in vars { t = t.replace(k, &v); }
+    Ok(t + "\n")
 }
 
 /// Put the brief key on a device.
 pub fn install(dev: &Value) -> Result<(), String> {
     let root = root(dev);
-    if root.is_empty() { return Err("没有设置根目录".into()); }
+    if root.is_empty() { return Err(text::NO_ROOT.into()); }
     let k = crate::brief::key();
-    if !k.is_empty() { crate::host::write(dev, &format!("{root}/.brief-key"), &k, "600")?; }
+    if !k.is_empty() { host::write(dev, &format!("{root}/.brief-key"), &k, "600")?; }
     Ok(())
 }

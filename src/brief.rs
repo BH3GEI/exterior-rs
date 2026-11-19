@@ -13,10 +13,22 @@ pub fn configured() -> bool { let (u, k) = conf(); !u.is_empty() && !k.is_empty(
 
 pub fn key() -> String { conf().1 }
 
+/// brief's Telegram topics are chats named "tgbot:<topic id>".
+pub const TOPIC_PREFIX: &str = "tgbot:";
+/// brief prefixes the name of a topic marked done with this.
+pub const DONE_MARK: &str = "✓ ";
+
+pub fn topic_id(chat: &str) -> &str { chat.trim_start_matches(TOPIC_PREFIX) }
+
+/// brief marks messages the user sent himself with this sender name (its API convention, used by all its adapters).
+const SELF_SENDER: &str = "我";
+
+pub fn from_user(m: &Value) -> bool { m["sender"] == SELF_SENDER }
+
 /// One API call. Ok(json) on 2xx, Err((status, json)) otherwise (status 0 = no answer at all).
 pub fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, (u16, Value)> {
     let (base, key) = conf();
-    if base.is_empty() || key.is_empty() { return Err((0, Value::String("未设置".into()))); }
+    if base.is_empty() || key.is_empty() { return Err((0, Value::String(crate::text::BRIEF_NOT_SET.into()))); }
     let mut c = Command::new("curl");
     c.args(["-s", "-m", "70", "-w", "\n%{http_code}", "-X", method, "-H", "@-"]).arg(format!("{base}{path}"));
     if let Some(b) = body { c.args(["-H", "Content-Type: application/json", "--data-binary"]).arg(b.to_string()); }
@@ -40,16 +52,19 @@ pub fn download(path: &str) -> Result<Vec<u8>, String> {
     let mut ch = c.spawn().map_err(|e| e.to_string())?;
     { use std::io::Write; let mut i = ch.stdin.take().unwrap(); let _ = writeln!(i, "Authorization: Bearer {key}"); }
     let o = ch.wait_with_output().map_err(|e| e.to_string())?;
-    if o.status.success() && !o.stdout.is_empty() { Ok(o.stdout) } else { Err(format!("下载失败（curl {:?}）", o.status.code())) }
+    if o.status.success() && !o.stdout.is_empty() { Ok(o.stdout) } else { Err(crate::text::download_failed(o.status.code())) }
 }
 
 pub fn get(path: &str) -> Option<Value> { call("GET", path, None).ok() }
 pub fn post(path: &str, body: Value) -> Result<Value, (u16, Value)> { call("POST", path, Some(&body)) }
 
-/// Telegram allows 4096 characters per message.
+/// Telegram allows 4096 characters per message; keep the end, which is where an answer concludes.
+const MESSAGE_MAX: usize = 4000;
+const KEEP: usize = 3900;
+
 pub fn clip(s: &str) -> String {
     let n = s.chars().count();
-    if n <= 4000 { return s.to_string(); }
-    let tail: String = s.chars().skip(n - 3900).collect();
-    format!("…（前面 {} 字略）\n{}", n - 3900, tail)
+    if n <= MESSAGE_MAX { return s.to_string(); }
+    let tail: String = s.chars().skip(n - KEEP).collect();
+    format!("{}\n{}", crate::text::clipped(n - KEEP), tail)
 }

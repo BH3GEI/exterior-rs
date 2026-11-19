@@ -46,11 +46,11 @@ pub fn agent(dev: &Value, dir: &str, env: &[(&str, String)], command: &str, args
 pub fn run(dev: &Value, script: &str, secs: u64) -> Result<String, String> {
     let mut c = line(dev, script);
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let child = c.spawn().map_err(|e| format!("无法执行：{e}"))?;
+    let child = c.spawn().map_err(|e| crate::text::exec_failed(&e.to_string()))?;
     let out = wait(child, secs)?;
     let so = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if out.status.success() { Ok(so) } else { Err(if se.is_empty() { format!("退出码 {:?}；{so}", out.status.code()) } else { se }) }
+    if out.status.success() { Ok(so) } else { Err(if se.is_empty() { crate::text::exit_code(out.status.code(), &so) } else { se }) }
 }
 
 pub fn wait(mut child: std::process::Child, secs: u64) -> Result<Output, String> {
@@ -58,7 +58,7 @@ pub fn wait(mut child: std::process::Child, secs: u64) -> Result<Output, String>
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return child.wait_with_output().map_err(|e| e.to_string()),
-            Ok(None) if start.elapsed().as_secs() >= secs => { let _ = child.kill(); return Err(format!("超时（{secs} 秒）")); }
+            Ok(None) if start.elapsed().as_secs() >= secs => { let _ = child.kill(); return Err(crate::text::timed_out(secs)); }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
             Err(e) => return Err(e.to_string()),
         }
@@ -77,7 +77,7 @@ pub fn write_bytes(dev: &Value, path: &str, data: &[u8]) -> Result<(), String> {
     let dir = path.rsplit_once('/').map(|x| x.0).unwrap_or("/");
     let mut c = line(dev, &format!("mkdir -p {d} && cat > {p}", d = quote(dir), p = quote(path)));
     c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = c.spawn().map_err(|e| format!("无法执行：{e}"))?;
+    let mut child = c.spawn().map_err(|e| crate::text::exec_failed(&e.to_string()))?;
     {
         use std::io::Write;
         let mut i = child.stdin.take().unwrap();
