@@ -69,6 +69,38 @@ pub fn base64(data: &[u8]) -> String {
 pub fn get(path: &str) -> Option<Value> { call("GET", path, None).ok() }
 pub fn post(path: &str, body: Value) -> Result<Value, (u16, Value)> { call("POST", path, Some(&body)) }
 
+/// Until when Telegram told us to hold off (429 with retry_after). One group shares one limit, so this is global.
+static HOLD: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Telegram is rate-limiting us right now.
+pub fn held() -> bool { HOLD.lock().unwrap().map(|u| u > std::time::Instant::now()).unwrap_or(false) }
+
+/// Post something that ends up in Telegram (send, edit). On 429 every later post waits out retry_after.
+/// `wait`: wait and retry (for anything that must arrive); otherwise give up at once (live updates,
+/// the next one carries the same text anyway). Waiting stops after ratelimit_max_s in total.
+pub fn tg_post(path: &str, body: Value, wait: bool) -> Result<Value, (u16, Value)> {
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let cap = crate::params::secs("ratelimit_max_s");
+    loop {
+        let until = *HOLD.lock().unwrap();
+        if let Some(u) = until { let now = Instant::now(); if u > now {
+            if !wait || start.elapsed() + (u - now) > cap { return Err((429, serde_json::json!({"error": "rate_limited", "held": true}))); }
+            std::thread::sleep(u - now);
+        } }
+        match post(path, body.clone()) {
+            Err((429, v)) => {
+                let ra = v["retry_after"].as_u64().unwrap_or(5).max(1) + 1;
+                let u = Instant::now() + Duration::from_secs(ra);
+                { let mut h = HOLD.lock().unwrap(); if h.map(|x| x < u).unwrap_or(true) { *h = Some(u); } }
+                crate::store::log(&format!("{path}: Telegram rate limit, holding {ra}s{}", if wait { ", will retry" } else { "" }));
+                if !wait || start.elapsed() + Duration::from_secs(ra) > cap { return Err((429, v)); }
+            }
+            r => return r,
+        }
+    }
+}
+
 /// Telegram allows 4096 characters per message; keep the end, which is where an answer concludes.
 const MESSAGE_MAX: usize = 4000;
 const KEEP: usize = 3900;
@@ -78,4 +110,38 @@ pub fn clip(s: &str) -> String {
     if n <= MESSAGE_MAX { return s.to_string(); }
     let tail: String = s.chars().skip(n - KEEP).collect();
     format!("{}\n{}", crate::text::clipped(n - KEEP), tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A fake brief: the first `n` posts get 429 retry_after=1, the rest 200.
+    fn fake(n: usize) -> u16 {
+        let srv = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = srv.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || for (i, r) in srv.incoming_requests().enumerate() {
+            let (code, body) = if i < n { (429, r#"{"error":"rate_limited","retry_after":1}"#) } else { (200, r#"{"id":7}"#) };
+            let _ = r.respond(tiny_http::Response::from_string(body).with_status_code(code));
+        });
+        port
+    }
+
+    #[test]
+    fn rate_limit() {
+        let dir = std::env::temp_dir().join(format!("exterior-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("EXTERIOR_VAR", &dir);
+        let port = fake(2);
+        crate::store::set_config(&serde_json::json!({"brief": {"url": format!("http://127.0.0.1:{port}"), "key": crate::crypt::seal("k")}}));
+        // a live update gives up at once and puts everyone on hold
+        assert_eq!(tg_post("/api/edit", serde_json::json!({}), false).unwrap_err().0, 429);
+        assert!(held());
+        // a final answer waits out the hold (2 s each: retry_after + 1) and gets through
+        let t = Instant::now();
+        assert_eq!(tg_post("/api/send", serde_json::json!({}), true).unwrap()["id"], 7);
+        assert!(t.elapsed() >= Duration::from_secs(3), "waited {:?}", t.elapsed());
+        assert!(!held());
+    }
 }

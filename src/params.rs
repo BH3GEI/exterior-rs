@@ -19,6 +19,8 @@ pub const PARAMS: &[Param] = &[
     Param { key: "ack_emoji", label: "收到消息时添加的回应表情", default: "👀" },
     Param { key: "idle_hours", label: "会话空闲多少小时后关闭进程", default: "2" },
     Param { key: "flush_ms", label: "回复刷新间隔（毫秒）", default: "1500" },
+    Param { key: "stream_gap_ms", label: "所有话题合计，两次流式刷新之间的最短间隔（毫秒），避免 Telegram 限流", default: "2500" },
+    Param { key: "ratelimit_max_s", label: "Telegram 限流时，一条消息最多等待多少秒", default: "300" },
     Param { key: "ask_timeout_s", label: "等待 agent 响应请求的时间（秒）", default: "30" },
     Param { key: "codex_ready_s", label: "等待 codex 就绪的时间（秒）", default: "40" },
     Param { key: "notice_every", label: "重试提示的发送间隔（每多少次重试发一条）", default: "3" },
