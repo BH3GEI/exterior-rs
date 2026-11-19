@@ -14,15 +14,23 @@ exterior 是运行在懒猫微服上的一个应用（单个 Rust 程序），�
 
 ## 话题中的命令
 
+原则：agent 自己有的命令，在话题中以相同的名称提供，前面加上表示 agent 的前缀（claude 为 `cc_`，pi 为 `pi_`，codex 为 `cx_`），含义与 agent 自身的命令相同。exterior 自己只有三个命令：
+
 | 命令 | 作用 |
 |---|---|
-| `/stop` | 停止当前回合 |
-| `/exit` | 结束当前会话，下一条消息开启新会话 |
-| `/agent` | 切换 agent（显示按钮）；切换时新 agent 会读取原会话的记录并继续 |
-| `/model` | 切换模型（显示 agent 提供的模型列表） |
-| `/pi_thinking`、`/pi_compact`、`/pi_new` | pi 的思考强度、压缩上下文、开启新会话 |
-| `/cx_compact`、`/cx_new` | codex 的压缩上下文、开启新会话 |
-| `/cc_*`、`/pi_*` | 各 agent 自带的命令，启动时自动读取并加入「/」菜单 |
+| `/stop` | 停止当前回合（相当于在 agent 中按 Esc） |
+| `/exit` | 结束 agent 进程，并删除该话题记录的会话编号，下一条消息开启全新的会话 |
+| `/agent` | 切换到另一个 agent；新 agent 会读取原会话的记录并继续 |
+
+agent 的命令分两类：
+
+1. agent 在无界面模式下自己能处理的命令（claude 的 `/compact`、`/context`、`/usage`，pi 的扩展和技能命令等）：exterior 启动时向 agent 读取列表，原样转交。
+2. agent 只在交互界面中提供、但协议中有对应请求的命令：exterior 转换为协议请求。目前包括：
+   - claude：`/cc_model`、`/cc_status`、`/cc_cost`、`/cc_export`、`/cc_hooks`、`/cc_permissions`、`/cc_memory`、`/cc_exit`
+   - pi：`/pi_model`、`/pi_thinking`、`/pi_compact`、`/pi_new`、`/pi_name`、`/pi_session`、`/pi_fork`、`/pi_clone`、`/pi_tree`、`/pi_export`、`/pi_copy`、`/pi_resume`、`/pi_import`、`/pi_quit`
+   - codex：`/cx_model`、`/cx_compact`、`/cx_new`、`/cx_clear`、`/cx_status`、`/cx_usage`、`/cx_review`、`/cx_diff`、`/cx_rename`、`/cx_resume`、`/cx_fork`、`/cx_archive`、`/cx_goal`、`/cx_mcp`、`/cx_apps`、`/cx_plugins`、`/cx_skills`、`/cx_hooks`、`/cx_copy`、`/cx_logout`、`/cx_quit`、`/cx_exit`
+
+Telegram 的「/」菜单最多显示 100 条命令，超出的命令不显示在菜单中，但直接输入仍然有效。
 
 agent 的报错、重试、用量限制、模型切换等情况都会在话题中显示。
 

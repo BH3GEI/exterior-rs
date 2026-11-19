@@ -26,10 +26,20 @@ impl Kind {
 /// the agent's own name (pi's /thinking is pi_thinking, codex's /model is cx_model); exterior only turns it into the
 /// protocol call. The menu, the dispatch and the "which agent is this for" check are all built from this table.
 pub const BUILTINS: &[(Kind, &str)] = &[
-    (Kind::Claude, "model"),
-    (Kind::Pi, "model"), (Kind::Pi, "thinking"), (Kind::Pi, "compact"), (Kind::Pi, "new"), (Kind::Pi, "name"), (Kind::Pi, "session"), (Kind::Pi, "fork"), (Kind::Pi, "export"),
-    (Kind::Codex, "model"), (Kind::Codex, "compact"), (Kind::Codex, "new"), (Kind::Codex, "status"), (Kind::Codex, "review"),
+    (Kind::Claude, "model"), (Kind::Claude, "status"), (Kind::Claude, "cost"), (Kind::Claude, "export"), (Kind::Claude, "hooks"),
+    (Kind::Claude, "permissions"), (Kind::Claude, "memory"), (Kind::Claude, "exit"),
+    (Kind::Pi, "model"), (Kind::Pi, "thinking"), (Kind::Pi, "compact"), (Kind::Pi, "new"), (Kind::Pi, "name"), (Kind::Pi, "session"),
+    (Kind::Pi, "fork"), (Kind::Pi, "clone"), (Kind::Pi, "tree"), (Kind::Pi, "export"), (Kind::Pi, "copy"), (Kind::Pi, "resume"),
+    (Kind::Pi, "import"), (Kind::Pi, "quit"),
+    (Kind::Codex, "model"), (Kind::Codex, "compact"), (Kind::Codex, "new"), (Kind::Codex, "clear"), (Kind::Codex, "status"),
+    (Kind::Codex, "usage"), (Kind::Codex, "review"), (Kind::Codex, "diff"), (Kind::Codex, "rename"), (Kind::Codex, "resume"),
+    (Kind::Codex, "fork"), (Kind::Codex, "archive"), (Kind::Codex, "goal"), (Kind::Codex, "mcp"), (Kind::Codex, "apps"),
+    (Kind::Codex, "plugins"), (Kind::Codex, "skills"), (Kind::Codex, "hooks"), (Kind::Codex, "copy"), (Kind::Codex, "logout"),
+    (Kind::Codex, "quit"), (Kind::Codex, "exit"),
 ];
+
+/// Built-ins that end the agent's process (the session is kept, so the next message resumes it).
+pub fn is_quit(name: &str) -> bool { matches!(name, "exit" | "quit") }
 
 /// The menu name of a built-in command, e.g. pi_thinking.
 pub fn builtin_command(kind: Kind, name: &str) -> String { format!("{}_{name}", kind.prefix()) }
@@ -580,10 +590,62 @@ impl Ctl {
     pub fn builtin(&self, name: &str, arg: &str) -> Result<Value, String> {
         self.ready()?;
         let codex_thread = || self.thread.lock().unwrap().clone().ok_or_else(|| text::CODEX_NOT_READY.to_string());
+        let start_params = || json!({"cwd": self.dir, "developerInstructions": self.prompt, "approvalPolicy": params::get("codex_approval"), "sandbox": params::get("codex_sandbox")});
+        let claude = |sub: &str| self.ask(|id| json!({"type": "control_request", "request_id": id, "request": {"subtype": sub}}));
+        let codex = |method: &str, p: Value| self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": p}));
         let r = match (self.kind, name) {
+            (Kind::Claude, "status") => claude("get_status")?,
+            (Kind::Claude, "cost") => claude("get_session_cost")?,
+            (Kind::Claude, "export") => claude("export_conversation")?,
+            (Kind::Claude, "hooks") => claude("get_hooks_listing")?,
+            (Kind::Claude, "permissions") => claude("list_permission_rules")?,
+            (Kind::Claude, "memory") => claude("get_memory_dialog")?,
+            (Kind::Pi, "clone") => self.ask(|id| json!({"type": "clone", "id": id}))?,
+            (Kind::Pi, "tree") => self.ask(|id| json!({"type": "get_tree", "id": id}))?,
+            (Kind::Pi, "copy") => self.ask(|id| json!({"type": "get_last_assistant_text", "id": id}))?,
+            (Kind::Pi, "resume") if arg.is_empty() => {
+                // pi has no "list sessions" request: list the session files next to the current one, through pi's own shell
+                let st = self.ask(|id| json!({"type": "get_state", "id": id}))?;
+                let dir = st["data"]["sessionFile"].as_str().and_then(|f| f.rsplit_once('/')).map(|x| x.0.to_string()).ok_or(text::NO_SESSIONS)?;
+                self.ask(|id| json!({"type": "bash", "id": id, "command": format!("ls -t {} | head -n 10", crate::host::quote(&dir))}))?
+                    .pipe(|mut r| { r["data"]["_dir"] = json!(dir); r })
+            }
+            (Kind::Pi, "resume") | (Kind::Pi, "import") => self.ask(|id| json!({"type": "switch_session", "id": id, "sessionPath": arg}))?,
+            (Kind::Codex, "clear") => codex("thread/start", start_params())?,
+            (Kind::Codex, "usage") => codex("account/usage/read", json!({}))?,
+            (Kind::Codex, "diff") => codex("command/exec", json!({"command": ["sh", "-c", "git status --short && git diff"], "cwd": self.dir}))?,
+            (Kind::Codex, "rename") => codex("thread/name/set", json!({"threadId": codex_thread()?, "name": arg}))?,
+            (Kind::Codex, "resume") if arg.is_empty() => codex("thread/list", json!({"cwd": self.dir, "limit": 10}))?,
+            (Kind::Codex, "resume") => {
+                let mut p = start_params();
+                p["threadId"] = json!(arg);
+                let r = codex("thread/resume", p)?;
+                if let Some(t) = r["result"]["thread"]["id"].as_str() { *self.thread.lock().unwrap() = Some(t.to_string()); }
+                r
+            }
+            (Kind::Codex, "fork") => {
+                let r = codex("thread/fork", json!({"threadId": codex_thread()?}))?;
+                if let Some(t) = r["result"]["thread"]["id"].as_str() { *self.thread.lock().unwrap() = Some(t.to_string()); }
+                r
+            }
+            (Kind::Codex, "archive") => {
+                codex("thread/archive", json!({"threadId": codex_thread()?}))?;
+                // the archived thread is no longer used: continue in a new one
+                codex("thread/start", start_params())?
+            }
+            (Kind::Codex, "goal") if arg.is_empty() => codex("thread/goal/get", json!({"threadId": codex_thread()?}))?,
+            (Kind::Codex, "goal") if arg == "clear" => codex("thread/goal/clear", json!({"threadId": codex_thread()?}))?,
+            (Kind::Codex, "goal") => codex("thread/goal/set", json!({"threadId": codex_thread()?, "objective": arg}))?,
+            (Kind::Codex, "mcp") => codex("mcpServerStatus/list", json!({"threadId": codex_thread()?}))?,
+            (Kind::Codex, "apps") => codex("app/list", json!({"threadId": codex_thread()?}))?,
+            (Kind::Codex, "plugins") => codex("plugin/list", json!({"cwds": [self.dir]}))?,
+            (Kind::Codex, "skills") => codex("skills/list", json!({"cwds": [self.dir]}))?,
+            (Kind::Codex, "hooks") => codex("hooks/list", json!({"cwds": [self.dir]}))?,
+            (Kind::Codex, "logout") => codex("account/logout", json!({}))?,
             (Kind::Pi, "name") => self.ask(|id| json!({"type": "set_session_name", "id": id, "name": arg}))?,
             (Kind::Pi, "session") => self.ask(|id| json!({"type": "get_session_stats", "id": id}))?,
-            (Kind::Pi, "export") => self.ask(|id| json!({"type": "export_html", "id": id}))?,
+            (Kind::Pi, "export") if arg.is_empty() => self.ask(|id| json!({"type": "export_html", "id": id}))?,
+            (Kind::Pi, "export") => self.ask(|id| json!({"type": "export_html", "id": id, "outputPath": arg}))?,
             (Kind::Pi, "fork") if arg.is_empty() => self.ask(|id| json!({"type": "get_fork_messages", "id": id}))?,
             (Kind::Pi, "fork") => self.ask(|id| json!({"type": "fork", "id": id, "entryId": arg}))?,
             (Kind::Codex, "status") => {
@@ -603,19 +665,19 @@ impl Ctl {
                 let th = codex_thread()?;
                 self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "thread/compact/start", "params": {"threadId": th}}))?
             }
-            (Kind::Codex, "new") => {
-                let p = json!({"cwd": self.dir, "developerInstructions": self.prompt, "approvalPolicy": params::get("codex_approval"), "sandbox": params::get("codex_sandbox")});
-                self.ask(|id| json!({"jsonrpc": "2.0", "id": id, "method": "thread/start", "params": p}))?
-            }
+            (Kind::Codex, "new") => codex("thread/start", start_params())?,
             _ => return Err(text::NOT_SUPPORTED.into()),
         };
-        if r["success"] == false || !r["error"].is_null() {
+        if r["success"] == false || !r["error"].is_null() || r["subtype"] == "error" {
             return Err(r["error"]["message"].as_str().or(r["error"].as_str()).unwrap_or(text::BUILTIN_FAILED).to_string());
         }
-        let mut data = if self.kind == Kind::Codex { r["result"].clone() } else { r["data"].clone() };
+        let mut data = match self.kind { Kind::Codex => r["result"].clone(), Kind::Claude => r["response"].clone(), Kind::Pi => r["data"].clone() };
+        if self.kind == Kind::Codex && matches!(name, "new" | "clear" | "resume" | "fork" | "archive") {
+            if let Some(t) = data["thread"]["id"].as_str() { *self.thread.lock().unwrap() = Some(t.to_string()); data["_session"] = json!(t); }
+        }
         // pi writes the export next to its working directory: report the full path
         if let Some(p) = data["path"].as_str().filter(|p| !p.starts_with('/')) { data["path"] = json!(format!("{}/{p}", self.dir.trim_end_matches('/'))); }
-        if self.kind == Kind::Pi && matches!(name, "new" | "fork") && !(name == "fork" && arg.is_empty()) {
+        if self.kind == Kind::Pi && matches!(name, "new" | "fork" | "clone" | "resume" | "import") && !(matches!(name, "fork" | "resume") && arg.is_empty()) {
             // pi now writes to another session: remember it, so a restart resumes that one
             if let Ok(s) = self.ask(|id| json!({"type": "get_state", "id": id})) {
                 if !data.is_object() { data = json!({}); }
@@ -625,6 +687,10 @@ impl Ctl {
         Ok(data)
     }
 }
+
+/// `x.pipe(f)` = `f(x)`, to adjust a value inside an expression.
+trait Pipe: Sized { fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T { f(self) } }
+impl<S> Pipe for S {}
 
 /// /cx_review's argument: nothing for the uncommitted changes, a commit hash, or a base branch.
 pub fn review_target(arg: &str) -> Value {

@@ -45,7 +45,12 @@ fn probe(a: &[String]) {
     }
     // the agent's own commands that go through the protocol (read-only ones, plus naming the session)
     for (k, name) in agents::BUILTINS.iter().filter(|(k, _)| *k == kind) {
-        let arg = match *name { "name" => "probe", "thinking" | "model" | "new" | "compact" | "review" => continue, _ => "" };
+        let arg = match *name {
+            "name" | "rename" => "probe",
+            "thinking" | "model" | "new" | "clear" | "compact" | "review" | "archive" | "logout" | "import" | "exit" | "quit" => continue,
+            "copy" if kind == agents::Kind::Codex => continue,
+            _ => "",
+        };
         let r = c.builtin(name, arg);
         println!("/{} {arg}: {:?}", agents::builtin_command(*k, name), r.as_ref().map(|v| v.to_string().chars().take(3000).collect::<String>()));
         if *name == "fork" {

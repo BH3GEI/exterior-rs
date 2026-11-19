@@ -30,8 +30,25 @@ const COMMAND_DESC_MAX: usize = 60;
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 type Own = Arc<Mutex<HashSet<u64>>>;
 
-/// The last model list shown in each topic, for buttons whose model name is too long to fit (they say "/model 3").
+/// The last list of choices shown for each topic and command, for buttons whose value is too long to fit in a
+/// button (they say "/pi_resume 3" and the number is looked up here).
 static CHOICES: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
+
+/// Buttons "/<cmd> <value>", or "/<cmd> <n>" where the value is too long; remembers the values for the numbers.
+fn choice_buttons(chat: &str, cmd: &str, items: Vec<(String, String)>, per: usize) -> Value {
+    let rows: Vec<(String, String)> = items.iter().enumerate().map(|(i, (label, value))| {
+        let full = format!("/{cmd} {value}");
+        (label.clone(), if full.len() <= BUTTON_DATA_MAX { full } else { format!("/{cmd} {}", i + 1) })
+    }).collect();
+    CHOICES.lock().unwrap().get_or_insert_with(HashMap::new).insert(format!("{chat}:{cmd}"), items.into_iter().map(|(_, v)| v).collect());
+    buttons(in_rows(rows, per))
+}
+
+/// The value behind "/<cmd> <n>" from the last list shown.
+fn chosen(chat: &str, cmd: &str, arg: &str) -> Option<String> {
+    let i = arg.parse::<usize>().ok()?;
+    CHOICES.lock().unwrap().as_ref()?.get(&format!("{chat}:{cmd}"))?.get(i.wrapping_sub(1)).cloned()
+}
 
 /// What the 会话 page shows about the running side (the rest is in the notes).
 pub static LIVE: Mutex<Option<Sessions>> = Mutex::new(None);
@@ -192,14 +209,14 @@ pub fn build_menu() -> Result<usize, String> {
     for kind in Kind::ALL {
         let Some(row) = dev["agents"].as_array().into_iter().flatten().find(|a| a["kind"] == kind.name()) else { continue };
         for (orig, desc) in agents::commands(&dev, &root, row["command"].as_str().unwrap_or(""), kind) {
-            if cmds.len() >= MENU_MAX { break; }
             let mut tg: String = format!("{}_{}", kind.prefix(), orig.to_lowercase()).chars().map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' { c } else { '_' }).collect();
             tg.truncate(COMMAND_NAME_MAX);
             if !used.insert(tg.clone()) { continue; }
             let d = if desc.trim().is_empty() { format!("/{orig}") } else { desc.trim().replace('\n', " ") };
             let full = format!("{} · {d}", kind.label());
             let d: String = if full.chars().count() > COMMAND_DESC_MAX { format!("{}…", full.chars().take(COMMAND_DESC_MAX - 1).collect::<String>()) } else { full };
-            cmds.push(json!({"command": tg, "description": d}));
+            // Telegram shows at most MENU_MAX commands; the rest still work when typed
+            if cmds.len() < MENU_MAX { cmds.push(json!({"command": tg.clone(), "description": d})); }
             map.insert(tg, json!([kind.name(), orig]));
         }
     }
@@ -246,6 +263,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 if let Some((d, name)) = who {
                     if let Some(dev) = store::device(&d) { std::thread::spawn(move || crate::infra::commit(&dev, &name)); }
                 }
+                if !body.trim().is_empty() && error.is_none() { store::note_set(&tid, "last_answer", json!(body)); }
                 if current(&tid, gen) {
                     set_status(&tid, if error.is_some() { st::ERROR } else { st::IDLE });
                     store::note_set(&tid, "last_error", error.map(Value::String).unwrap_or(Value::Null));
@@ -461,7 +479,14 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             reply = Some(text::session_ended(&cur));
         } else if let Some((k, name)) = builtin {
             if Some(k) != cur_kind { reply = Some(text::wrong_agent(k.label(), &cur)); }
-            else {
+            else if agents::is_quit(name) {
+                if let Some(a) = s.agent.as_mut() { a.stop(); a.kill(); }
+                s.agent = None; s.gen += 1; s.pending = false;
+                set_status(chat, st::STOPPED);
+                reply = Some(text::QUIT.into());
+            } else if name == "copy" && k == Kind::Codex {
+                reply = Some(n["last_answer"].as_str().filter(|a| !a.trim().is_empty()).unwrap_or(text::NOTHING_TO_COPY).to_string());
+            } else {
                 if s.agent.is_none() {
                     if let Err(e) = start_agent(s, tx) { reply = Some(text::start_failed(&cur, &e)); }
                 }
@@ -535,17 +560,23 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                 if let Some(s) = sessions.lock().unwrap().get_mut(&chat) { s.pending = true; }
                 set_status(&chat, st::RUNNING);
             }
-            send_with(&own, &sessions, &chat, &a.text, a.buttons);
+            match a.file {
+                Some((name, data)) => {
+                    let r = brief::post("/api/send_file", json!({"chat": chat, "name": name, "data": brief::base64(&data), "text": a.text}));
+                    if let Err((c, v)) = r { send_with(&own, &sessions, &chat, &text::failed(&format!("{c} {v}")), None); }
+                }
+                None => { send_with(&own, &sessions, &chat, &a.text, a.buttons); }
+            }
         });
     }
 }
 
 /// What a built-in command answers in the topic, and what it changed.
-struct Answer { text: String, buttons: Option<Value>, session: Option<String>, started: bool }
+struct Answer { text: String, buttons: Option<Value>, session: Option<String>, started: bool, file: Option<(String, Vec<u8>)> }
 
 impl Answer {
-    fn say(t: impl Into<String>) -> Answer { Answer { text: t.into(), buttons: None, session: None, started: false } }
-    fn choose(t: impl Into<String>, b: Value) -> Answer { Answer { text: t.into(), buttons: Some(b), session: None, started: false } }
+    fn say(t: impl Into<String>) -> Answer { Answer { text: t.into(), buttons: None, session: None, started: false, file: None } }
+    fn choose(t: impl Into<String>, b: Value) -> Answer { Answer { text: t.into(), buttons: Some(b), session: None, started: false, file: None } }
 }
 
 /// The agents' own commands that go through the protocol (agents::BUILTINS), answered without holding the sessions lock.
@@ -555,24 +586,14 @@ fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> An
         "model" if arg.is_empty() => match c.models() {
             Err(e) => Answer::say(text::models_failed(&e)),
             Ok(list) if list.is_empty() => Answer::say(text::NO_MODELS),
-            Ok(list) => {
-                let items: Vec<(String, String)> = list.iter().enumerate().map(|(i, m)| {
-                    let full = format!("/{cmd} {}", m.value);
-                    (m.label.clone(), if full.len() <= BUTTON_DATA_MAX { full } else { format!("/{cmd} {}", i + 1) })
-                }).collect();
-                CHOICES.lock().unwrap().get_or_insert_with(HashMap::new).insert(chat.to_string(), list.into_iter().map(|m| m.value).collect());
-                Answer::choose(text::CHOOSE_MODEL, buttons(in_rows(items, 2)))
-            }
+            Ok(list) => Answer::choose(text::CHOOSE_MODEL, choice_buttons(chat, &cmd, list.into_iter().map(|m| (m.label, m.value)).collect(), 2)),
         },
         "model" => {
             let value = match arg.parse::<usize>() {
-                Ok(i) => {
-                    let cached = CHOICES.lock().unwrap().as_ref().and_then(|m| m.get(chat)).and_then(|l| l.get(i.wrapping_sub(1)).cloned());
-                    match cached.or_else(|| c.models().ok().and_then(|l| l.get(i.wrapping_sub(1)).map(|m| m.value.clone()))) {
-                        Some(v) => v,
-                        None => return Answer::say(text::no_model_at(i, &cmd)),
-                    }
-                }
+                Ok(i) => match chosen(chat, &cmd, arg).or_else(|| c.models().ok().and_then(|l| l.get(i.wrapping_sub(1)).map(|m| m.value.clone()))) {
+                    Some(v) => v,
+                    None => return Answer::say(text::no_model_at(i, &cmd)),
+                },
                 Err(_) => arg.to_string(),
             };
             match c.set_model(&value) { Ok(()) => Answer::say(text::model_set(&value)), Err(e) => Answer::say(text::model_failed(&e)) }
@@ -581,27 +602,60 @@ fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> An
             Ok(levels) => Answer::choose(text::CHOOSE_THINKING, buttons(in_rows(levels.into_iter().map(|l| (l.clone(), format!("/{cmd} {l}"))).collect(), 3))),
             Err(e) => Answer::say(text::thinking_failed(&e)),
         },
-        "name" if arg.is_empty() => Answer::say(text::name_needed(&cmd)),
-        _ => match c.builtin(name, arg) {
+        "name" | "rename" if arg.is_empty() => Answer::say(text::name_needed(&cmd)),
+        _ => match c.builtin(name, &chosen(chat, &cmd, arg).unwrap_or_else(|| arg.to_string())) {
             Err(e) => Answer::say(text::failed(&e)),
             Ok(d) => {
                 let mut a = match name {
                     "thinking" => Answer::say(text::thinking_set(arg)),
                     "compact" => Answer::say(text::COMPACTED),
-                    "new" => Answer::say(text::NEW_SESSION),
+                    "new" | "clear" => Answer::say(text::NEW_SESSION),
                     "name" => Answer::say(text::name_set(arg)),
+                    "rename" => Answer::say(text::renamed(arg)),
+                    "clone" => Answer::say(text::cloned(d["_session"].as_str().unwrap_or("—"))),
+                    "archive" => Answer::say(text::archived(d["_session"].as_str().unwrap_or("—"))),
+                    "copy" => Answer::say(d["text"].as_str().filter(|t| !t.trim().is_empty()).unwrap_or(text::NOTHING_TO_COPY)),
+                    "logout" => Answer::say(text::LOGGED_OUT),
+                    "goal" if arg == "clear" => Answer::say(text::GOAL_CLEARED),
+                    "goal" if !arg.is_empty() => Answer::say(text::goal_set(arg)),
+                    "diff" => {
+                        let out = d["stdout"].as_str().unwrap_or("").trim().to_string();
+                        Answer::say(if out.is_empty() { text::NO_DIFF.to_string() } else { out })
+                    }
+                    "resume" if arg.is_empty() && kind == Kind::Pi => {
+                        let dir = d["_dir"].as_str().unwrap_or("");
+                        let items: Vec<(String, String)> = d["output"].as_str().unwrap_or("").lines().map(str::trim).filter(|f| f.ends_with(".jsonl"))
+                            .map(|f| (f.chars().take(40).collect(), format!("{dir}/{f}"))).collect();
+                        if items.is_empty() { Answer::say(text::NO_SESSIONS) } else { Answer::choose(text::CHOOSE_SESSION, choice_buttons(chat, &cmd, items, 1)) }
+                    }
+                    "resume" if arg.is_empty() => {
+                        let items: Vec<(String, String)> = d["data"].as_array().into_iter().flatten().filter_map(|t| {
+                            let id = t["id"].as_str()?;
+                            let label = t["name"].as_str().or(t["preview"].as_str()).unwrap_or(id).chars().take(40).collect();
+                            Some((label, id.to_string()))
+                        }).collect();
+                        if items.is_empty() { Answer::say(text::NO_SESSIONS) } else { Answer::choose(text::CHOOSE_SESSION, choice_buttons(chat, &cmd, items, 1)) }
+                    }
+                    "resume" | "import" => Answer::say(text::resumed(d["_session"].as_str().unwrap_or(arg))),
+                    "fork" if kind == Kind::Codex => Answer::say(text::resumed(d["_session"].as_str().unwrap_or("—"))),
+                    "export" if kind == Kind::Claude => {
+                        let name = d["default_filename"].as_str().or(d["filename"].as_str()).unwrap_or("conversation.txt").to_string();
+                        let body = ["content", "text", "conversation"].iter().find_map(|k| d[*k].as_str()).unwrap_or("").to_string();
+                        let mut a = Answer::say(text::exported_file(&name));
+                        a.file = Some((name, body.into_bytes()));
+                        a
+                    }
                     "session" => Answer::say(text::session_stats(&d)),
                     "export" => Answer::say(text::exported(d["path"].as_str().unwrap_or("—"))),
-                    "fork" if arg.is_empty() => {
+                    "fork" if arg.is_empty() && kind == Kind::Pi => {
                         let items: Vec<(String, String)> = d["messages"].as_array().into_iter().flatten().filter_map(|m| {
-                            let label: String = m["text"].as_str()?.chars().take(30).collect();
-                            Some((label, format!("/{cmd} {}", m["entryId"].as_str()?)))
-                        }).filter(|(_, data)| data.len() <= BUTTON_DATA_MAX).collect();
-                        if items.is_empty() { Answer::say(text::NO_FORK_POINTS) } else { Answer::choose(text::CHOOSE_FORK, buttons(in_rows(items, 1))) }
+                            Some((m["text"].as_str()?.chars().take(30).collect(), m["entryId"].as_str()?.to_string()))
+                        }).collect();
+                        if items.is_empty() { Answer::say(text::NO_FORK_POINTS) } else { Answer::choose(text::CHOOSE_FORK, choice_buttons(chat, &cmd, items, 1)) }
                     }
                     "fork" if d["cancelled"] == true => Answer::say(text::FORK_CANCELLED),
                     "fork" => Answer::say(text::forked(d["text"].as_str().unwrap_or(""))),
-                    "status" => Answer::say(text::codex_status(d["_model"].as_str().unwrap_or(text::DEFAULT_MODEL), &d["rateLimits"])),
+                    "status" if kind == Kind::Codex => Answer::say(text::codex_status(d["_model"].as_str().unwrap_or(text::DEFAULT_MODEL), &d["rateLimits"])),
                     "review" => {
                         let t = agents::review_target(arg);
                         let v = t["sha"].as_str().or(t["branch"].as_str()).unwrap_or("");
@@ -609,7 +663,8 @@ fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> An
                         a.started = true;
                         a
                     }
-                    _ => Answer::say(text::BUILTIN_FAILED),
+                    // the commands that only show information
+                    _ => Answer::say(text::show(&d)),
                 };
                 a.session = d["_session"].as_str().map(String::from);
                 a
@@ -651,5 +706,20 @@ mod text_tests {
         let s = crate::text::codex_status("gpt", &json!({"credits": {"hasCredits": false}, "primary": {"usedPercent": 100, "windowDurationMins": 10080}, "secondary": null, "rateLimitReachedType": "x"}));
         assert!(s.contains("7 天用量：100%") && s.contains("额度余额：无") && s.contains("已达上限：x"), "{s}");
         assert_eq!(crate::text::window(Some(300)), "5 小时");
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    #[test]
+    fn helpers() {
+        assert_eq!(crate::brief::base64(b"hello"), "aGVsbG8=");
+        assert_eq!(crate::brief::base64(b"ab"), "YWI=");
+        assert_eq!(crate::brief::base64(b"abc"), "YWJj");
+        let b = super::choice_buttons("tgbot:1", "pi_resume", vec![("a".into(), "x".repeat(80)), ("b".into(), "short".into())], 1);
+        assert_eq!(b[0][0]["data"], "/pi_resume 1");
+        assert_eq!(b[1][0]["data"], "/pi_resume short");
+        assert_eq!(super::chosen("tgbot:1", "pi_resume", "1").as_deref(), Some("x".repeat(80).as_str()));
+        assert!(crate::text::show(&serde_json::json!({"a": 1, "b": {"c": "d"}, "_x": 2})).contains("  c：d"));
     }
 }

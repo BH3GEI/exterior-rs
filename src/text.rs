@@ -93,7 +93,7 @@ pub fn session_stats(d: &serde_json::Value) -> String {
     let n = |v: &serde_json::Value| v.as_u64().map(|x| x.to_string()).unwrap_or_else(|| "—".into());
     let t = &d["tokens"];
     let ctx = &d["contextUsage"];
-    format!("会话 {}\n消息：你 {} 条，pi {} 条；工具调用 {} 次\n令牌：输入 {}，输出 {}，缓存读取 {}，缓存写入 {}，合计 {}\n费用：{}\n上下文：已用 {} / {}",
+    format!("会话 {}\n消息：你 {} 条，pi {} 条；工具调用 {} 次\ntoken：输入 {}，输出 {}，缓存读取 {}，缓存写入 {}，合计 {}\n费用：{}\n上下文：已用 {} / {}",
         d["sessionId"].as_str().unwrap_or("—"), n(&d["userMessages"]), n(&d["assistantMessages"]), n(&d["toolCalls"]),
         n(&t["input"]), n(&t["output"]), n(&t["cacheRead"]), n(&t["cacheWrite"]), n(&t["total"]),
         d["cost"].as_f64().map(|c| format!("${c:.2}")).unwrap_or_else(|| "—".into()), n(&ctx["tokens"]), n(&ctx["contextWindow"]))
@@ -121,6 +121,44 @@ pub fn window(mins: Option<i64>) -> String {
     }
 }
 pub const DEFAULT_MODEL: &str = "默认模型";
+pub const NO_SESSIONS: &str = "没有找到其他会话。";
+pub const CHOOSE_SESSION: &str = "请选择要恢复的会话：";
+pub fn resumed(id: &str) -> String { format!("已切换到会话 {id}，之后的消息将在该会话中进行。") }
+pub fn cloned(id: &str) -> String { format!("已复制当前会话，之后的消息将在副本 {id} 中进行。") }
+pub fn renamed(name: &str) -> String { format!("会话已重命名为「{name}」。") }
+pub fn archived(id: &str) -> String { format!("原会话已归档，之后的消息将在新会话 {id} 中进行。") }
+pub const GOAL_CLEARED: &str = "目标已清除。";
+pub fn goal_set(g: &str) -> String { format!("目标已设置为：{g}") }
+pub const LOGGED_OUT: &str = "已退出该 codex 账号的登录。";
+pub const QUIT: &str = "agent 进程已退出。下一条消息将恢复原会话。";
+pub const NOTHING_TO_COPY: &str = "还没有可复制的回答。";
+pub fn exported_file(name: &str) -> String { format!("会话已导出为文件 {name}。") }
+pub const EMPTY_RESULT: &str = "（无内容）";
+pub const NO_DIFF: &str = "工作目录中没有改动。";
+
+/// A result from an agent, shown as indented key: value lines (for the commands that only display information).
+pub fn show(v: &serde_json::Value) -> String {
+    fn walk(v: &serde_json::Value, depth: usize, out: &mut String) {
+        let pad = "  ".repeat(depth);
+        match v {
+            serde_json::Value::Object(m) => for (k, x) in m {
+                if k.starts_with('_') || x.is_null() { continue; }
+                if x.is_object() || x.is_array() { out.push_str(&format!("{pad}{k}：\n")); walk(x, depth + 1, out); }
+                else { out.push_str(&format!("{pad}{k}：{}\n", scalar(x))); }
+            },
+            serde_json::Value::Array(a) => for x in a {
+                if x.is_object() || x.is_array() { out.push_str(&format!("{pad}-\n")); walk(x, depth + 1, out); }
+                else { out.push_str(&format!("{pad}- {}\n", scalar(x))); }
+            },
+            x => out.push_str(&format!("{pad}{}\n", scalar(x))),
+        }
+    }
+    fn scalar(x: &serde_json::Value) -> String { x.as_str().map(String::from).unwrap_or_else(|| x.to_string()) }
+    let mut out = String::new();
+    walk(v, 0, &mut out);
+    let out = out.trim_end().to_string();
+    if out.is_empty() { EMPTY_RESULT.into() } else { out }
+}
 pub fn model_set(v: &str) -> String { format!("已切换到模型 {v}。") }
 pub fn model_failed(e: &str) -> String { format!("{WARN} 模型切换失败：{e}") }
 pub fn thinking_set(v: &str) -> String { format!("思考强度已设置为 {v}。") }
@@ -189,7 +227,7 @@ pub fn codex_request_declined(method: &str) -> String { format!("codex 发出了
 pub fn mcp_failed(name: &str, e: &str) -> String { if e.is_empty() { format!("MCP 服务 {name} 启动失败") } else { format!("MCP 服务 {name} 启动失败：{e}") } }
 pub fn auth_recovery(provider: &str, m: &str) -> String { format!("模型服务 {provider} 认证失效，正在恢复：{m}") }
 pub fn auth_error(e: &str) -> String { format!("claude 登录状态出错：{e}") }
-pub fn hook_failed(name: &str, e: &str) -> String { format!("钩子 {name} 执行失败：{e}") }
+pub fn hook_failed(name: &str, e: &str) -> String { format!("hook {name} 执行失败：{e}") }
 pub fn instructions_too_long(total: u64, limit: u64) -> String { format!("说明文件总长度为 {total} 字符，超过上限 {limit} 字符") }
 pub fn tool_denied(tool: &str, why: &str) -> String { if why.is_empty() { format!("claude 拒绝调用工具 {tool}") } else { format!("claude 拒绝调用工具 {tool}（{why}）") } }
 pub fn writes_lost(code: &str) -> String { format!("会话记录写入失败（{code}），部分记录已丢失") }

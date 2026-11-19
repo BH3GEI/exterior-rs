@@ -55,6 +55,17 @@ pub fn download(path: &str) -> Result<Vec<u8>, String> {
     if o.status.success() && !o.stdout.is_empty() { Ok(o.stdout) } else { Err(crate::text::download_failed(o.status.code())) }
 }
 
+/// Standard base64, for /api/send_file.
+pub fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 { out.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' }); }
+    }
+    out
+}
+
 pub fn get(path: &str) -> Option<Value> { call("GET", path, None).ok() }
 pub fn post(path: &str, body: Value) -> Result<Value, (u16, Value)> { call("POST", path, Some(&body)) }
 
