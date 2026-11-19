@@ -1034,6 +1034,9 @@ mod tests {
         assert!(msgs.iter().all(|m| m.chars().count() <= text::MESSAGE_MAX));
         let all = msgs.join("\n");
         for i in [0, 2500, 4999] { assert_eq!(all.matches(&format!("第 {i} 行\n")).count(), 2, "line {i}"); }
+        // a blank line early on does not make it cut mid-line
+        let body = format!("\n\n── 输出 ──\n{}", "一行代码;\n".repeat(20000));
+        for part in text::split_text(&body, 28000) { assert!(part.ends_with(';') || part.ends_with(";\n"), "{}", &part[part.len() - 20..]); }
         // code fences inside the output do not break the block
         assert!(text::step("x", "a ``` b")[0].contains("````\na ``` b\n````"));
         // a long notice keeps its whole text, folded

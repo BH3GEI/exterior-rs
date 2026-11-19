@@ -67,6 +67,8 @@ pub fn builtin_desc(name: &str) -> String {
 // ---- Telegram messages ----
 
 pub const WARN: &str = "⚠️";
+/// a tool call the turn ended without a result for; the result follows later under the same title
+pub fn tool_waiting(title: &str) -> String { format!("{title}（结果稍后）") }
 pub const THINKING: &str = "💭 思考";
 pub const STDERR: &str = "🖥 stderr";
 pub const STDOUT: &str = "🖥 stdout";
@@ -117,7 +119,9 @@ pub fn split_text(t: &str, n: usize) -> Vec<String> {
     let mut rest: Vec<char> = t.chars().collect();
     while rest.len() > n {
         let head: String = rest[..n].iter().collect();
-        let cut = head.rfind("\n\n").or_else(|| head.rfind('\n')).map(|b| head[..b].chars().count()).filter(|c| *c > n / 2).unwrap_or(n);
+        // a blank line, else a line break, if one is in the second half; only then mid-line
+        let late = |b: Option<usize>| b.map(|b| head[..b].chars().count()).filter(|c| *c > n / 2);
+        let cut = late(head.rfind("\n\n")).or_else(|| late(head.rfind('\n'))).unwrap_or(n);
         out.push(rest[..cut].iter().collect::<String>());
         rest = rest[cut..].to_vec();
         while rest.first() == Some(&'\n') { rest.remove(0); }

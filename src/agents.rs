@@ -278,7 +278,9 @@ impl Agent {
                     }
                     Some("rate_limit_event") => step(text::event_title("rate_limit_event"), pretty(&v)),
                     Some("result") => {
-                        for (_, (name, input)) in tools.drain() { step(tool_title(&name, &input, false), tool_body(&input, None)); }
+                        // calls still without a result (a background subagent's, say): shown now with what they were
+                        // asked, and kept, so the result that comes later is shown under the same call
+                        for (name, input) in tools.values() { step(text::tool_waiting(&tool_title(name, input, false)), tool_body(input, None)); }
                         step(text::event_title("result"), pretty(&v));
                     }
                     // stream_event pieces come again whole in the assistant message; control_response answers exterior
