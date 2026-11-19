@@ -61,6 +61,9 @@ pub const CHOOSE_THINKING: &str = "请选择思考强度：";
 pub const COMPACTED: &str = "上下文已压缩。";
 pub const NEW_SESSION: &str = "已开启新会话。";
 pub const RESTART_CUT: &str = "exterior 重启时本回合尚未完成，请重新发送该消息。";
+pub const RESTART_RESEND: &str = "exterior 重启打断了本回合，已自动重新发送上一条消息。";
+/// what the agent gets when its turn is re-sent after a restart
+pub fn resent(msg: &str) -> String { format!("（exterior 重启打断了上一回合，下面是同一条消息，请接着处理，已做完的部分不必重做。）\n\n{msg}") }
 
 pub fn exited(why: &str) -> String {
     let tail = if why.is_empty() { String::new() } else { format!("\n\n{why}") };

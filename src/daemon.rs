@@ -268,6 +268,8 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                     set_status(&tid, if error.is_some() { st::ERROR } else { st::IDLE });
                     store::note_set(&tid, "last_error", error.map(Value::String).unwrap_or(Value::Null));
                     store::note_set(&tid, "from", Value::Null);
+                    store::note_set(&tid, "turn_msg", Value::Null);
+                    store::note_set(&tid, "turn_resent", Value::Null);
                 }
             }
             Ev::Session { tid, gen, id } => {
@@ -326,13 +328,23 @@ fn run(sessions: Sessions) {
     }
     store::log("exterior started");
     ensure_global();
+    let mut resend: Vec<(String, String)> = Vec::new();
     for n in store::notes() {
         let tid = n["topic"].as_str().unwrap_or("").to_string();
         if tid.is_empty() { continue; }
         // notes written before 0.7 stored the status label itself
         if let Some(k) = n["status"].as_str().and_then(st::from_legacy) { store::note_set(&tid, "status", json!(k)); }
         // nothing runs right after a restart: a topic still marked running had its turn cut off
-        if matches!(store::note(&tid)["status"].as_str(), Some(st::RUNNING) | Some(st::MOVING)) {
+        let n = store::note(&tid);
+        let last_msg = n["turn_msg"].as_str().map(String::from);
+        store::note_set(&tid, "turn_msg", Value::Null);
+        store::note_set(&tid, "turn_resent", Value::Null);
+        // only once: a turn that itself restarts exterior (say, deploying it) must not loop
+        if n["status"].as_str() == Some(st::RUNNING) && last_msg.is_some() && n["turn_resent"] != json!(true) {
+            // the user should not have to repeat himself: send the cut-off message again once the loop is up
+            resend.push((tid.clone(), last_msg.unwrap_or_default()));
+            store::log(&format!("{}: turn cut off by restart, resending", n["name"]));
+        } else if matches!(n["status"].as_str(), Some(st::RUNNING) | Some(st::MOVING)) {
             store::note_set(&tid, "status", json!(st::ERROR));
             store::note_set(&tid, "last_error", json!(text::RESTART_CUT));
             store::log(&format!("{}: turn cut off by restart", n["name"]));
@@ -349,6 +361,12 @@ fn run(sessions: Sessions) {
     });
     std::thread::spawn(|| for d in store::devices() { if let Err(e) = crate::prompt::install(&d) { store::log(&format!("install brief key on {}: {e}", d["name"])); } });
     refresh(&sessions);
+    for (tid, msg) in resend {
+        send(&own, &sessions, &tid, text::RESTART_RESEND);
+        let line = if msg.starts_with('/') { msg } else { text::resent(&msg) };
+        handle(&sessions, &own, &tx, &tid, &line);
+        store::note_set(&tid, "turn_resent", json!(true));
+    }
     let mut last = store::state("last_id").as_u64().unwrap_or(0);
     if last == 0 {
         last = brief::get("/api/messages?source=telegram&limit=1").and_then(|v| v.as_array().and_then(|a| a.iter().filter_map(|m| m["id"].as_u64()).max())).unwrap_or(0);
@@ -405,6 +423,7 @@ fn run(sessions: Sessions) {
             if from_user && m["media"]["url"].is_string() {
                 text = with_file(&sessions, &chat, id, &m["media"], &text);
             }
+            store::note_set(&chat, "turn_resent", Value::Null);
             handle(&sessions, &own, &tx, &chat, &text);
         }
         store::set_state("last_id", json!(last));
@@ -545,6 +564,7 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                 s.pending = true;
                 if let Err(e) = a.say(&line) { s.pending = false; reply = Some(text::say_failed(&e)); }
                 else if transfer.is_some() { set_status(chat, st::MOVING); }
+                else { store::note_set(chat, "turn_msg", json!(msg)); }
             }
         }
     }
