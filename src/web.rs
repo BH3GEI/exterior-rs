@@ -282,9 +282,11 @@ fn settings_page() -> String {
     let body = format!(r#"<h2>brief</h2><div class="card"><form method="post" action="/settings/save">
 <div class="grid"><div><label class="mute">brief 地址</label><br><input name="brief_url" value="{}" size="34"></div><div><label class="mute">brief 密钥{}</label><br><input name="brief_key" type="password" placeholder="{}" autocomplete="new-password"></div></div>
 <div class="row"><button class="primary">保存</button></div></form><div class="row">状态：{} <span class="mute">{}</span></div>
+<div class="row">全局话题：{} <span class="mute">{}</span></div>
 <div class="row">「/」命令菜单：{} 条 agent 命令，更新于 {} <form class="inline" method="post" action="/settings/menu"><button>重新生成</button></form> {}</div></div>"#,
         esc(c["brief"]["url"].as_str().unwrap_or("")), if has_key { "（已加密保存）" } else { "" }, if has_key { "如不修改请留空" } else { "" },
         badge(Some(tg["ok"] == true), tg["msg"].as_str().unwrap_or("未知")), ago(tg["time"].as_u64().unwrap_or(0)),
+        badge(Some(store::state("global")["ok"] == true), store::state("global")["msg"].as_str().unwrap_or("—")), ago(store::state("global")["time"].as_u64().unwrap_or(0)),
         menu_n, ago(store::state("menu_time").as_u64().unwrap_or(0)), result_cell(r));
     let fields: String = params::PARAMS.iter().map(|p| format!("<div><label class=\"mute\">{}</label><br><input name=\"p_{}\" value=\"{}\" placeholder=\"{}\"></div>",
         esc(p.label), p.key, esc(&params::get(p.key)), esc(p.default))).collect();

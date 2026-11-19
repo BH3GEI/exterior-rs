@@ -308,6 +308,7 @@ fn run(sessions: Sessions) {
         std::thread::sleep(params::secs("reconnect_s"));
     }
     store::log("exterior started");
+    ensure_global();
     for n in store::notes() {
         let tid = n["topic"].as_str().unwrap_or("").to_string();
         if tid.is_empty() { continue; }
@@ -390,6 +391,16 @@ fn run(sessions: Sessions) {
             handle(&sessions, &own, &tx, &chat, &text);
         }
         store::set_state("last_id", json!(last));
+    }
+}
+
+/// The global topic: created as the user (brief does it with his account, since only his topics are adopted
+/// and only he can pin) if he has none with that title, and pinned. Safe to repeat.
+fn ensure_global() {
+    let name = params::get("global_topic");
+    match brief::post("/api/bots/user_topic", json!({"name": name, "pin": true})) {
+        Ok(v) => { store::log(&format!("global topic {name}: {}", v["chat"])); store::set_state("global", json!({"ok": true, "time": store::now(), "msg": text::global_ready(&name)})); }
+        Err((c, v)) => { store::log(&format!("global topic {name} failed: {c} {v}")); store::set_state("global", json!({"ok": false, "time": store::now(), "msg": text::global_failed(&name, &format!("{c} {v}"))})); }
     }
 }
 

@@ -93,6 +93,8 @@ pub const TG_CONNECTED: &str = "已连接";
 pub const TG_NOT_SET: &str = "尚未设置 brief 地址和密钥，或尚未添加设备";
 pub fn tg_adopt_failed(e: &str) -> String { format!("接管话题失败：{e}") }
 pub fn tg_unreachable(e: &str) -> String { format!("无法连接 brief：{e}") }
+pub fn global_ready(name: &str) -> String { format!("「{name}」话题已存在并已置顶") }
+pub fn global_failed(name: &str, e: &str) -> String { format!("无法创建或置顶「{name}」话题：{e}") }
 
 // ---- errors ----
 
