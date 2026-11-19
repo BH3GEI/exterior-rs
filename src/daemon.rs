@@ -243,6 +243,9 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
             Ev::Session { tid, gen, id } => {
                 if current(&tid, gen) && store::note(&tid)["session"].as_str() != Some(&id) { store::note_set(&tid, "session", json!(id)); }
             }
+            Ev::Note { tid, gen, text } => {
+                if current(&tid, gen) { send(&own, &sessions, &tid, &format!("⚠️ {text}")); }
+            }
             Ev::Resolved { tid, gen, name } => {
                 if current(&tid, gen) { store::note_set(&tid, "resolved", json!(name)); }
             }

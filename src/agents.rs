@@ -27,6 +27,8 @@ pub enum Ev {
     Text { tid: String, gen: u64, delta: String },
     Done { tid: String, gen: u64, text: Option<String>, stopped: bool, error: Option<String> },
     Session { tid: String, gen: u64, id: String },
+    /// side notice worth showing Yao: rate limit, model fallback, API retry
+    Note { tid: String, gen: u64, text: String },
     /// the command picked a concrete account (cc0 → cc6): later restarts use that one
     Resolved { tid: String, gen: u64, name: String },
     Exited { tid: String, gen: u64, why: String },
@@ -171,6 +173,7 @@ impl Agent {
                 if let Some(s) = v["session_id"].as_str() {
                     if s != known { known = s.to_string(); let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: known.clone() }); }
                 }
+                if let Some(t) = claude_note(&v) { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: t }); }
                 if let Some(d) = v["event"]["delta"]["text"].as_str() { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() }); }
                 if v["type"] == "result" {
                     *busy.lock().unwrap() = false;
@@ -503,4 +506,53 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
     drop(stdin);
     let _ = child.lock().unwrap().kill();
     out
+}
+
+/// Claude's side notices that Yao should see (limits, fallback to another model, retries).
+pub fn claude_note(v: &Value) -> Option<String> {
+    let model = |k: &str| v[k].as_str().unwrap_or("?").to_string();
+    match (v["type"].as_str()?, v["subtype"].as_str().unwrap_or("")) {
+        ("rate_limit_event", _) => {
+            let i = &v["rate_limit_info"];
+            let st = i["status"].as_str().unwrap_or("");
+            if st == "allowed" || st.is_empty() { return None; }
+            let kind = i["rateLimitType"].as_str().unwrap_or("");
+            let when = i["resetsAt"].as_i64().map(|t| {
+                let t = if t > 1_000_000_000_000 { t / 1000 } else { t };
+                let left = t - std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(t);
+                if left > 0 { format!("，约 {} 小时 {} 分后恢复", left / 3600, left % 3600 / 60) } else { String::new() }
+            }).unwrap_or_default();
+            let pct = i["utilization"].as_f64().map(|u| format!("（已用 {:.0}%）", if u <= 1.0 { u * 100.0 } else { u })).unwrap_or_default();
+            Some(match st { "rejected" => format!("额度用完了 {kind}{when}"), _ => format!("额度快用完 {kind}{pct}{when}") })
+        }
+        ("system", "model_fallback") | ("system", "model_refusal_fallback") | ("system", "model_consent_fallback") => {
+            let c = v["content"].as_str().unwrap_or("").trim();
+            Some(if c.is_empty() { format!("降级：{} → {}", model("original_model"), model("fallback_model")) } else { c.to_string() })
+        }
+        ("system", "api_retry") => {
+            let a = v["attempt"].as_i64().unwrap_or(0);
+            if a != 1 && a % 3 != 0 { return None; }
+            Some(format!("接口出错，正在重试 {a}/{}：{}", v["max_retries"].as_i64().unwrap_or(0), v["error"].as_str().map(String::from).unwrap_or_else(|| v["error_status"].to_string())))
+        }
+        ("system", "notification") => {
+            let t = v["text"].as_str()?.trim();
+            if t.is_empty() || v["priority"] == "low" { None } else { Some(t.to_string()) }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod note_tests {
+    use super::claude_note;
+    use serde_json::json;
+    #[test]
+    fn notes() {
+        assert_eq!(claude_note(&json!({"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}})), None);
+        assert!(claude_note(&json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":4102444800i64}})).unwrap().starts_with("额度用完了 five_hour，约"));
+        assert_eq!(claude_note(&json!({"type":"system","subtype":"model_fallback","original_model":"claude-opus-5-5","fallback_model":"claude-opus-4-8","content":""})).unwrap(), "降级：claude-opus-5-5 → claude-opus-4-8");
+        assert!(claude_note(&json!({"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"error":"overloaded"})).unwrap().contains("1/10"));
+        assert_eq!(claude_note(&json!({"type":"system","subtype":"api_retry","attempt":2})), None);
+        assert_eq!(claude_note(&json!({"type":"assistant"})), None);
+    }
 }
