@@ -63,6 +63,9 @@ pub enum Ev {
     Note { tid: String, gen: u64, text: String },
     /// the command picked a concrete account (cc0 → cc6): later restarts use that one
     Resolved { tid: String, gen: u64, name: String },
+    /// a step of the agent's work that is not its answer: thinking, a tool call with its output, a protocol event.
+    /// Shown folded; nothing is left out.
+    Step { tid: String, gen: u64, title: String, body: String },
     /// claude refused for lack of quota on this account (rate limit "rejected")
     Exhausted { tid: String, gen: u64, why: String },
     Exited { tid: String, gen: u64, why: String },
@@ -116,8 +119,21 @@ fn env(spec: &Spec) -> Vec<(&'static str, String)> {
 
 /// stderr: remember the last lines (for error messages) and notice "→ cc6" style picks.
 fn watch_stderr(err: std::process::ChildStderr, tx: Sender<Ev>, tid: String, gen: u64, last: Arc<Mutex<String>>) {
+    // everything the process writes to stderr is shown too, gathered into one folded step every couple of seconds
+    let pend = Arc::new(Mutex::new(String::new()));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (pend, done, tx, tid) = (pend.clone(), done.clone(), tx.clone(), tid.clone());
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let t = std::mem::take(&mut *pend.lock().unwrap());
+            if !t.trim().is_empty() { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::STDERR.into(), body: t }); }
+            if done.load(std::sync::atomic::Ordering::SeqCst) { break; }
+        });
+    }
     std::thread::spawn(move || {
         for line in BufReader::new(err).lines().map_while(Result::ok) {
+            { let mut p = pend.lock().unwrap(); p.push_str(&line); p.push('\n'); }
             let l = line.trim();
             let mark = params::get("pick_mark");
             if let Some(n) = l.strip_prefix(mark.as_str()).filter(|_| !mark.is_empty()) {
@@ -130,6 +146,7 @@ fn watch_stderr(err: std::process::ChildStderr, tx: Sender<Ev>, tid: String, gen
                 if s.len() > 2000 { let cut = s.len() - 1500; *s = s[s.char_indices().find(|(i, _)| *i >= cut).map(|x| x.0).unwrap_or(0)..].to_string(); }
             }
         }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
@@ -200,6 +217,9 @@ impl Agent {
                 "--include-partial-messages"].map(String::from).to_vec();
         args.extend(params::args("claude_args"));
         if let Some(e) = self.spec.effort.as_ref().filter(|e| *e != "auto") { args.push("--effort".into()); args.push(e.clone()); }
+        // claude leaves its thinking out unless asked; the summaries Anthropic's API gives are shown as steps
+        let td = params::get("claude_thinking");
+        if !td.is_empty() { args.push("--thinking-display".into()); args.push(td); }
         if let Some(id) = &self.spec.resume { args.push("--resume".into()); args.push(id.clone()); }
         if !self.spec.prompt.is_empty() { args.push("--append-system-prompt".into()); args.push(self.spec.prompt.clone()); }
         let (out, last) = self.spawn(args)?;
@@ -212,6 +232,7 @@ impl Agent {
         let quiet = silent.clone();
         std::thread::spawn(move || {
             let mut known = String::new();
+            let mut tools: HashMap<String, (String, Value)> = HashMap::new();
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                 if v["type"] == "control_response" {
@@ -222,6 +243,29 @@ impl Agent {
                 }
                 if let Some(s) = v["session_id"].as_str() {
                     if s != known { known = s.to_string(); let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: known.clone() }); }
+                }
+                // everything the agent does besides answering: thinking, tool calls with their output, system events
+                let step = |title: String, body: String| { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title, body }); };
+                match v["type"].as_str() {
+                    Some("assistant") => for b in v["message"]["content"].as_array().into_iter().flatten() {
+                        match b["type"].as_str() {
+                            Some("thinking") => if let Some(t) = b["thinking"].as_str().filter(|t| !t.trim().is_empty()) { step(text::THINKING.into(), t.trim().to_string()); },
+                            Some("redacted_thinking") => step(text::THINKING.into(), text::THINKING_HIDDEN.into()),
+                            Some("tool_use") => { tools.insert(b["id"].as_str().unwrap_or("").to_string(), (b["name"].as_str().unwrap_or("?").to_string(), b["input"].clone())); }
+                            _ => {}
+                        }
+                    },
+                    Some("user") => for b in v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
+                        let (name, input) = tools.remove(b["tool_use_id"].as_str().unwrap_or("")).unwrap_or(("?".into(), Value::Null));
+                        let failed = b["is_error"] == true;
+                        step(tool_title(&name, &input, failed), tool_body(&input, Some(&result_text(&b["content"]))));
+                    },
+                    Some("system") if !matches!(v["subtype"].as_str(), Some("status") | Some("thinking_tokens")) => {
+                        step(text::event_title(&format!("system · {}", v["subtype"].as_str().unwrap_or(""))), pretty(&v));
+                    }
+                    Some("rate_limit_event") => step(text::event_title("rate_limit_event"), pretty(&v)),
+                    Some("result") => for (_, (name, input)) in tools.drain() { step(tool_title(&name, &input, false), tool_body(&input, None)); },
+                    _ => {}
                 }
                 if let Some(t) = claude_note(&v) {
                     if v["type"] == "rate_limit_event" && v["rate_limit_info"]["status"] == "rejected" {
@@ -279,6 +323,15 @@ impl Agent {
                     Some("message_update") => {
                         let e = &v["assistantMessageEvent"];
                         if e["type"] == "text_delta" { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: e["delta"].as_str().unwrap_or("").to_string() }); }
+                        if e["type"] == "thinking_end" {
+                            if let Some(t) = e["content"].as_str().filter(|t| !t.trim().is_empty()) { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::THINKING.into(), body: t.trim().to_string() }); }
+                        }
+                    }
+                    Some("tool_execution_end") => {
+                        let failed = v["isError"] == true;
+                        let out = v["result"]["content"].as_array().map(|a| a.iter().map(|c| c["text"].as_str().map(String::from).unwrap_or_else(|| pretty(c))).collect::<Vec<_>>().join("\n")).unwrap_or_else(|| pretty(&v["result"]));
+                        let name = v["toolName"].as_str().unwrap_or("?");
+                        let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: tool_title(name, &v["args"], failed), body: tool_body(&v["args"], Some(&out)) });
                     }
                     Some("turn_end") => {
                         let t: String = v["message"]["content"].as_array().into_iter().flatten()
@@ -399,6 +452,10 @@ impl Agent {
                     "item/completed" if p["item"]["type"] == "agentMessage" => {
                         if !reply.is_empty() && !reply.ends_with("\n\n") { reply.push_str("\n\n"); let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
                     }
+                    "item/completed" if p["item"]["type"] != "userMessage" => {
+                        let (title, body) = codex_step(&p["item"]);
+                        let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title, body });
+                    }
                     "error" if p["willRetry"] == true => {
                         retries += 1;
                         if worth_noting(retries) {
@@ -417,6 +474,7 @@ impl Agent {
                         let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::fallback(p["fromModel"].as_str().unwrap_or("?"), p["toModel"].as_str().unwrap_or("?")) });
                     }
                     "account/rateLimits/updated" => {
+                        let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title("rateLimits"), body: pretty(&p["rateLimits"]) });
                         for t in limits.update(&p["rateLimits"]) { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: t }); }
                     }
                     "mcpServer/startupStatus/updated" if p["status"] == "failed" => {
@@ -825,24 +883,89 @@ fn resets(w: &Value) -> String {
     w["resetsAt"].as_i64().map(|t| t - crate::store::now() as i64).filter(|l| *l > 0).map(|l| text::resets_in(l / 3600, l % 3600 / 60)).unwrap_or_default()
 }
 
-/// Whether a retry is worth a message: the first one, then every `notice_every`-th.
-fn worth_noting(attempt: i64) -> bool {
-    let every = params::num("notice_every").max(1) as i64;
-    attempt == 1 || attempt % every == 0
+/// Whether a retry is worth a message: every one is (nothing is held back).
+fn worth_noting(_attempt: i64) -> bool { true }
+
+/// The main argument of a tool call, for its one-line title (the full call is in the folded body).
+fn short(s: &str) -> String {
+    let l = s.trim().lines().next().unwrap_or("").trim();
+    if l.chars().count() > 80 { format!("{}…", l.chars().take(80).collect::<String>()) } else { l.to_string() }
+}
+
+pub fn pretty(v: &Value) -> String {
+    match v { Value::String(s) => s.clone(), Value::Null => String::new(), _ => serde_json::to_string_pretty(v).unwrap_or_default() }
+}
+
+/// "🔧 Bash · ls -la": icon, tool, its main argument.
+pub fn tool_title(name: &str, input: &Value, failed: bool) -> String {
+    let n = name.to_lowercase();
+    let icon = if n.contains("bash") || n.contains("command") || n.contains("exec") { "🔧" }
+        else if n.contains("read") || n == "view" { "📄" }
+        else if n.contains("edit") || n.contains("write") || n.contains("patch") || n.contains("filechange") { "✏️" }
+        else if n.contains("grep") || n.contains("glob") || n.contains("find") || n == "ls" { "🔎" }
+        else if n.contains("web") || n.contains("fetch") || n.contains("search") { "🌐" }
+        else if n.contains("task") || n.contains("agent") { "🤖" } else { "🔧" };
+    let arg = ["command", "cmd", "file_path", "path", "pattern", "url", "query", "description", "prompt", "skill"].iter()
+        .find_map(|k| input[*k].as_str().map(short)).unwrap_or_default();
+    let mark = if failed { " ✗" } else { "" };
+    if arg.is_empty() { format!("{icon} {name}{mark}") } else { format!("{icon} {name} · {arg}{mark}") }
+}
+
+/// A tool call and what came back, as one text.
+pub fn tool_body(input: &Value, output: Option<&str>) -> String {
+    let call = match input["command"].as_str() {
+        Some(c) => match input["description"].as_str() { Some(d) => format!("{c}\n# {d}"), None => c.to_string() },
+        None => pretty(input),
+    };
+    match output { Some(o) => format!("{call}\n\n── 输出 ──\n{o}"), None => call }
+}
+
+/// A finished codex item other than its answer: (title, full content).
+fn codex_step(it: &Value) -> (String, String) {
+    let kind = it["type"].as_str().unwrap_or("?");
+    match kind {
+        "commandExecution" => {
+            let cmd = it["command"].as_str().unwrap_or("");
+            let failed = it["exitCode"].as_i64().map(|c| c != 0).unwrap_or(false);
+            let out = format!("{}\n(exit {})", it["aggregatedOutput"].as_str().unwrap_or(""), it["exitCode"]);
+            (tool_title("command", &serde_json::json!({"command": cmd}), failed), tool_body(&serde_json::json!({"command": cmd}), Some(out.trim())))
+        }
+        "reasoning" => {
+            let parts: Vec<String> = ["summary", "content"].iter().flat_map(|k| it[*k].as_array().cloned().unwrap_or_default())
+                .map(|x| x.as_str().map(String::from).unwrap_or_else(|| pretty(&x))).collect();
+            (text::THINKING.into(), parts.join("\n\n"))
+        }
+        "fileChange" => {
+            let ch = it["changes"].as_array().cloned().unwrap_or_default();
+            let body = ch.iter().map(|c| format!("{} ({})\n{}", c["path"].as_str().unwrap_or("?"), c["kind"]["type"].as_str().or(c["kind"].as_str()).unwrap_or(""), c["diff"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n\n");
+            let first = ch.first().and_then(|c| c["path"].as_str()).unwrap_or("");
+            (tool_title("fileChange", &serde_json::json!({"path": first}), false), body)
+        }
+        "mcpToolCall" => (tool_title(&format!("{}.{}", it["server"].as_str().unwrap_or("?"), it["tool"].as_str().unwrap_or("?")), &it["arguments"], !it["error"].is_null()),
+                          tool_body(&it["arguments"], Some(&pretty(if it["error"].is_null() { &it["result"] } else { &it["error"] })))),
+        "webSearch" => (tool_title("webSearch", &serde_json::json!({"query": it["query"]}), false), pretty(it)),
+        _ => (text::event_title(kind), pretty(it)),
+    }
+}
+
+/// claude's tool result content: a string, or blocks of text and images.
+fn result_text(c: &Value) -> String {
+    match c {
+        Value::Array(a) => a.iter().map(|b| match b["type"].as_str() {
+            Some("text") => b["text"].as_str().unwrap_or("").to_string(),
+            Some("image") => "[图片]".to_string(),
+            _ => pretty(b),
+        }).collect::<Vec<_>>().join("\n"),
+        _ => pretty(c),
+    }
 }
 
 /// Keep an error short enough for a message.
-pub fn clip(s: &str) -> String {
-    let n = params::num("error_chars") as usize;
-    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n).collect::<String>()) }
-}
+/// Error text as the agent gave it. (It used to be shortened; nothing is cut any more, long text is folded when shown.)
+pub fn clip(s: &str) -> String { s.trim().to_string() }
 
 /// The last few lines of an error output.
-pub fn last_lines(s: &str) -> String {
-    let n = params::num("error_lines") as usize;
-    let v: Vec<&str> = s.trim().lines().collect();
-    v[v.len().saturating_sub(n)..].join("\n")
-}
+pub fn last_lines(s: &str) -> String { s.trim().to_string() }
 
 /// Claude's side notices that the user should see. Claude marks its own warnings with `level`; limits and
 /// retries come as their own events.
@@ -915,7 +1038,7 @@ mod note_tests {
         assert_eq!(claude_note(&json!({"type":"system","subtype":"model_refusal_fallback","level":"warning","content":"已切换模型"})).unwrap(), "已切换模型");
         assert_eq!(claude_note(&json!({"type":"system","subtype":"init"})), None);
         assert!(claude_note(&json!({"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"error":"overloaded"})).unwrap().contains("1/10"));
-        assert_eq!(claude_note(&json!({"type":"system","subtype":"api_retry","attempt":2})), None);
+        assert!(claude_note(&json!({"type":"system","subtype":"api_retry","attempt":2})).is_some());   // every retry is shown
         assert_eq!(claude_note(&json!({"type":"assistant"})), None);
     }
 }

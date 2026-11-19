@@ -124,17 +124,6 @@ pub fn tg_post(path: &str, body: Value, wait: bool) -> Result<Value, (u16, Value
     }
 }
 
-/// Telegram allows 4096 characters per message; keep the end, which is where an answer concludes.
-const MESSAGE_MAX: usize = 32000;
-const KEEP: usize = 31900;
-
-pub fn clip(s: &str) -> String {
-    let n = s.chars().count();
-    if n <= MESSAGE_MAX { return s.to_string(); }
-    let tail: String = s.chars().skip(n - KEEP).collect();
-    format!("{}\n{}", crate::text::clipped(n - KEEP), tail)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -77,9 +77,18 @@ fn buttons(rows: Vec<Vec<(String, String)>>) -> Value {
 
 fn in_rows(items: Vec<(String, String)>, per: usize) -> Vec<Vec<(String, String)>> { items.chunks(per).map(|c| c.to_vec()).collect() }
 
+/// Send a text; one longer than a message can hold goes out as several, nothing is cut. Buttons go on the last.
 fn send_with(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Option<Value>) -> Option<u64> {
+    let parts = text::pack(vec![text.to_string()]);
+    let n = parts.len();
+    let mut id = None;
+    for (i, p) in parts.into_iter().enumerate() { id = send_one(own, sessions, chat, &p, if i + 1 == n { btns.clone() } else { None }); }
+    id
+}
+
+fn send_one(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Option<Value>) -> Option<u64> {
     for _ in 0..params::num("send_retries").max(1) {
-        let mut body = json!({"chat": chat, "text": brief::clip(text)});
+        let mut body = json!({"chat": chat, "text": text});
         if let Some(b) = &btns { body["buttons"] = b.clone(); }
         match brief::tg_post("/api/send", body, true) {
             Ok(v) => { let id = v["id"].as_u64(); if let Some(i) = id { own.lock().unwrap().insert(i); } return id; }
@@ -237,7 +246,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
         let t = std::mem::take(&mut o.buf);
         if !t.trim().is_empty() { o.said.push(t.trim().to_string()); o.since.get_or_insert(Instant::now()); }
     }
-    fn take(o: &mut Out) -> String { o.since = None; if !o.said.is_empty() { o.spoke = true; } std::mem::take(&mut o.said).join("\n\n") }
+    fn take(o: &mut Out) -> Vec<String> { o.since = None; if !o.said.is_empty() { o.spoke = true; } text::pack(std::mem::take(&mut o.said)) }
     let mut outs: HashMap<String, Out> = HashMap::new();
     loop {
         let ev = match rx.recv_timeout(Duration::from_millis(500)) { Ok(e) => Some(e), Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None, Err(_) => return };
@@ -247,7 +256,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
             if !o.buf.is_empty() && o.last.elapsed() > pause { settle(o); }
             if o.since.map(|s| s.elapsed() >= merge).unwrap_or(false) { due.push((tid.clone(), take(o))); }
         }
-        for (tid, t) in due { send(&own, &sessions, &tid, &t); }
+        for (tid, msgs) in due { for t in msgs { send(&own, &sessions, &tid, &t); } }
         let Some(ev) = ev else { continue };
         let current = |tid: &str, gen: u64| sessions.lock().unwrap().get(tid).map(|s| s.gen == gen).unwrap_or(false);
         match ev {
@@ -265,8 +274,9 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 if stopped { o.said.push(text::sys(text::STOPPED_SUFFIX)); }
                 if let Some(e) = &error { o.said.push(text::failed(e)); }
                 if o.said.is_empty() && !o.spoke { o.said.push(text::sys(text::DONE_EMPTY)); }
-                let body = take(&mut o);
-                if !body.is_empty() && send(&own, &sessions, &tid, &body).is_none() { store::log(&format!("answer for {tid} could not be delivered")); }
+                let msgs = take(&mut o);
+                for m in &msgs { if send(&own, &sessions, &tid, m).is_none() { store::log(&format!("answer for {tid} could not be delivered")); } }
+                let body = msgs.join("\n\n");
                 let who = {
                     let mut ss = sessions.lock().unwrap();
                     ss.get_mut(&tid).map(|s| { if s.gen == gen { s.pending = false; } s.active = Instant::now(); (s.dev.clone(), s.name.clone()) })
@@ -307,6 +317,13 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                     settle(o); o.said.push(text::note(&t)); o.since.get_or_insert(Instant::now());
                 }
             }
+            Ev::Step { tid, gen, title, body } => {
+                if current(&tid, gen) {
+                    let o = outs.entry(tid).or_insert_with(|| fresh(gen));
+                    if gen > o.gen { *o = fresh(gen); }
+                    settle(o); o.said.extend(text::step(&title, &body)); o.since.get_or_insert(Instant::now());
+                }
+            }
             Ev::Exhausted { tid, gen, why } => {
                 if current(&tid, gen) { store::note_set(&tid, "exhausted", json!(why)); }
             }
@@ -323,7 +340,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 };
                 if let Some(mut o) = outs.remove(&tid) {
                     settle(&mut o);
-                    if !o.said.is_empty() { o.said.push(text::sys_warn(text::CUT_SUFFIX)); let b = take(&mut o); send(&own, &sessions, &tid, &b); }
+                    if !o.said.is_empty() { o.said.push(text::sys_warn(text::CUT_SUFFIX)); for b in take(&mut o) { send(&own, &sessions, &tid, &b); } }
                 }
                 if current(&tid, gen) || warn {
                     let why = agents::last_lines(&why);
@@ -856,6 +873,23 @@ fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> An
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nothing_is_cut() {
+        // a long answer and a huge tool output come out whole, across several messages
+        let long: String = (0..5000).map(|i| format!("第 {i} 行\n")).collect();
+        let parts = text::step("🔧 Bash · cat big.log", &long);
+        assert!(parts.len() > 1 && parts[0].contains("（1/") && parts[0].starts_with("<details><summary><sub><i>"));
+        let msgs = text::pack([vec!["开头".to_string()], parts, vec![long.clone()]].concat());
+        assert!(msgs.iter().all(|m| m.chars().count() <= text::MESSAGE_MAX));
+        let all = msgs.join("\n");
+        for i in [0, 2500, 4999] { assert_eq!(all.matches(&format!("第 {i} 行\n")).count(), 2, "line {i}"); }
+        // code fences inside the output do not break the block
+        assert!(text::step("x", "a ``` b")[0].contains("````\na ``` b\n````"));
+        // a long notice keeps its whole text, folded
+        let n = text::sys_warn(&format!("出错了\n{}", "细节 ".repeat(100)));
+        assert!(n.starts_with("<footer>⚠️ exterior · 出错了</footer>") && n.contains(&"细节 ".repeat(100).trim_end().to_string()));
+    }
+
     #[test]
     fn parsing() {
         assert_eq!(strip_bot_mention("/model@exterior_bot 3"), "/model 3");

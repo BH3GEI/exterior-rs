@@ -38,6 +38,7 @@ fn probe(a: &[String]) {
         match ev {
             agents::Ev::Done { text, error, .. } => { println!("done: {text:?} error: {error:?}"); break; }
             agents::Ev::Exited { why, .. } => { println!("exited: {why}"); break; }
+            agents::Ev::Step { title, body, .. } => println!("step: {title} ({} 字)", body.chars().count()),
             agents::Ev::Session { id, .. } => println!("session {id}"),
             agents::Ev::Note { text, .. } => println!("note: {text}"),
             _ => {}

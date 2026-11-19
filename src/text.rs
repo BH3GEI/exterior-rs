@@ -62,14 +62,76 @@ pub fn builtin_desc(agent: &str, name: &str) -> String {
 // ---- Telegram messages ----
 
 pub const WARN: &str = "⚠️";
+pub const THINKING: &str = "💭 思考";
+pub const STDERR: &str = "🖥 stderr";
+pub const THINKING_HIDDEN: &str = "（模型没有给出思考内容）";
+pub fn event_title(kind: &str) -> String { format!("ℹ️ {kind}") }
 /// exterior's own notices, set apart from what the agent says: small grey text (a rich message footer).
 pub fn sys(t: &str) -> String { footer("⚙️", t) }
 pub fn sys_warn(t: &str) -> String { footer(WARN, t) }
 /// a reply of exterior's own, as a notice unless it already is one
 pub fn as_sys(t: &str) -> String { if t.starts_with("<footer>") { t.to_string() } else { sys(t) } }
 fn footer(icon: &str, t: &str) -> String {
-    let t = t.trim().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('\n', "<br>");
-    format!("<footer>{icon} exterior · {t}</footer>")
+    let t = t.trim();
+    // a long or multi-line notice: its first line as the footer, the whole text folded below
+    if t.contains('\n') || t.chars().count() > 200 {
+        let first: String = t.lines().next().unwrap_or("").chars().take(150).collect();
+        return format!("<footer>{icon} exterior · {}</footer>\n\n{}", esc(&first), step(DETAILS, t).join("\n\n"));
+    }
+    format!("<footer>{icon} exterior · {}</footer>", esc(t))
+}
+
+fn esc(t: &str) -> String { t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;") }
+
+pub const DETAILS: &str = "完整内容";
+/// Longest text one message carries (Telegram allows 32768 characters in a rich message; markup needs room too).
+pub const MESSAGE_MAX: usize = 30000;
+const CHUNK: usize = 28000;
+
+/// A step shown folded: a small italic title, the full content in a code block below it. Nothing is cut: content
+/// too long for one message becomes several folded parts, (1/3), (2/3)…
+pub fn step(title: &str, body: &str) -> Vec<String> {
+    let body = body.trim_end();
+    let mut run = 0; let mut longest = 0;
+    for c in body.chars() { if c == '`' { run += 1; longest = longest.max(run); } else { run = 0; } }
+    let fence = "`".repeat(longest.max(2) + 1);
+    let parts = split_text(body, CHUNK);
+    let n = parts.len();
+    parts.iter().enumerate().map(|(i, p)| {
+        let part = if n > 1 { format!("（{}/{n}）", i + 1) } else { String::new() };
+        if p.trim().is_empty() { format!("<details><summary><sub><i>{}{part}</i></sub></summary>\n\n（无内容）\n\n</details>", esc(title)) }
+        else { format!("<details><summary><sub><i>{}{part}</i></sub></summary>\n\n{fence}\n{p}\n{fence}\n\n</details>", esc(title)) }
+    }).collect()
+}
+
+/// Cut text into pieces of at most `n` characters, at a paragraph or line break where possible. Nothing is dropped.
+pub fn split_text(t: &str, n: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest: Vec<char> = t.chars().collect();
+    while rest.len() > n {
+        let head: String = rest[..n].iter().collect();
+        let cut = head.rfind("\n\n").or_else(|| head.rfind('\n')).map(|b| head[..b].chars().count()).filter(|c| *c > n / 2).unwrap_or(n);
+        out.push(rest[..cut].iter().collect::<String>());
+        rest = rest[cut..].to_vec();
+        while rest.first() == Some(&'\n') { rest.remove(0); }
+    }
+    if !rest.is_empty() || out.is_empty() { out.push(rest.into_iter().collect()); }
+    out
+}
+
+/// Pieces (paragraphs, folded steps) → messages of at most MESSAGE_MAX characters, in order.
+pub fn pack(pieces: Vec<String>) -> Vec<String> {
+    let mut msgs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for p in pieces {
+        for p in if p.chars().count() > MESSAGE_MAX { split_text(&p, MESSAGE_MAX) } else { vec![p] } {
+            if !cur.is_empty() && cur.chars().count() + 2 + p.chars().count() > MESSAGE_MAX { msgs.push(std::mem::take(&mut cur)); }
+            if !cur.is_empty() { cur.push_str("\n\n"); }
+            cur.push_str(&p);
+        }
+    }
+    if !cur.is_empty() { msgs.push(cur); }
+    msgs
 }
 pub const STOPPED_SUFFIX: &str = "本回合已停止。";
 pub const CUT_SUFFIX: &str = "输出中断。";
@@ -286,7 +348,6 @@ pub fn timed_out(secs: u64) -> String { format!("执行超时（{secs} 秒）") 
 pub fn download_failed(code: Option<i32>) -> String { format!("文件下载失败（curl 退出码 {code:?}）") }
 pub fn read_failed(e: &str) -> String { format!("读取失败：{e}") }
 pub fn prompt_unreadable(path: &str, e: &str) -> String { format!("无法读取启动说明 {path}：{e}") }
-pub fn clipped(n: usize) -> String { format!("…（已省略前 {n} 字）") }
 pub fn menu_set(n: usize) -> String { format!("已设置 {n} 条命令") }
 
 /// Folder name for a topic whose title has no usable characters.
