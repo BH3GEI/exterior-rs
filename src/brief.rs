@@ -72,8 +72,30 @@ pub fn post(path: &str, body: Value) -> Result<Value, (u16, Value)> { call("POST
 /// Until when Telegram told us to hold off (429 with retry_after). One group shares one limit, so this is global.
 static HOLD: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
+/// The queue: the earliest moment the next post to Telegram may go out. Every post takes the next free slot,
+/// tg_gap_ms after the previous one, so we stay under Telegram's per-group limit instead of running into it.
+static NEXT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Take a slot in the queue and wait for it. `wait` false: only take a slot that is free right now.
+fn slot(wait: bool) -> bool {
+    use std::time::{Duration, Instant};
+    let gap = Duration::from_millis(crate::params::num("tg_gap_ms"));
+    let at = {
+        let mut n = NEXT.lock().unwrap();
+        let now = Instant::now();
+        let at = n.filter(|t| *t > now).unwrap_or(now);
+        if !wait && at > now { return false; }
+        *n = Some(at + gap);
+        at
+    };
+    let now = Instant::now();
+    if at > now { std::thread::sleep(at - now); }
+    true
+}
+
 /// Telegram is rate-limiting us right now.
-pub fn held() -> bool { HOLD.lock().unwrap().map(|u| u > std::time::Instant::now()).unwrap_or(false) }
+#[cfg(test)]
+fn held() -> bool { HOLD.lock().unwrap().map(|u| u > std::time::Instant::now()).unwrap_or(false) }
 
 /// Post something that ends up in Telegram (send, edit). On 429 every later post waits out retry_after.
 /// `wait`: wait and retry (for anything that must arrive); otherwise give up at once (live updates,
@@ -88,6 +110,7 @@ pub fn tg_post(path: &str, body: Value, wait: bool) -> Result<Value, (u16, Value
             if !wait || start.elapsed() + (u - now) > cap { return Err((429, serde_json::json!({"error": "rate_limited", "held": true}))); }
             std::thread::sleep(u - now);
         } }
+        if !slot(wait) { return Err((429, serde_json::json!({"error": "queued", "held": true}))); }
         match post(path, body.clone()) {
             Err((429, v)) => {
                 let ra = v["retry_after"].as_u64().unwrap_or(5).max(1) + 1;

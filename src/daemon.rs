@@ -69,8 +69,6 @@ fn relay_split(t: &str) -> Option<(&str, &str)> {
 }
 
 fn send(own: &Own, sessions: &Sessions, chat: &str, text: &str) -> Option<u64> { send_with(own, sessions, chat, text, None) }
-/// A live update: skipped while Telegram rate-limits us, the next flush carries the same text.
-fn send_live(own: &Own, sessions: &Sessions, chat: &str, text: &str) -> Option<u64> { send_inner(own, sessions, chat, text, None, false) }
 
 /// Buttons: rows of (label, what pressing it says).
 fn buttons(rows: Vec<Vec<(String, String)>>) -> Value {
@@ -79,30 +77,18 @@ fn buttons(rows: Vec<Vec<(String, String)>>) -> Value {
 
 fn in_rows(items: Vec<(String, String)>, per: usize) -> Vec<Vec<(String, String)>> { items.chunks(per).map(|c| c.to_vec()).collect() }
 
-fn send_with(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Option<Value>) -> Option<u64> { send_inner(own, sessions, chat, text, btns, true) }
-
-fn send_inner(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Option<Value>, wait: bool) -> Option<u64> {
+fn send_with(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Option<Value>) -> Option<u64> {
     for _ in 0..params::num("send_retries").max(1) {
         let mut body = json!({"chat": chat, "text": brief::clip(text)});
         if let Some(b) = &btns { body["buttons"] = b.clone(); }
-        match brief::tg_post("/api/send", body, wait) {
+        match brief::tg_post("/api/send", body, true) {
             Ok(v) => { let id = v["id"].as_u64(); if let Some(i) = id { own.lock().unwrap().insert(i); } return id; }
             Err((410, _)) => { gone(sessions, chat); return None; }
             Err((c, v)) if c == 0 || c >= 500 => { store::log(&format!("send {chat}: {c} {v}; retry")); std::thread::sleep(params::secs("retry_wait_s")); }
-            Err((c, v)) => { if c != 429 || wait { store::log(&format!("send {chat} failed {c} {v}")); } return None; }
+            Err((c, v)) => { store::log(&format!("send {chat} failed {c} {v}")); return None; }
         }
     }
     None
-}
-
-/// Replace the text of a message. `wait`: wait out rate limits (final answers). False if the text did not get there.
-fn edit(sessions: &Sessions, chat: &str, id: u64, text: &str, wait: bool) -> bool {
-    match brief::tg_post("/api/edit", json!({"chat": chat, "id": id, "text": brief::clip(text)}), wait) {
-        Ok(_) => true,
-        Err((410, _)) => { gone(sessions, chat); true }
-        Err((_, v)) if v.to_string().contains("not modified") => true,
-        Err((c, v)) => { if c != 429 || wait { store::log(&format!("edit {chat} failed {c} {v}")); } false }
-    }
 }
 
 /// The topic was deleted in Telegram: close the session, delete nothing.
@@ -237,42 +223,47 @@ pub fn build_menu() -> Result<usize, String> {
     Ok(n)
 }
 
-/// Agent output → Telegram: one message per answer, edited as it grows.
+/// Agent output → Telegram. No live editing: what the agent says is sent as it is said. A paragraph is done when the
+/// agent pauses (pause_ms); paragraphs of one topic within merge_s go out together as one message, and whatever is
+/// left goes out at once when the turn ends. Every send waits its turn in brief's queue.
 fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
-    struct Out { gen: u64, buf: String, sent: String, id: Option<u64>, shown: Instant }
+    /// buf: text still coming in; last: when the last piece came; said: paragraphs waiting to go out, since when
+    struct Out { gen: u64, buf: String, last: Instant, said: Vec<String>, since: Option<Instant>, spoke: bool }
+    let fresh = |gen| Out { gen, buf: String::new(), last: Instant::now(), said: Vec::new(), since: None, spoke: false };
+    fn settle(o: &mut Out) {
+        let t = std::mem::take(&mut o.buf);
+        if !t.trim().is_empty() { o.said.push(t.trim().to_string()); o.since.get_or_insert(Instant::now()); }
+    }
+    fn take(o: &mut Out) -> String { o.since = None; if !o.said.is_empty() { o.spoke = true; } std::mem::take(&mut o.said).join("\n\n") }
     let mut outs: HashMap<String, Out> = HashMap::new();
-    let mut last_live = Instant::now();
     loop {
         let ev = match rx.recv_timeout(Duration::from_millis(500)) { Ok(e) => Some(e), Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None, Err(_) => return };
-        let flush = Duration::from_millis(params::num("flush_ms"));
-        // all topics share one group and one Telegram limit: at most one live update per stream_gap_ms,
-        // the topic that waited longest first, none while Telegram has us on hold
-        if !brief::held() && last_live.elapsed() > Duration::from_millis(params::num("stream_gap_ms")) {
-            let due = outs.iter_mut().filter(|(_, o)| !o.buf.trim().is_empty() && o.buf != o.sent && o.shown.elapsed() > flush).max_by_key(|(_, o)| o.shown.elapsed());
-            if let Some((tid, o)) = due {
-                let ok = match o.id { None => { o.id = send_live(&own, &sessions, tid, &o.buf); o.id.is_some() } Some(i) => edit(&sessions, tid, i, &o.buf, false) };
-                if ok { o.sent = o.buf.clone(); }
-                o.shown = Instant::now();
-                last_live = Instant::now();
-            }
+        let (pause, merge) = (Duration::from_millis(params::num("pause_ms")), params::secs("merge_s"));
+        let mut due = Vec::new();
+        for (tid, o) in outs.iter_mut() {
+            if !o.buf.is_empty() && o.last.elapsed() > pause { settle(o); }
+            if o.since.map(|s| s.elapsed() >= merge).unwrap_or(false) { due.push((tid.clone(), take(o))); }
         }
+        for (tid, t) in due { send(&own, &sessions, &tid, &t); }
         let Some(ev) = ev else { continue };
         let current = |tid: &str, gen: u64| sessions.lock().unwrap().get(tid).map(|s| s.gen == gen).unwrap_or(false);
         match ev {
             Ev::Text { tid, gen, delta } => {
-                let o = outs.entry(tid).or_insert(Out { gen, buf: String::new(), sent: String::new(), id: None, shown: Instant::now() });
-                if gen > o.gen { *o = Out { gen, buf: String::new(), sent: String::new(), id: None, shown: Instant::now() }; }
-                if gen == o.gen { o.buf.push_str(&delta); }
+                let o = outs.entry(tid).or_insert_with(|| fresh(gen));
+                if gen > o.gen { *o = fresh(gen); }
+                if gen == o.gen { o.buf.push_str(&delta); o.last = Instant::now(); }
             }
             Ev::Done { tid, gen, text: answer, stopped, error } => {
-                let o = outs.remove(&tid).filter(|o| o.gen == gen).unwrap_or(Out { gen, buf: String::new(), sent: String::new(), id: None, shown: Instant::now() });
-                let mut body = if stopped { o.buf.clone() } else { answer.filter(|t| !t.trim().is_empty()).unwrap_or(o.buf.clone()) };
-                if stopped { body = format!("{body}\n\n{}", text::STOPPED_SUFFIX).trim().to_string(); }
-                if let Some(e) = &error { body = format!("{body}\n\n{}", text::failed(e)).trim().to_string(); }
-                if body.trim().is_empty() { body = text::DONE_EMPTY.into(); }
-                // the final answer must arrive: if the live message cannot be edited, send it anew
-                let done = match o.id { None => send(&own, &sessions, &tid, &body).is_some(), Some(i) => edit(&sessions, &tid, i, &body, true) || send(&own, &sessions, &tid, &body).is_some() };
-                if !done { store::log(&format!("answer for {tid} could not be delivered")); }
+                let mut o = outs.remove(&tid).filter(|o| o.gen == gen).unwrap_or_else(|| fresh(gen));
+                let streamed = !o.buf.trim().is_empty() || !o.said.is_empty();
+                settle(&mut o);
+                // the final text came only as a whole (no deltas): send it
+                if !streamed { if let Some(a) = answer.filter(|t| !t.trim().is_empty()) { o.said.push(a.trim().to_string()); } }
+                if stopped { o.said.push(text::STOPPED_SUFFIX.into()); }
+                if let Some(e) = &error { o.said.push(text::failed(e)); }
+                if o.said.is_empty() && !o.spoke { o.said.push(text::DONE_EMPTY.into()); }
+                let body = take(&mut o);
+                if !body.is_empty() && send(&own, &sessions, &tid, &body).is_none() { store::log(&format!("answer for {tid} could not be delivered")); }
                 let who = {
                     let mut ss = sessions.lock().unwrap();
                     ss.get_mut(&tid).map(|s| { if s.gen == gen { s.pending = false; } s.active = Instant::now(); (s.dev.clone(), s.name.clone()) })
@@ -293,7 +284,12 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 if current(&tid, gen) && store::note(&tid)["session"].as_str() != Some(&id) { store::note_set(&tid, "session", json!(id)); }
             }
             Ev::Note { tid, gen, text: t } => {
-                if current(&tid, gen) { send(&own, &sessions, &tid, &text::note(&t)); }
+                // notes join the topic's waiting paragraphs, in order
+                if current(&tid, gen) {
+                    let o = outs.entry(tid).or_insert_with(|| fresh(gen));
+                    if gen > o.gen { *o = fresh(gen); }
+                    settle(o); o.said.push(text::note(&t)); o.since.get_or_insert(Instant::now());
+                }
             }
             Ev::Resolved { tid, gen, name } => {
                 if current(&tid, gen) { store::note_set(&tid, "resolved", json!(name)); }
@@ -306,8 +302,9 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                         _ => false,
                     }
                 };
-                if let Some(o) = outs.remove(&tid) {
-                    if !o.buf.trim().is_empty() { let b = format!("{}\n\n{}", o.buf, text::CUT_SUFFIX); match o.id { None => { send(&own, &sessions, &tid, &b); } Some(i) => { if !edit(&sessions, &tid, i, &b, true) { send(&own, &sessions, &tid, &b); } } } }
+                if let Some(mut o) = outs.remove(&tid) {
+                    settle(&mut o);
+                    if !o.said.is_empty() { o.said.push(text::CUT_SUFFIX.into()); let b = take(&mut o); send(&own, &sessions, &tid, &b); }
                 }
                 if current(&tid, gen) || warn {
                     let why = agents::last_lines(&why);
@@ -433,7 +430,7 @@ fn run(sessions: Sessions) {
             };
             if from_user {
                 let c = chat.clone();
-                std::thread::spawn(move || { let _ = brief::post("/api/react", json!({"chat": c, "id": id, "emoji": params::get("ack_emoji")})); });
+                std::thread::spawn(move || { let _ = brief::tg_post("/api/react", json!({"chat": c, "id": id, "emoji": params::get("ack_emoji")}), true); });
             } else if let Some((who, body)) = relay_split(&text) {
                 store::append("messages.jsonl", &json!({"time": store::now(), "from": who.trim(), "to": to_name, "text": body.chars().take(500).collect::<String>()}));
             }
@@ -609,7 +606,7 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             }
             match a.file {
                 Some((name, data)) => {
-                    let r = brief::post("/api/send_file", json!({"chat": chat, "name": name, "data": brief::base64(&data), "text": a.text}));
+                    let r = brief::tg_post("/api/send_file", json!({"chat": chat, "name": name, "data": brief::base64(&data), "text": a.text}), true);
                     if let Err((c, v)) = r { send_with(&own, &sessions, &chat, &text::failed(&format!("{c} {v}")), None); }
                 }
                 None => { send_with(&own, &sessions, &chat, &a.text, a.buttons); }

@@ -217,6 +217,8 @@ impl Agent {
                     if s != known { known = s.to_string(); let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: known.clone() }); }
                 }
                 if let Some(t) = claude_note(&v) { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: t }); }
+                // a new text block (after a tool call, say) is a new paragraph
+                if v["event"]["type"] == "content_block_start" && v["event"]["content_block"]["type"] == "text" { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
                 if let Some(d) = v["event"]["delta"]["text"].as_str() { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() }); }
                 if v["type"] == "result" {
                     *busy.lock().unwrap() = false;

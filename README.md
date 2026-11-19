@@ -1,6 +1,6 @@
 # exterior
 
-把 Telegram 群组中的每个话题变成一个 agent 会话：在话题中发送的消息交给运行在你自己机器上的 agent（Claude Code、Codex 或 pi），agent 的回答实时写回同一话题。
+把 Telegram 群组中的每个话题变成一个 agent 会话：在话题中发送的消息交给运行在你自己机器上的 agent（Claude Code、Codex 或 pi），agent 说的话按段发回同一话题：同一话题短时间内的几段合并成一条，所有消息排队发送，不会撞上 Telegram 的限流。
 
 exterior 是运行在懒猫微服上的一个应用（单个 Rust 程序），通过 [brief](https://github.com/BH3GEI/wxbrief) 收发 Telegram 消息，通过 SSH 在设备上启动 agent。
 
