@@ -259,9 +259,9 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 settle(&mut o);
                 // the final text came only as a whole (no deltas): send it
                 if !streamed { if let Some(a) = answer.filter(|t| !t.trim().is_empty()) { o.said.push(a.trim().to_string()); } }
-                if stopped { o.said.push(text::STOPPED_SUFFIX.into()); }
+                if stopped { o.said.push(text::sys(text::STOPPED_SUFFIX)); }
                 if let Some(e) = &error { o.said.push(text::failed(e)); }
-                if o.said.is_empty() && !o.spoke { o.said.push(text::DONE_EMPTY.into()); }
+                if o.said.is_empty() && !o.spoke { o.said.push(text::sys(text::DONE_EMPTY)); }
                 let body = take(&mut o);
                 if !body.is_empty() && send(&own, &sessions, &tid, &body).is_none() { store::log(&format!("answer for {tid} could not be delivered")); }
                 let who = {
@@ -304,7 +304,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 };
                 if let Some(mut o) = outs.remove(&tid) {
                     settle(&mut o);
-                    if !o.said.is_empty() { o.said.push(text::CUT_SUFFIX.into()); let b = take(&mut o); send(&own, &sessions, &tid, &b); }
+                    if !o.said.is_empty() { o.said.push(text::sys_warn(text::CUT_SUFFIX)); let b = take(&mut o); send(&own, &sessions, &tid, &b); }
                 }
                 if current(&tid, gen) || warn {
                     let why = agents::last_lines(&why);
@@ -386,7 +386,7 @@ fn run(sessions: Sessions) {
     std::thread::spawn(|| for d in store::devices() { if let Err(e) = crate::prompt::install(&d) { store::log(&format!("install brief key on {}: {e}", d["name"])); } });
     refresh(&sessions);
     for (tid, msg) in resend {
-        send(&own, &sessions, &tid, text::RESTART_RESEND);
+        send(&own, &sessions, &tid, &text::sys(text::RESTART_RESEND));
         let line = if msg.starts_with('/') { msg } else { text::resent(&msg) };
         handle(&sessions, &own, &tx, &tid, &line);
         store::note_set(&tid, "turn_resent", json!(true));
@@ -481,7 +481,7 @@ fn retry_waiting(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
             if store::note(&tid)["wait_msg"].as_str() != Some(msg.as_str()) { continue; }
             store::note_set(&tid, "wait_msg", Value::Null);
             store::log(&format!("{}: device back, resending", n["name"]));
-            send(&own, &sessions, &tid, text::DEVICE_BACK);
+            send(&own, &sessions, &tid, &text::sys(text::DEVICE_BACK));
             let line = if msg.starts_with('/') { msg } else { text::resent(&msg) };
             handle(&sessions, &own, &tx, &tid, &line);
             store::note_set(&tid, "turn_resent", json!(true));
@@ -638,7 +638,7 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             }
         }
     }
-    if let Some((_, want)) = &transfer { send(own, sessions, chat, &text::transferring(want)); }
+    if let Some((_, want)) = &transfer { send(own, sessions, chat, &text::sys(&text::transferring(want))); }
     if let Some(r) = reply { send_with(own, sessions, chat, &r, reply_buttons); }
     if let Some((c, kind, name, arg)) = ctl {
         let (own, sessions, chat) = (own.clone(), sessions.clone(), chat.to_string());
