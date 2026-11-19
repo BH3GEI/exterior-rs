@@ -25,7 +25,7 @@ const BUTTON_DATA_MAX: usize = 64;
 /// Telegram's limits on the command menu.
 const MENU_MAX: usize = 100;
 const COMMAND_NAME_MAX: usize = 32;
-const COMMAND_DESC_MAX: usize = 120;
+const COMMAND_DESC_MAX: usize = 60;
 
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 type Own = Arc<Mutex<HashSet<u64>>>;
@@ -279,6 +279,20 @@ fn menu_name(orig: &str) -> String {
     n
 }
 
+/// Telegram refuses a menu whose names and descriptions together are longer than about 5200 characters
+/// (BOT_COMMANDS_TOO_MUCH; measured 11-19 with 100 commands). Shorten every description alike until it fits.
+const MENU_CHARS: usize = 5000;
+
+fn fit_menu(cmds: &mut [Value]) {
+    let len = |v: &Value, k: &str| v[k].as_str().unwrap_or("").chars().count();
+    let mut cap = COMMAND_DESC_MAX;
+    while cap > 8 && cmds.iter().map(|c| len(c, "command") + len(c, "description").min(cap)).sum::<usize>() > MENU_CHARS { cap -= 1; }
+    for c in cmds.iter_mut() {
+        let d = c["description"].as_str().unwrap_or("").to_string();
+        if d.chars().count() > cap { c["description"] = json!(format!("{}…", d.chars().take(cap - 1).collect::<String>())); }
+    }
+}
+
 /// The "/" menu: exterior's own commands, then the agents' commands without any prefix: claude's as claude lists
 /// them, pi's as pi lists them plus the table (agents::BUILTINS), codex's from the table. One entry per name; its
 /// grey description says which agents have it. The topic's current agent decides what a command does.
@@ -315,9 +329,9 @@ pub fn build_menu() -> Result<usize, String> {
         if cmds.len() >= MENU_MAX { break; }
         let who: Vec<&str> = Kind::ALL.iter().filter(|k| !map[tg][k.name()].is_null()).map(|k| k.label()).collect();
         let full = format!("{} · {}", who.join(" / "), desc.get(tg).cloned().unwrap_or_else(|| format!("/{tg}")));
-        let d: String = if full.chars().count() > COMMAND_DESC_MAX { format!("{}…", full.chars().take(COMMAND_DESC_MAX - 1).collect::<String>()) } else { full };
-        cmds.push(json!({"command": tg, "description": d}));
+        cmds.push(json!({"command": tg, "description": full}));
     }
+    fit_menu(&mut cmds);
     let n = cmds.len();
     brief::post("/api/bots/commands", json!({"commands": cmds})).map_err(|(c, v)| format!("{c} {v}"))?;
     store::set_state("menu", Value::Object(map));
@@ -978,6 +992,10 @@ mod tests {
         assert_eq!(agents::builtin(Kind::Claude, "model"), None);
         assert_eq!(agents::builtin(Kind::Codex, "thinking"), None);
         assert_eq!(menu_name("design-sync"), "design_sync");
+        let mut m: Vec<Value> = (0..100).map(|i| json!({"command": format!("command_{i}"), "description": "说".repeat(100)})).collect();
+        fit_menu(&mut m);
+        assert!(m.iter().map(|c| c["command"].as_str().unwrap().chars().count() + c["description"].as_str().unwrap().chars().count()).sum::<usize>() <= MENU_CHARS);
+        assert!(m[0]["description"].as_str().unwrap().ends_with('…'));
         assert_eq!(menu_name("skill:Foo.Bar"), "skill_foo_bar");
         assert_eq!(agents::review_target("")["type"], "uncommittedChanges");
         assert_eq!(agents::review_target("abc1234")["type"], "commit");
