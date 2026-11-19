@@ -63,38 +63,49 @@ pub fn running(tid: &str) -> Option<(bool, bool)> {
 }
 
 /// What each topic still has to send: messages handed to its sender and not yet sent, and topics whose text is still
-/// being gathered (output keeps this up to date).
+/// being gathered (output keeps this up to date). pushed: how many jobs each topic's sender has been given; urgent:
+/// up to which of them the user is waiting for (the rest of a turn that has ended).
 #[derive(Default)]
-struct Owed { handed: HashMap<String, usize>, gathering: HashSet<String> }
+struct Owed { handed: HashMap<String, usize>, gathering: HashSet<String>, pushed: HashMap<String, u64>, urgent: HashMap<String, u64> }
 static OWED: Mutex<Option<Owed>> = Mutex::new(None);
 
 fn owed<T>(f: impl FnOnce(&mut Owed) -> T) -> T { f(OWED.lock().unwrap().get_or_insert_with(Owed::default)) }
 fn handed(tid: &str) -> usize { owed(|o| o.handed.get(tid).copied().unwrap_or(0)) }
 fn owes(tid: &str) -> bool { owed(|o| o.handed.get(tid).is_some_and(|n| *n > 0) || o.gathering.contains(tid)) }
+/// The topic's turn is over: what it has been given so far, up to the answer, goes before running topics' output.
+fn hurry(tid: &str) { owed(|o| if let Some(n) = o.pushed.get(tid).copied() { o.urgent.insert(tid.to_string(), n); }) }
 
 type Job = Box<dyn FnOnce() + Send>;
 
 /// Each topic sends through its own thread, its jobs one after another in the order given: a slow send (a file read
 /// from a device that does not answer, an upload, brief being retried) holds up only its own topic. Every send still
-/// waits its turn in brief's one queue, so the rate limit stays shared.
+/// waits its turn in brief's one queue, so the rate limit stays shared; a job is urgent there once `hurry` covers it.
 #[derive(Default)]
-struct Lanes(HashMap<String, Sender<Job>>);
+struct Lanes(HashMap<String, Sender<(u64, Job)>>);
 
 impl Lanes {
     fn push(&mut self, tid: &str, job: impl FnOnce() + Send + 'static) {
-        owed(|o| *o.handed.entry(tid.to_string()).or_insert(0) += 1);
+        let n = owed(|o| {
+            *o.handed.entry(tid.to_string()).or_insert(0) += 1;
+            let n = o.pushed.entry(tid.to_string()).or_insert(0);
+            *n += 1;
+            *n
+        });
         let tx = self.0.entry(tid.to_string()).or_insert_with(|| {
-            let (tx, rx) = channel::<Job>();
+            let (tx, rx) = channel::<(u64, Job)>();
             let t = tid.to_string();
-            std::thread::spawn(move || for job in rx {
+            std::thread::spawn(move || for (n, job) in rx {
+                let u = t.clone();
+                let urgent = move || owed(|o| o.urgent.get(&u).is_some_and(|m| *m >= n));
                 // a job that panics must not take the topic's later messages with it, nor leave it running forever
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() { store::log(&format!("sending to {t} panicked")); }
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| brief::with_urgency(urgent, job)));
+                if r.is_err() { store::log(&format!("sending to {t} panicked")); }
                 owed(|o| if let Some(n) = o.handed.get_mut(&t) { *n -= 1; });
             });
             tx
         });
         // the thread never ends while its sender is here, so this cannot fail
-        let _ = tx.send(Box::new(job));
+        let _ = tx.send((n, Box::new(job)));
     }
 }
 
@@ -208,8 +219,9 @@ pub fn relay(from: &str, to: &str, body: &str) -> Result<String, String> {
     let own: Own = Arc::new(Mutex::new(HashSet::new()));
     for p in text::pieces(&format!("{name} {} {}", params::get("relay_mark"), body.trim())) {
         match p {
-            text::Piece::Text(t) => for part in text::pack(vec![t]) { post(&sessions, &target, "/api/send", json!({"chat": target, "text": part}))?; },
-            text::Piece::File { alt, path } => send_file(&own, &sessions, &target, &dev, &dir, &alt, &path).map_err(|e| format!("{path}：{e}"))?,
+            // a running agent's message to another topic: nobody is waiting for it, it queues like the agents' steps
+            text::Piece::Text(t) => for part in text::pack(vec![t]) { brief::with_urgency(|| false, || post(&sessions, &target, "/api/send", json!({"chat": target, "text": part})))?; },
+            text::Piece::File { alt, path } => brief::with_urgency(|| false, || send_file(&own, &sessions, &target, &dev, &dir, &alt, &path)).map_err(|e| format!("{path}：{e}"))?,
         }
     }
     store::log(&format!("relay {name} -> {to}"));
@@ -453,6 +465,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                     store::note_set(&tid, "turn_msg", Value::Null);
                     store::note_set(&tid, "turn_resent", Value::Null);
                 }
+                hurry(&tid);
             }
             Ev::Session { tid, gen, id } => {
                 if current(&tid, gen) && store::note(&tid)["session"].as_str() != Some(&id) { store::note_set(&tid, "session", json!(id)); }
@@ -518,15 +531,18 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                         set_status(&tid, st::STOPPED);
                     }
                 }
+                hurry(&tid);
             }
         }
         }
         // then one message for each topic whose words have waited merge_s and whose sender is free, longest waiting
         // first. Under load each topic's text simply grows while its last message waits for its turn, so the total
-        // stays within the queue's rate however much the agents say.
-        let (pause, merge) = (Duration::from_millis(params::num("pause_ms")), params::secs("merge_s"));
+        // stays within the queue's rate however much the agents say. While the queue is busy, a topic whose turn is
+        // still running waits busy_merge_s: fewer, bigger messages, so the slots go to answers the user waits for.
+        let pause = Duration::from_millis(params::num("pause_ms"));
+        let merge = window(&sessions);
         for o in outs.values_mut() { if !o.buf.is_empty() && o.last.elapsed() > pause { settle(o); } }
-        let mut ready: Vec<(Instant, String)> = outs.iter().filter_map(|(t, o)| o.since.filter(|s| s.elapsed() >= merge).map(|s| (s, t.clone()))).collect();
+        let mut ready: Vec<(Instant, String)> = outs.iter().filter_map(|(t, o)| o.since.filter(|s| s.elapsed() >= merge(t)).map(|s| (s, t.clone()))).collect();
         ready.sort();
         for (_, tid) in ready {
             if handed(&tid) > 0 { continue; }
@@ -535,7 +551,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
             if msgs.is_empty() { continue; }
             let first = msgs.remove(0);
             // what did not fit stays first in line for this topic
-            if !msgs.is_empty() { o.said = msgs; o.since = Some(Instant::now() - merge); }
+            if !msgs.is_empty() { o.said = msgs; o.since = Instant::now().checked_sub(merge(&tid)).or(o.since); }
             let (own, sessions, t) = (own.clone(), sessions.clone(), tid.clone());
             lanes.push(&tid, move || { deliver(&own, &sessions, &t, &first); });
         }
@@ -543,6 +559,14 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
         let gathering: HashSet<String> = outs.iter().filter(|(_, o)| !o.said.is_empty() || !o.buf.trim().is_empty()).map(|(t, _)| t.clone()).collect();
         owed(|o| o.gathering = gathering);
     }
+}
+
+/// How long each topic's paragraphs are gathered into one message right now (see output).
+fn window(sessions: &Sessions) -> impl Fn(&str) -> Duration {
+    let (merge, busy) = (params::secs("merge_s"), brief::busy());
+    let long = params::secs("busy_merge_s").max(merge);
+    let running: HashSet<String> = if busy { sessions.lock().unwrap().values().filter(|s| s.pending).map(|s| s.tid.clone()).collect() } else { HashSet::new() };
+    move |tid: &str| if running.contains(tid) { long } else { merge }
 }
 
 pub fn start() {
@@ -1132,18 +1156,13 @@ mod lane_tests {
         assert!(!owes("tgbot:panic"));
     }
 
-    #[test]
-    fn slow_topic_does_not_hold_up_others() {
-        let _g = store::TEST.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("exterior-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("EXTERIOR_VAR", &dir);
-        std::fs::write(dir.join("pic.png"), b"png").unwrap();
-        // a fake brief that answers each request on its own thread; uploading the slow topic's file takes 3 s.
-        // It records what arrived, in the order it was answered
+    type Got = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// A fake brief that answers each request on its own thread; uploading the topic "tgbot:slow"'s file takes 3 s.
+    /// It records what arrived (chat, text or file), in the order it was answered. Returns its port.
+    fn fake_brief(got: &Got) -> u16 {
         let srv = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = srv.server_addr().to_ip().unwrap().port();
-        let got: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let g = got.clone();
         std::thread::spawn(move || for mut r in srv.incoming_requests() {
             let g = g.clone();
@@ -1157,22 +1176,48 @@ mod lane_tests {
                 let _ = r.respond(tiny_http::Response::from_string(r#"{"id":1}"#));
             });
         });
-        store::set_config(&json!({"brief": {"url": format!("http://127.0.0.1:{port}"), "key": crate::crypt::seal("k")},
-            "params": {"tg_gap_ms": "0", "merge_s": "0", "pause_ms": "0"},
-            "devices": [{"name": "here", "host": "local", "infra": dir.join("no-knowledge").display().to_string()}]}));
+        port
+    }
+
+    fn test_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("exterior-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("EXTERIOR_VAR", &dir);
+        dir
+    }
+
+    fn of(got: &Got, chat: &str) -> Vec<String> { got.lock().unwrap().iter().filter(|(c, _)| c == chat).map(|(_, w)| w.clone()).collect() }
+    fn wait(what: &dyn Fn() -> bool) { let t = Instant::now(); while !what() && t.elapsed() < Duration::from_secs(10) { std::thread::sleep(Duration::from_millis(20)); } }
+
+    /// Sessions for these topics (turn running or not) and an output thread for them.
+    fn topics(dir: &std::path::Path, ts: &[(&str, bool)]) -> (Sessions, Sender<Ev>) {
         let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-        for t in ["tgbot:slow", "tgbot:fast"] {
-            sessions.lock().unwrap().insert(t.into(), Session { tid: t.into(), name: t.into(), dev: "here".into(), dir: dir.display().to_string(),
-                agent: None, gen: 1, pending: true, deleted: false, active: Instant::now() });
+        for (t, pending) in ts {
+            sessions.lock().unwrap().insert(t.to_string(), Session { tid: t.to_string(), name: t.to_string(), dev: "here".into(), dir: dir.display().to_string(),
+                agent: None, gen: 1, pending: *pending, deleted: false, active: Instant::now() });
         }
         *LIVE.lock().unwrap() = Some(sessions.clone());
         let (tx, rx) = channel();
         { let s = sessions.clone(); std::thread::spawn(move || output(rx, s, Arc::new(Mutex::new(HashSet::new())))); }
-        let done = |tid: &str, t: &str| Ev::Done { tid: tid.into(), gen: 1, text: Some(t.into()), stopped: false, error: None };
+        (sessions, tx)
+    }
+
+    fn done(tid: &str, t: &str) -> Ev { Ev::Done { tid: tid.into(), gen: 1, text: Some(t.into()), stopped: false, error: None } }
+
+    #[test]
+    fn slow_topic_does_not_hold_up_others() {
+        let _g = store::TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir();
+        std::fs::write(dir.join("pic.png"), b"png").unwrap();
+        let got: Got = Arc::default();
+        let port = fake_brief(&got);
+        store::set_config(&json!({"brief": {"url": format!("http://127.0.0.1:{port}"), "key": crate::crypt::seal("k")},
+            "params": {"tg_gap_ms": "0", "merge_s": "0", "pause_ms": "0"},
+            "devices": [{"name": "here", "host": "local", "infra": dir.join("no-knowledge").display().to_string()}]}));
+        let (sessions, tx) = topics(&dir, &[("tgbot:slow", true), ("tgbot:fast", true)]);
         tx.send(done("tgbot:slow", "a1\n\n![图](pic.png)\n\na2")).unwrap();
         tx.send(done("tgbot:fast", "b1")).unwrap();
-        let of = |chat: &str| got.lock().unwrap().iter().filter(|(c, _)| c == chat).map(|(_, w)| w.clone()).collect::<Vec<_>>();
-        let wait = |what: &dyn Fn() -> bool| { let t = Instant::now(); while !what() && t.elapsed() < Duration::from_secs(10) { std::thread::sleep(Duration::from_millis(20)); } };
+        let of = |chat: &str| of(&got, chat);
         // the fast topic is answered while the slow one's file is still uploading
         wait(&|| !of("tgbot:fast").is_empty());
         assert_eq!(of("tgbot:fast"), vec!["b1"]);
@@ -1186,5 +1231,76 @@ mod lane_tests {
         wait(&|| running("tgbot:slow") == Some((false, false)));
         assert_eq!(running("tgbot:slow"), Some((false, false)));
         assert_eq!(running("tgbot:fast"), Some((false, false)));
+    }
+
+    #[test]
+    fn finished_topic_goes_first() {
+        let _g = store::TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir();
+        let got: Got = Arc::default();
+        let port = fake_brief(&got);
+        store::set_config(&json!({"brief": {"url": format!("http://127.0.0.1:{port}"), "key": crate::crypt::seal("k")}, "params": {"tg_gap_ms": "300"}}));
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        let own: Own = Arc::default();
+        let mut lanes = Lanes::default();
+        let push = |lanes: &mut Lanes, chat: &'static str, t: String| { let (o, s) = (own.clone(), sessions.clone()); lanes.push(chat, move || { send(&o, &s, chat, &t); }); };
+        // a running topic has a lot to say; another one, also running, has two steps queued behind it
+        for i in 1..=6 { push(&mut lanes, "tgbot:busy", format!("b{i}")); }
+        std::thread::sleep(Duration::from_millis(50));
+        push(&mut lanes, "tgbot:ans", "a1".into());
+        push(&mut lanes, "tgbot:ans", "a2".into());
+        // then its turn ends: its answer is pushed and all it has goes before the busy topic's steps
+        std::thread::sleep(Duration::from_millis(50));
+        push(&mut lanes, "tgbot:ans", "a3".into());
+        hurry("tgbot:ans");
+        wait(&|| got.lock().unwrap().len() == 9);
+        let order: Vec<String> = got.lock().unwrap().iter().map(|(_, w)| w.clone()).collect();
+        let at = |w: &str| order.iter().position(|x| x == w).unwrap();
+        // nothing lost, each topic in its own order
+        assert_eq!(of(&got, "tgbot:busy"), (1..=6).map(|i| format!("b{i}")).collect::<Vec<_>>(), "{order:?}");
+        assert_eq!(of(&got, "tgbot:ans"), vec!["a1", "a2", "a3"], "{order:?}");
+        // the finished topic's three overtook most of the queue, but the busy topic still got a slot in between
+        assert!(at("a3") < at("b5"), "{order:?}");
+        assert!(at("b2") < at("b6"), "{order:?}");
+        // what the topic says next (a new turn) is not urgent any more
+        push(&mut lanes, "tgbot:ans", "a4".into());
+        assert!(!owed(|o| o.urgent["tgbot:ans"] >= o.pushed["tgbot:ans"]));
+        wait(&|| handed("tgbot:ans") == 0);
+    }
+
+    #[test]
+    fn running_topic_merges_longer_while_busy() {
+        let _g = store::TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = test_dir();
+        let got: Got = Arc::default();
+        let port = fake_brief(&got);
+        store::set_config(&json!({"brief": {"url": format!("http://127.0.0.1:{port}"), "key": crate::crypt::seal("k")},
+            "params": {"tg_gap_ms": "0", "merge_s": "0", "pause_ms": "0", "busy_merge_s": "60"},
+            "devices": [{"name": "here", "host": "local", "infra": dir.join("no-knowledge").display().to_string()}]}));
+        let (sessions, tx) = topics(&dir, &[("tgbot:run", true), ("tgbot:idle", false)]);
+        let step = |tid: &str, b: &str| Ev::Step { tid: tid.into(), gen: 1, title: "t".into(), body: b.into() };
+        brief::BUSY_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+        tx.send(step("tgbot:run", "s1")).unwrap();
+        tx.send(Ev::Note { tid: "tgbot:idle".into(), gen: 1, text: "n1".into() }).unwrap();
+        // a topic whose turn is over still goes out after merge_s; the running one waits for busy_merge_s
+        wait(&|| !of(&got, "tgbot:idle").is_empty());
+        tx.send(step("tgbot:run", "s2")).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(of(&got, "tgbot:run").is_empty());
+        assert_eq!(running("tgbot:run"), Some((false, true)));
+        // its turn ends: everything goes out at once, as one message
+        tx.send(Ev::Text { tid: "tgbot:run".into(), gen: 1, delta: "ans".into() }).unwrap();
+        tx.send(done("tgbot:run", "ans")).unwrap();
+        wait(&|| !of(&got, "tgbot:run").is_empty());
+        let run = of(&got, "tgbot:run");
+        assert_eq!(run.len(), 1, "{run:?}");
+        assert!(run[0].contains("s1") && run[0].contains("s2") && run[0].contains("ans"), "{run:?}");
+        // not busy: merge_s again
+        brief::BUSY_TEST.store(false, std::sync::atomic::Ordering::SeqCst);
+        sessions.lock().unwrap().get_mut("tgbot:run").unwrap().pending = true;
+        tx.send(step("tgbot:run", "s3")).unwrap();
+        wait(&|| of(&got, "tgbot:run").len() == 2);
+        assert!(of(&got, "tgbot:run")[1].contains("s3"));
+        wait(&|| running("tgbot:run") == Some((false, false)) || handed("tgbot:run") == 0);
     }
 }

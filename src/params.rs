@@ -24,6 +24,7 @@ pub const PARAMS: &[Param] = &[
     Param { key: "idle_hours", label: "会话空闲多少小时后关闭进程", default: "2" },
     Param { key: "pause_ms", label: "agent 停顿多久算说完一段（毫秒）", default: "2000" },
     Param { key: "merge_s", label: "同一话题多少秒内说的话合并成一条发送", default: "10" },
+    Param { key: "busy_merge_s", label: "Telegram 发送队列拥堵时，仍在运行的话题多少秒内说的话合并成一条发送", default: "60" },
     Param { key: "tg_gap_ms", label: "向 Telegram 发送、编辑消息的最短间隔（毫秒）；所有话题共用一个队列，避免限流", default: "3000" },
     Param { key: "ask_timeout_s", label: "等待 agent 响应请求的时间（秒）", default: "30" },
     Param { key: "codex_ready_s", label: "等待 codex 就绪的时间（秒）", default: "40" },

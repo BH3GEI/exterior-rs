@@ -86,25 +86,99 @@ pub fn post(path: &str, body: Value) -> Result<Value, (u16, Value)> { call("POST
 /// Until when Telegram told us to hold off (429 with retry_after). One group shares one limit, so this is global.
 static HOLD: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
-/// The queue: the earliest moment the next post to Telegram may go out. Every post takes the next free slot,
-/// tg_gap_ms after the previous one, so we stay under Telegram's per-group limit instead of running into it.
-static NEXT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+/// The queue. Every post waits here for a slot, tg_gap_ms after the previous one, so we stay under Telegram's
+/// per-group limit instead of running into it. Who gets the next slot: an urgent caller (the user is waiting for
+/// it, see `urgent`) before the others, otherwise in order of arrival. So that the others are not starved, one of
+/// them gets the slot after every STARVE urgent ones.
+/// next: the earliest moment the next post may go out; waiting: (ticket, urgent) in order of arrival.
+struct Queue { next: Option<std::time::Instant>, waiting: Vec<(u64, bool)>, ticket: u64, urgent_run: u32 }
+static Q: std::sync::Mutex<Queue> = std::sync::Mutex::new(Queue { next: None, waiting: Vec::new(), ticket: 0, urgent_run: 0 });
+static FREED: std::sync::Condvar = std::sync::Condvar::new();
+const STARVE: u32 = 3;
+/// How often a waiting caller asks again whether it is urgent (a topic's turn can end while its message waits).
+const RECHECK: std::time::Duration = std::time::Duration::from_millis(200);
+/// The queue counts as busy when what already waits would take this long to go out.
+const BUSY: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Take a slot in the queue and wait for it. `wait` false: only take a slot that is free right now.
+fn queue() -> std::sync::MutexGuard<'static, Queue> { Q.lock().unwrap_or_else(|e| e.into_inner()) }
+
+impl Queue {
+    /// The ticket that gets the next slot.
+    fn pick(&self) -> Option<u64> {
+        let first = |u: bool| self.waiting.iter().find(|w| w.1 == u).map(|w| w.0);
+        if self.urgent_run >= STARVE { if let Some(t) = first(false) { return Some(t); } }
+        first(true).or_else(|| first(false))
+    }
+}
+
+thread_local! {
+    /// Whether this thread's posts are urgent, asked again while they wait. A thread that did not say is urgent:
+    /// that is exterior answering a user's command directly.
+    static URGENT: std::cell::RefCell<Option<Box<dyn Fn() -> bool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with this thread's posts urgent while `urgent()` says so.
+pub fn with_urgency<T>(urgent: impl Fn() -> bool + 'static, f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset { fn drop(&mut self) { URGENT.with(|u| *u.borrow_mut() = None); } }
+    URGENT.with(|u| *u.borrow_mut() = Some(Box::new(urgent)));
+    let _r = Reset;
+    f()
+}
+
+fn urgent() -> bool { URGENT.with(|u| u.borrow().as_ref().map(|f| f()).unwrap_or(true)) }
+
+/// The queue is congested: what waits for a slot (and a hold from Telegram) would take longer than BUSY to go out.
+pub fn busy() -> bool {
+    use std::time::{Duration, Instant};
+    #[cfg(test)] if BUSY_TEST.load(std::sync::atomic::Ordering::SeqCst) { return true; }
+    let gap = Duration::from_millis(crate::params::num("tg_gap_ms"));
+    let hold = HOLD.lock().unwrap().map(|u| u.saturating_duration_since(Instant::now())).unwrap_or_default();
+    gap * queue().waiting.len() as u32 + hold >= BUSY
+}
+
+/// Tests elsewhere make the queue look busy with this.
+#[cfg(test)]
+pub static BUSY_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Take a slot in the queue and wait for it. `wait` false: only take a slot that is free right now and nobody waits for.
 fn slot(wait: bool) -> bool {
     use std::time::{Duration, Instant};
     let gap = Duration::from_millis(crate::params::num("tg_gap_ms"));
-    let at = {
-        let mut n = NEXT.lock().unwrap();
+    if !wait {
+        let mut q = queue();
         let now = Instant::now();
-        let at = n.filter(|t| *t > now).unwrap_or(now);
-        if !wait && at > now { return false; }
-        *n = Some(at + gap);
-        at
-    };
-    let now = Instant::now();
-    if at > now { std::thread::sleep(at - now); }
-    true
+        if !q.waiting.is_empty() || q.next.is_some_and(|t| t > now) { return false; }
+        q.next = Some(now + gap);
+        return true;
+    }
+    let mut high = urgent();
+    let mut q = queue();
+    let me = q.ticket;
+    q.ticket += 1;
+    q.waiting.push((me, high));
+    drop(q);
+    // a caller that goes away (a panic) must not stay in line: the slot it would get would never be taken
+    struct Leave(u64);
+    impl Drop for Leave { fn drop(&mut self) { queue().waiting.retain(|w| w.0 != self.0); FREED.notify_all(); } }
+    let _leave = Leave(me);
+    loop {
+        let mut q = queue();
+        if let Some(w) = q.waiting.iter_mut().find(|w| w.0 == me) { w.1 = high; }
+        let now = Instant::now();
+        let free = q.next.is_none_or(|t| t <= now);
+        if free && q.pick() == Some(me) {
+            q.waiting.retain(|w| w.0 != me);
+            let others = q.waiting.iter().any(|w| !w.1);
+            q.urgent_run = if high && others { q.urgent_run + 1 } else { 0 };
+            q.next = Some(now + gap);
+            return true;
+        }
+        let d = q.next.filter(|_| !free).map_or(RECHECK, |t| (t - now).min(RECHECK));
+        drop(FREED.wait_timeout(q, d).unwrap_or_else(|e| e.into_inner()).0);
+        // asked with the queue unlocked: the answer may take other locks
+        high = urgent();
+    }
 }
 
 /// Telegram is rate-limiting us right now.
@@ -161,6 +235,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("EXTERIOR_VAR", &dir);
         let port = fake(2);
+        queue().next = None;
         crate::store::set_config(&serde_json::json!({"brief": {"url": format!("http://127.0.0.1:{port}"), "key": crate::crypt::seal("k")}}));
         // a live update gives up at once and puts everyone on hold
         assert_eq!(tg_post("/api/edit", serde_json::json!({}), false).unwrap_err().0, 429);
@@ -173,5 +248,80 @@ mod tests {
         // a picture is bigger than one command-line argument can hold: it still goes through, whole
         let big = serde_json::json!({"data": "A".repeat(400_000)});
         assert_eq!(call("POST", "/api/send_file", Some(&big)).unwrap()["len"], big.to_string().len());
+    }
+
+    /// Callers enter the queue one after another while the next slot is still ahead: "u…" urgent, "x…" not urgent
+    /// until `late` is set (its topic's turn ends while it waits), the rest not. Returns the order they got slots in.
+    fn line_up(who: &[&'static str], late: impl FnOnce(&std::sync::atomic::AtomicBool)) -> Vec<&'static str> {
+        use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
+        queue().next = Some(Instant::now() + Duration::from_millis(400));
+        queue().urgent_run = 0;
+        let (got, flag) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
+        let hs: Vec<_> = who.iter().map(|w| {
+            let (g, f, w) = (got.clone(), flag.clone(), *w);
+            let h = std::thread::spawn(move || {
+                let ok = match w.as_bytes()[0] { b'u' => slot(true), b'x' => with_urgency(move || f.load(Ordering::SeqCst), || slot(true)), _ => with_urgency(|| false, || slot(true)) };
+                assert!(ok);
+                g.lock().unwrap().push(w);
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            h
+        }).collect();
+        late(&flag);
+        for h in hs { h.join().unwrap(); }
+        let v = got.lock().unwrap().clone();
+        v
+    }
+
+    #[test]
+    fn urgent_first() {
+        let _g = crate::store::TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("exterior-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("EXTERIOR_VAR", &dir);
+        crate::store::set_config(&serde_json::json!({"params": {"tg_gap_ms": "100"}}));
+        let none = |_: &std::sync::atomic::AtomicBool| {};
+        // urgent callers overtake the others, but after every STARVE of them one of the others goes
+        assert_eq!(line_up(&["l1", "u1", "u2", "u3", "u4", "u5"], none), vec!["u1", "u2", "u3", "l1", "u4", "u5"]);
+        // the others keep their order of arrival among themselves, and so do the urgent ones
+        assert_eq!(line_up(&["l1", "l2", "u1", "l3", "u2"], none), vec!["u1", "u2", "l1", "l2", "l3"]);
+        // a caller that becomes urgent while it waits goes next
+        assert_eq!(line_up(&["l1", "l2", "x1", "l3"], |f| f.store(true, std::sync::atomic::Ordering::SeqCst)), vec!["x1", "l1", "l2", "l3"]);
+        assert!(queue().waiting.is_empty());
+        // a post that must not wait gets a slot only when it is free
+        queue().next = None;
+        assert!(slot(false));
+        assert!(!slot(false));
+    }
+
+    #[test]
+    fn busy_queue() {
+        let _g = crate::store::TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("exterior-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("EXTERIOR_VAR", &dir);
+        let gap = |ms: &str| crate::store::set_config(&serde_json::json!({"params": {"tg_gap_ms": ms}}));
+        gap("0");
+        assert!(!busy());
+        // three callers waiting: busy when they take 10 s or more to go out
+        queue().next = Some(Instant::now() + Duration::from_secs(60));
+        let hs: Vec<_> = (0..3).map(|_| std::thread::spawn(|| slot(true))).collect();
+        let t = Instant::now();
+        while queue().waiting.len() < 3 && t.elapsed() < Duration::from_secs(5) { std::thread::sleep(Duration::from_millis(10)); }
+        gap("3000");
+        assert!(!busy());
+        gap("4000");
+        assert!(busy());
+        gap("0");
+        queue().next = None;
+        FREED.notify_all();
+        for h in hs { assert!(h.join().unwrap()); }
+        gap("4000");
+        assert!(!busy());
+        // so is a hold from Telegram that long
+        *HOLD.lock().unwrap() = Some(Instant::now() + Duration::from_secs(11));
+        assert!(busy());
+        *HOLD.lock().unwrap() = None;
+        queue().next = None;
     }
 }
