@@ -63,6 +63,8 @@ pub enum Ev {
     Note { tid: String, gen: u64, text: String },
     /// the command picked a concrete account (cc0 → cc6): later restarts use that one
     Resolved { tid: String, gen: u64, name: String },
+    /// claude refused for lack of quota on this account (rate limit "rejected")
+    Exhausted { tid: String, gen: u64, why: String },
     Exited { tid: String, gen: u64, why: String },
 }
 
@@ -221,7 +223,12 @@ impl Agent {
                 if let Some(s) = v["session_id"].as_str() {
                     if s != known { known = s.to_string(); let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: known.clone() }); }
                 }
-                if let Some(t) = claude_note(&v) { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: t }); }
+                if let Some(t) = claude_note(&v) {
+                    if v["type"] == "rate_limit_event" && v["rate_limit_info"]["status"] == "rejected" {
+                        let _ = tx.send(Ev::Exhausted { tid: tid.clone(), gen, why: t.clone() });
+                    }
+                    let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: t });
+                }
                 // a new text block (after a tool call, say) is a new paragraph
                 if v["event"]["type"] == "content_block_start" && v["event"]["content_block"]["type"] == "text" { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
                 if let Some(d) = v["event"]["delta"]["text"].as_str() { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() }); }

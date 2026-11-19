@@ -38,6 +38,17 @@ pub mod status {
 pub const MENU_STOP: &str = "停止当前回合";
 pub const MENU_EXIT: &str = "结束当前会话，下一条消息将开启新会话";
 pub const MENU_AGENT: &str = "切换 agent";
+pub const MENU_ACCOUNT: &str = "claude · 换账号继续当前会话";
+pub fn exhausted(acct: &str, why: &str) -> String { format!("{acct} 的额度已用完：{why}。可以换一个账号继续当前会话，上一条消息会自动重发；也可以等额度重置。") }
+pub fn choose_account(cur: &str, age_min: u64) -> String { format!("当前账号 {cur}。选择要换到的账号（用量是 {age_min} 分钟前的数据）：") }
+pub const NO_ACCOUNTS: &str = "没有其他可用的 claude 账号。";
+pub fn accounts_failed(e: &str) -> String { format!("读不到各账号的用量：{e}") }
+pub fn account_label(n: &str, h5: &str, d7: &str) -> String { format!("cc{n} · 5h {h5}% · 7d {d7}%") }
+pub fn no_such_account(a: &str) -> String { format!("没有名为 {a} 的 claude 账号。") }
+pub fn already_account(a: &str) -> String { format!("当前已在使用 {a}。") }
+pub fn account_switched(a: &str) -> String { format!("已换到 {a}，会话保持不变。") }
+pub fn account_switched_resend(a: &str) -> String { format!("已换到 {a}，会话保持不变，正在重发上一条消息。") }
+pub fn account_copy_failed(e: &str) -> String { format!("换账号失败，会话记录复制不过去：{e}") }
 
 pub fn builtin_desc(agent: &str, name: &str) -> String {
     let what = match name {

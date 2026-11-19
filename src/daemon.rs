@@ -172,7 +172,7 @@ fn start_agent(s: &mut Session, tx: &Sender<Ev>) -> Result<(), String> {
     let kind = Kind::parse(row["kind"].as_str().unwrap_or("")).ok_or(text::BAD_KIND)?;
     let resume = n["session"].as_str().map(String::from);
     // cc0 picked cc6 last time: the session lives in cc6, so resume through cc6
-    let run_row = if resume.is_some() { n["resolved"].as_str().and_then(|r| store::agent(&dev, r)).unwrap_or(row.clone()) } else { row.clone() };
+    let run_row = n["resolved"].as_str().and_then(|r| store::agent(&dev, r)).unwrap_or(row.clone());
     s.gen += 1;
     let global = s.dir == crate::prompt::global_dir(&dev);
     let prompt = crate::prompt::session_text(&dev, &s.name, &s.tid, &s.dir, global)?;
@@ -193,6 +193,9 @@ pub fn build_menu() -> Result<usize, String> {
         json!({"command": "exit", "description": text::MENU_EXIT}),
         json!({"command": "agent", "description": text::MENU_AGENT}),
     ];
+    if dev["agents"].as_array().into_iter().flatten().any(|a| a["kind"] == Kind::Claude.name()) {
+        cmds.push(json!({"command": "cc_account", "description": text::MENU_ACCOUNT}));
+    }
     for (k, n) in agents::BUILTINS {
         if dev["agents"].as_array().into_iter().flatten().any(|a| a["kind"] == k.name()) {
             cmds.push(json!({"command": agents::builtin_command(*k, n), "description": text::builtin_desc(k.label(), n)}));
@@ -273,6 +276,19 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 }
                 if !body.trim().is_empty() && error.is_none() { store::note_set(&tid, "last_answer", json!(body)); }
                 if current(&tid, gen) {
+                    let n = store::note(&tid);
+                    if let Some(why) = n["exhausted"].as_str() {
+                        // out of quota: offer the other accounts; the message is kept and re-sent after the switch
+                        store::note_set(&tid, "retry_msg", n["turn_msg"].clone());
+                        store::note_set(&tid, "exhausted", Value::Null);
+                        let acct = n["resolved"].as_str().or(n["agent"].as_str()).unwrap_or("").to_string();
+                        let (own, sessions, tid, why) = (own.clone(), sessions.clone(), tid.clone(), why.to_string());
+                        std::thread::spawn(move || {
+                            let dev = store::note(&tid)["device"].as_str().and_then(store::device);
+                            let b = dev.and_then(|d| account_buttons(&d, &acct).ok()).map(|(_, b)| b);
+                            send_with(&own, &sessions, &tid, &text::sys_warn(&text::exhausted(&acct, &why)), b);
+                        });
+                    }
                     set_status(&tid, if error.is_some() { st::ERROR } else { st::IDLE });
                     store::note_set(&tid, "last_error", error.map(Value::String).unwrap_or(Value::Null));
                     store::note_set(&tid, "from", Value::Null);
@@ -290,6 +306,9 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                     if gen > o.gen { *o = fresh(gen); }
                     settle(o); o.said.push(text::note(&t)); o.since.get_or_insert(Instant::now());
                 }
+            }
+            Ev::Exhausted { tid, gen, why } => {
+                if current(&tid, gen) { store::note_set(&tid, "exhausted", json!(why)); }
             }
             Ev::Resolved { tid, gen, name } => {
                 if current(&tid, gen) { store::note_set(&tid, "resolved", json!(name)); }
@@ -456,6 +475,48 @@ fn run(sessions: Sessions) {
     }
 }
 
+/// The other claude accounts with their usage, as buttons that switch to them.
+fn account_buttons(dev: &Value, cur: &str) -> Result<(String, Value), String> {
+    let path = params::get("cc_usage");
+    let raw = crate::host::run(dev, &format!("cat {path}"), 20).map_err(|e| text::accounts_failed(&e))?;
+    let mut age = 0;
+    let mut items = Vec::new();
+    for l in raw.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if l.starts_with('#') { if let Some(t) = f.last().and_then(|t| t.parse::<u64>().ok()) { age = store::now().saturating_sub(t) / 60; } continue; }
+        if f.len() < 4 || f[3] != "ok" || format!("cc{}", f[0]) == cur { continue; }
+        if store::agent(dev, &format!("cc{}", f[0])).is_none() { continue; }
+        items.push((text::account_label(f[0], f[1], f[2]), format!("/cc_account {}", f[0])));
+    }
+    if items.is_empty() { return Err(text::NO_ACCOUNTS.into()); }
+    Ok((text::choose_account(cur, age), buttons(in_rows(items, 1))))
+}
+
+/// Move the topic's claude session from one account to another (copy its record, which lives in the account's
+/// own config folder), resume it there, and re-send the message that ran out of quota, if any.
+fn switch_account(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, dev: Option<Value>, from: &str, to: &str, sid: Option<String>) {
+    let Some(dev) = dev else { send(own, sessions, chat, &text::sys_warn(text::NO_DEVICE)); return };
+    if let Some(id) = &sid {
+        let dir = |name: &str| params::get("claude_dir").replace("{name}", name);
+        let script = format!("f=$(ls {src}/projects/*/{id}.jsonl 2>/dev/null | head -1); [ -n \"$f\" ] || {{ echo 'no record of {id} under {src}'; exit 3; }}; \
+             d={dst}/projects/$(basename \"$(dirname \"$f\")\"); mkdir -p \"$d\" && cp \"$f\" \"$d/\" && {{ [ ! -d \"${{f%.jsonl}}\" ] || cp -R \"${{f%.jsonl}}\" \"$d/\"; }}",
+             src = dir(from), dst = dir(to));
+        if let Err(e) = crate::host::run(&dev, &script, 60) { send(own, sessions, chat, &text::sys_warn(&text::account_copy_failed(&e))); return; }
+    }
+    store::note_set(chat, "resolved", json!(to));
+    store::log(&format!("{chat}: account {from} -> {to}"));
+    let retry = store::note(chat)["retry_msg"].as_str().map(String::from);
+    store::note_set(chat, "retry_msg", Value::Null);
+    match retry {
+        Some(m) => {
+            send(own, sessions, chat, &text::sys(&text::account_switched_resend(to)));
+            let line = if m.starts_with('/') { m } else { text::resent(&m) };
+            handle(sessions, own, tx, chat, &line);
+        }
+        None => { send(own, sessions, chat, &text::sys(&text::account_switched(to))); }
+    }
+}
+
 /// Topics whose turn was cut off when the agent's process went away (device rebooted, network dropped): once the
 /// device answers again, send the message again. One check at a time, in the background.
 fn retry_waiting(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
@@ -597,6 +658,31 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                         None => { set_status(chat, st::NEW); reply = Some(text::switched_agent(&want)); }
                         Some(p) => { store::note_set(chat, "from", json!(p)); transfer = Some((p, want.clone())); }
                     }
+                }
+            }
+        } else if head == "/cc_account" {
+            let acct = n["resolved"].as_str().unwrap_or(&cur).to_string();
+            if cur_kind != Some(Kind::Claude) { reply = Some(text::wrong_agent(Kind::Claude.label(), &cur)); }
+            else if arg.is_empty() {
+                let (own, sessions, chat, d) = (own.clone(), sessions.clone(), chat.to_string(), dev.clone());
+                std::thread::spawn(move || {
+                    let r = d.ok_or_else(|| text::NO_DEVICE.to_string()).and_then(|d| account_buttons(&d, &acct));
+                    match r {
+                        Ok((t, b)) => { send_with(&own, &sessions, &chat, &text::sys(&t), Some(b)); }
+                        Err(e) => { send(&own, &sessions, &chat, &text::sys_warn(&e)); }
+                    }
+                });
+            } else {
+                let want = if arg.starts_with("cc") { arg.clone() } else { format!("cc{arg}") };
+                if dev.as_ref().and_then(|d| store::agent(d, &want)).is_none() { reply = Some(text::no_such_account(&want)); }
+                else if want == acct { reply = Some(text::already_account(&want)); }
+                else {
+                    if let Some(a) = s.agent.as_mut() { a.stop(); a.kill(); }
+                    s.agent = None; s.gen += 1; s.pending = false;
+                    set_status(chat, st::STOPPED);
+                    let (own, sessions, tx, chat, d) = (own.clone(), sessions.clone(), tx.clone(), chat.to_string(), dev.clone());
+                    let sid = n["session"].as_str().map(String::from);
+                    std::thread::spawn(move || switch_account(&sessions, &own, &tx, &chat, d, &acct, &want, sid));
                 }
             }
         } else if let Some(kind) = own_prefix {
