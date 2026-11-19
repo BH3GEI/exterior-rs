@@ -87,17 +87,23 @@ fn send_with(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Optio
 }
 
 fn send_one(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Option<Value>) -> Option<u64> {
-    for _ in 0..params::num("send_retries").max(1) {
+    // a network error or a server error is not a reason to drop the message: try again until it is delivered
+    // (the only things that end it: delivered, topic deleted, or a refusal that retrying cannot change)
+    let mut tries = 0u64;
+    loop {
         let mut body = json!({"chat": chat, "text": text});
         if let Some(b) = &btns { body["buttons"] = b.clone(); }
         match brief::tg_post("/api/send", body, true) {
             Ok(v) => { let id = v["id"].as_u64(); if let Some(i) = id { own.lock().unwrap().insert(i); } return id; }
             Err((410, _)) => { gone(sessions, chat); return None; }
-            Err((c, v)) if c == 0 || c >= 500 => { store::log(&format!("send {chat}: {c} {v}; retry")); std::thread::sleep(params::secs("retry_wait_s")); }
+            Err((c, v)) if c == 0 || c >= 500 => {
+                tries += 1;
+                if tries == 1 || tries % 20 == 0 { store::log(&format!("send {chat}: {c} {v}; retrying (attempt {tries})")); }
+                std::thread::sleep(params::secs("retry_wait_s"));
+            }
             Err((c, v)) => { store::log(&format!("send {chat} failed {c} {v}")); return None; }
         }
     }
-    None
 }
 
 /// The topic was deleted in Telegram: close the session, delete nothing.

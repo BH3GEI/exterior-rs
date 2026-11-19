@@ -99,15 +99,13 @@ fn held() -> bool { HOLD.lock().unwrap().map(|u| u > std::time::Instant::now()).
 
 /// Post something that ends up in Telegram (send, edit). On 429 every later post waits out retry_after.
 /// `wait`: wait and retry (for anything that must arrive); otherwise give up at once (live updates,
-/// the next one carries the same text anyway). Waiting stops after ratelimit_max_s in total.
+/// the next one carries the same text anyway). A message that must arrive waits as long as Telegram says.
 pub fn tg_post(path: &str, body: Value, wait: bool) -> Result<Value, (u16, Value)> {
     use std::time::{Duration, Instant};
-    let start = Instant::now();
-    let cap = crate::params::secs("ratelimit_max_s");
     loop {
         let until = *HOLD.lock().unwrap();
         if let Some(u) = until { let now = Instant::now(); if u > now {
-            if !wait || start.elapsed() + (u - now) > cap { return Err((429, serde_json::json!({"error": "rate_limited", "held": true}))); }
+            if !wait { return Err((429, serde_json::json!({"error": "rate_limited", "held": true}))); }
             std::thread::sleep(u - now);
         } }
         if !slot(wait) { return Err((429, serde_json::json!({"error": "queued", "held": true}))); }
@@ -117,7 +115,7 @@ pub fn tg_post(path: &str, body: Value, wait: bool) -> Result<Value, (u16, Value
                 let u = Instant::now() + Duration::from_secs(ra);
                 { let mut h = HOLD.lock().unwrap(); if h.map(|x| x < u).unwrap_or(true) { *h = Some(u); } }
                 crate::store::log(&format!("{path}: Telegram rate limit, holding {ra}s{}", if wait { ", will retry" } else { "" }));
-                if !wait || start.elapsed() + Duration::from_secs(ra) > cap { return Err((429, v)); }
+                if !wait { return Err((429, v)); }
             }
             r => return r,
         }
