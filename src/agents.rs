@@ -233,6 +233,9 @@ impl Agent {
         std::thread::spawn(move || {
             let mut known = String::new();
             let mut tools: HashMap<String, (String, Value)> = HashMap::new();
+            // text that arrived piece by piece since the last whole message; a command's own output (/goal…) comes
+            // only as a whole message, and must not be lost
+            let mut streamed = false;
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                 if v["type"] == "control_response" {
@@ -251,6 +254,9 @@ impl Agent {
                         match b["type"].as_str() {
                             Some("thinking") => if let Some(t) = b["thinking"].as_str().filter(|t| !t.trim().is_empty()) { step(text::THINKING.into(), t.trim().to_string()); },
                             Some("redacted_thinking") => step(text::THINKING.into(), text::THINKING_HIDDEN.into()),
+                            Some("text") if !streamed && quiet.load(std::sync::atomic::Ordering::SeqCst) == 0 => if let Some(t) = b["text"].as_str().filter(|t| !t.trim().is_empty()) {
+                                let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: format!("\n\n{t}") });
+                            },
                             Some("tool_use") => { tools.insert(b["id"].as_str().unwrap_or("").to_string(), (b["name"].as_str().unwrap_or("?").to_string(), b["input"].clone())); }
                             _ => {}
                         }
@@ -275,7 +281,8 @@ impl Agent {
                 }
                 // a new text block (after a tool call, say) is a new paragraph
                 if v["event"]["type"] == "content_block_start" && v["event"]["content_block"]["type"] == "text" { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
-                if let Some(d) = v["event"]["delta"]["text"].as_str() { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() }); }
+                if let Some(d) = v["event"]["delta"]["text"].as_str() { streamed = true; let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() }); }
+                if v["type"] == "assistant" { streamed = false; }
                 if v["type"] == "result" && quiet.load(std::sync::atomic::Ordering::SeqCst) > 0 {
                     quiet.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     continue;
