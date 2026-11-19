@@ -17,6 +17,7 @@ pub const PARAMS: &[Param] = &[
     Param { key: "codex_approval", label: "codex 的审批策略（approvalPolicy）", default: "never" },
     Param { key: "codex_sandbox", label: "codex 的沙箱模式（sandbox）", default: "danger-full-access" },
     Param { key: "ack_emoji", label: "收到消息时添加的回应表情", default: "👀" },
+    Param { key: "wait_hours", label: "agent 中断后，最多等设备恢复多少小时再自动续上", default: "24" },
     Param { key: "idle_hours", label: "会话空闲多少小时后关闭进程", default: "2" },
     Param { key: "pause_ms", label: "agent 停顿多久算说完一段（毫秒）", default: "2000" },
     Param { key: "merge_s", label: "同一话题多少秒内说的话合并成一条发送", default: "10" },

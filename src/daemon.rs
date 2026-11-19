@@ -312,7 +312,17 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                         store::log(&format!("agent exited mid-turn in {tid}: {why}"));
                         set_status(&tid, st::ERROR);
                         store::note_set(&tid, "last_error", json!(why));
-                        send(&own, &sessions, &tid, &text::exited(&why));
+                        // the device may have rebooted or dropped off the network: keep the message and carry on
+                        // once it answers again (see retry_waiting); only once per turn, like after a restart
+                        let n = store::note(&tid);
+                        match n["turn_msg"].as_str().filter(|_| n["turn_resent"] != json!(true)) {
+                            Some(m) => {
+                                store::note_set(&tid, "wait_msg", json!(m));
+                                store::note_set(&tid, "wait_since", json!(store::now()));
+                                send(&own, &sessions, &tid, &text::exited_waiting(&why));
+                            }
+                            None => { send(&own, &sessions, &tid, &text::exited(&why)); }
+                        }
                     } else if store::note(&tid)["status"] != st::DELETED {
                         set_status(&tid, st::STOPPED);
                     }
@@ -391,6 +401,7 @@ fn run(sessions: Sessions) {
         if refreshed.elapsed() > params::secs("refresh_s") {
             refresh(&sessions);
             refreshed = Instant::now();
+            retry_waiting(&sessions, &own, &tx);
             let idle = Duration::from_secs(params::num("idle_hours") * 3600);
             for s in sessions.lock().unwrap().values_mut() {
                 if s.agent.is_some() && !s.pending && s.active.elapsed() > idle {
@@ -438,10 +449,45 @@ fn run(sessions: Sessions) {
                 text = with_file(&sessions, &chat, id, &m["media"], &text);
             }
             store::note_set(&chat, "turn_resent", Value::Null);
+            store::note_set(&chat, "wait_msg", Value::Null);
             handle(&sessions, &own, &tx, &chat, &text);
         }
         store::set_state("last_id", json!(last));
     }
+}
+
+/// Topics whose turn was cut off when the agent's process went away (device rebooted, network dropped): once the
+/// device answers again, send the message again. One check at a time, in the background.
+fn retry_waiting(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let waiting: Vec<Value> = store::notes().into_iter().filter(|n| n["wait_msg"].is_string() && n["deleted"] != true).collect();
+    if waiting.is_empty() || BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+    let (sessions, own, tx) = (sessions.clone(), own.clone(), tx.clone());
+    std::thread::spawn(move || {
+        let max = params::num("wait_hours") * 3600;
+        let mut up: HashMap<String, bool> = HashMap::new();
+        for n in waiting {
+            let tid = n["topic"].as_str().unwrap_or("").to_string();
+            let msg = n["wait_msg"].as_str().unwrap_or("").to_string();
+            if store::now().saturating_sub(n["wait_since"].as_u64().unwrap_or(0)) > max {
+                store::log(&format!("{}: device did not come back in time, giving up", n["name"]));
+                store::note_set(&tid, "wait_msg", Value::Null);
+                continue;
+            }
+            let dev = n["device"].as_str().unwrap_or("").to_string();
+            let ok = *up.entry(dev.clone()).or_insert_with(|| store::device(&dev).map(|d| crate::host::run(&d, "true", 30).is_ok()).unwrap_or(false));
+            if !ok { continue; }
+            // the user may have moved on in the meantime: then his newer message stands, nothing to repeat
+            if store::note(&tid)["wait_msg"].as_str() != Some(msg.as_str()) { continue; }
+            store::note_set(&tid, "wait_msg", Value::Null);
+            store::log(&format!("{}: device back, resending", n["name"]));
+            send(&own, &sessions, &tid, text::DEVICE_BACK);
+            let line = if msg.starts_with('/') { msg } else { text::resent(&msg) };
+            handle(&sessions, &own, &tx, &tid, &line);
+            store::note_set(&tid, "turn_resent", json!(true));
+        }
+        BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 /// The global topic: created as the user (brief does it with his account, since only his topics are adopted

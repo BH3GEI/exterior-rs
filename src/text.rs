@@ -66,6 +66,11 @@ pub const RESTART_RESEND: &str = "exterior 重启打断了本回合，已自动�
 /// what the agent gets when its turn is re-sent after a restart
 pub fn resent(msg: &str) -> String { format!("（exterior 重启打断了上一回合，下面是同一条消息，请接着处理，已做完的部分不必重做。）\n\n{msg}") }
 
+pub fn exited_waiting(why: &str) -> String {
+    let tail = if why.is_empty() { String::new() } else { format!("\n\n{why}") };
+    format!("{WARN} agent 进程中断（可能是设备重启或断网）。设备恢复后会自动接着处理上一条消息，不必重发。{tail}")
+}
+pub const DEVICE_BACK: &str = "设备已恢复，正在接着处理上一条消息。";
 pub fn exited(why: &str) -> String {
     let tail = if why.is_empty() { String::new() } else { format!("\n\n{why}") };
     format!("{WARN} agent 进程意外退出。下一条消息将恢复原会话。{tail}")
