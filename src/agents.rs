@@ -200,6 +200,7 @@ impl Agent {
         let (tx, tid, gen, child, busy, pending) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone());
         std::thread::spawn(move || {
             let mut last_text: Option<String> = None;
+            let mut last_err: Option<String> = None;
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                 if v["type"] == "response" && route(&pending, v["id"].as_str().map(String::from), &v) { continue; }
@@ -212,10 +213,16 @@ impl Agent {
                         let t: String = v["message"]["content"].as_array().into_iter().flatten()
                             .filter(|c| c["type"] == "text").filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("");
                         if !t.is_empty() { last_text = Some(t); }
+                        if v["message"]["stopReason"] == "error" {
+                            let m = v["message"]["errorMessage"].as_str().unwrap_or("模型出错了");
+                            let inner = serde_json::from_str::<Value>(m.splitn(2, ' ').nth(1).unwrap_or("")).ok()
+                                .and_then(|j| j["error"]["message"].as_str().map(String::from));
+                            last_err = Some(match inner { Some(i) => format!("{} {i}", m.split(' ').next().unwrap_or("")), None => m.chars().take(300).collect() });
+                        } else { last_err = None; }
                     }
                     Some("agent_settled") => {
                         *busy.lock().unwrap() = false;
-                        let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: last_text.take(), stopped: v["aborted"] == true, error: None });
+                        let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: last_text.take(), stopped: v["aborted"] == true, error: last_err.take() });
                     }
                     Some("response") if v["success"] == false => {
                         *busy.lock().unwrap() = false;
