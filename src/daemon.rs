@@ -249,16 +249,12 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
     fn take(o: &mut Out) -> Vec<String> { o.since = None; if !o.said.is_empty() { o.spoke = true; } text::pack(std::mem::take(&mut o.said)) }
     let mut outs: HashMap<String, Out> = HashMap::new();
     loop {
-        let ev = match rx.recv_timeout(Duration::from_millis(500)) { Ok(e) => Some(e), Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None, Err(_) => return };
-        let (pause, merge) = (Duration::from_millis(params::num("pause_ms")), params::secs("merge_s"));
-        let mut due = Vec::new();
-        for (tid, o) in outs.iter_mut() {
-            if !o.buf.is_empty() && o.last.elapsed() > pause { settle(o); }
-            if o.since.map(|s| s.elapsed() >= merge).unwrap_or(false) { due.push((tid.clone(), take(o))); }
-        }
-        for (tid, msgs) in due { for t in msgs { send(&own, &sessions, &tid, &t); } }
-        let Some(ev) = ev else { continue };
+        // take in everything that has arrived, so no backlog builds up while a send waits for its slot
+        let mut batch = Vec::new();
+        match rx.recv_timeout(Duration::from_millis(500)) { Ok(e) => batch.push(e), Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}, Err(_) => return }
+        while let Ok(e) = rx.try_recv() { batch.push(e); }
         let current = |tid: &str, gen: u64| sessions.lock().unwrap().get(tid).map(|s| s.gen == gen).unwrap_or(false);
+        for ev in batch {
         match ev {
             Ev::Text { tid, gen, delta } => {
                 let o = outs.entry(tid).or_insert_with(|| fresh(gen));
@@ -363,6 +359,22 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                         set_status(&tid, st::STOPPED);
                     }
                 }
+            }
+        }
+        }
+        // then one message at most: the topic whose words have waited longest. Under load each topic's text simply
+        // grows until its turn, so the total stays within the queue's rate however much the agents say.
+        let (pause, merge) = (Duration::from_millis(params::num("pause_ms")), params::secs("merge_s"));
+        for o in outs.values_mut() { if !o.buf.is_empty() && o.last.elapsed() > pause { settle(o); } }
+        let next = outs.iter().filter_map(|(t, o)| o.since.filter(|s| s.elapsed() >= merge).map(|s| (s, t.clone()))).min().map(|x| x.1);
+        if let Some(tid) = next {
+            let o = outs.get_mut(&tid).unwrap();
+            let mut msgs = take(o);
+            if !msgs.is_empty() {
+                let first = msgs.remove(0);
+                // what did not fit stays first in line for this topic
+                if !msgs.is_empty() { o.said = msgs; o.since = Some(Instant::now() - merge); }
+                send(&own, &sessions, &tid, &first);
             }
         }
     }
