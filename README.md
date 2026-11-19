@@ -39,7 +39,7 @@ agent 的报错、重试、用量限制、模型切换等情况都会在话题�
 
 ## 启动说明与 knowledge
 
-exterior 不在程序中保存任何发给 agent 的文字。启动 agent 时，它从设备上的 knowledge 目录读取说明文件（默认 `knowledge/rules/exterior-session.md`，「全局」话题另加 `rules/exterior-global.md`），填入话题名、文件夹等信息后交给 agent。agent 在 knowledge 中查阅和修改关于用户的信息；每个回合结束后，exterior 提交并推送 knowledge 中的修改。
+exterior 不在程序中保存任何发给 agent 的文字。启动 agent 时，它从设备上的 knowledge 目录读取说明文件（默认 `knowledge/exterior-session.md`，「全局」话题另加 `exterior-global.md`），填入话题名、文件夹等信息后交给 agent。agent 在 knowledge 中查阅和修改关于用户的信息；每个回合结束后，exterior 提交并推送 knowledge 中的修改。
 
 名为「全局」的话题由 exterior 在启动时通过 brief 以用户账号创建并置顶，用于一般性交流和询问各话题进展。
 
