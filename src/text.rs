@@ -54,6 +54,8 @@ pub const WARN: &str = "⚠️";
 /// exterior's own notices, set apart from what the agent says: small grey text (a rich message footer).
 pub fn sys(t: &str) -> String { footer("⚙️", t) }
 pub fn sys_warn(t: &str) -> String { footer(WARN, t) }
+/// a reply of exterior's own, as a notice unless it already is one
+pub fn as_sys(t: &str) -> String { if t.starts_with("<footer>") { t.to_string() } else { sys(t) } }
 fn footer(icon: &str, t: &str) -> String {
     let t = t.trim().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('\n', "<br>");
     format!("<footer>{icon} exterior · {t}</footer>")

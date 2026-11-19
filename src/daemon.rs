@@ -530,6 +530,7 @@ fn agent_names(dev: &str) -> Vec<String> {
 fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str) {
     let mut reply: Option<String> = None;
     let mut reply_buttons: Option<Value> = None;
+    let mut reply_raw = false;
     let mut transfer: Option<(String, String)> = None;
     let mut ctl: Option<(agents::Ctl, Kind, &'static str, String)> = None;
     {
@@ -564,7 +565,7 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                 set_status(chat, st::STOPPED);
                 reply = Some(text::QUIT.into());
             } else if name == "copy" && k == Kind::Codex {
-                reply = Some(n["last_answer"].as_str().filter(|a| !a.trim().is_empty()).unwrap_or(text::NOTHING_TO_COPY).to_string());
+                match n["last_answer"].as_str().filter(|a| !a.trim().is_empty()) { Some(a) => { reply = Some(a.to_string()); reply_raw = true; } None => reply = Some(text::NOTHING_TO_COPY.into()) }
             } else {
                 if s.agent.is_none() {
                     if let Err(e) = start_agent(s, tx) { reply = Some(text::start_failed(&cur, &e)); }
@@ -639,7 +640,7 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
         }
     }
     if let Some((_, want)) = &transfer { send(own, sessions, chat, &text::sys(&text::transferring(want))); }
-    if let Some(r) = reply { send_with(own, sessions, chat, &r, reply_buttons); }
+    if let Some(r) = reply { let r = if reply_raw { r } else { text::as_sys(&r) }; send_with(own, sessions, chat, &r, reply_buttons); }
     if let Some((c, kind, name, arg)) = ctl {
         let (own, sessions, chat) = (own.clone(), sessions.clone(), chat.to_string());
         std::thread::spawn(move || {
@@ -652,21 +653,24 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             }
             match a.file {
                 Some((name, data)) => {
-                    let r = brief::tg_post("/api/send_file", json!({"chat": chat, "name": name, "data": brief::base64(&data), "text": a.text}), true);
+                    let r = brief::tg_post("/api/send_file", json!({"chat": chat, "name": name, "data": brief::base64(&data), "text": text::as_sys(&a.text)}), true);
                     if let Err((c, v)) = r { send_with(&own, &sessions, &chat, &text::failed(&format!("{c} {v}")), None); }
                 }
-                None => { send_with(&own, &sessions, &chat, &a.text, a.buttons); }
+                None => { let t = if a.raw { a.text.clone() } else { text::as_sys(&a.text) }; send_with(&own, &sessions, &chat, &t, a.buttons); }
             }
         });
     }
 }
 
 /// What a built-in command answers in the topic, and what it changed.
-struct Answer { text: String, buttons: Option<Value>, session: Option<String>, started: bool, file: Option<(String, Vec<u8>)> }
+/// raw: the text is content the agent produced (a diff, a copied answer, a listing), shown as is; otherwise it is
+/// exterior's own reply and is shown as a notice.
+struct Answer { text: String, buttons: Option<Value>, session: Option<String>, started: bool, file: Option<(String, Vec<u8>)>, raw: bool }
 
 impl Answer {
-    fn say(t: impl Into<String>) -> Answer { Answer { text: t.into(), buttons: None, session: None, started: false, file: None } }
-    fn choose(t: impl Into<String>, b: Value) -> Answer { Answer { text: t.into(), buttons: Some(b), session: None, started: false, file: None } }
+    fn say(t: impl Into<String>) -> Answer { Answer { text: t.into(), buttons: None, session: None, started: false, file: None, raw: false } }
+    fn raw(t: impl Into<String>) -> Answer { Answer { raw: true, ..Answer::say(t) } }
+    fn choose(t: impl Into<String>, b: Value) -> Answer { Answer { buttons: Some(b), ..Answer::say(t) } }
 }
 
 /// The agents' own commands that go through the protocol (agents::BUILTINS), answered without holding the sessions lock.
@@ -704,13 +708,13 @@ fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> An
                     "rename" => Answer::say(text::renamed(arg)),
                     "clone" => Answer::say(text::cloned(d["_session"].as_str().unwrap_or("—"))),
                     "archive" => Answer::say(text::archived(d["_session"].as_str().unwrap_or("—"))),
-                    "copy" => Answer::say(d["text"].as_str().filter(|t| !t.trim().is_empty()).unwrap_or(text::NOTHING_TO_COPY)),
+                    "copy" => Answer::raw(d["text"].as_str().filter(|t| !t.trim().is_empty()).unwrap_or(text::NOTHING_TO_COPY)),
                     "logout" => Answer::say(text::LOGGED_OUT),
                     "goal" if arg == "clear" => Answer::say(text::GOAL_CLEARED),
                     "goal" if !arg.is_empty() => Answer::say(text::goal_set(arg)),
                     "diff" => {
                         let out = d["stdout"].as_str().unwrap_or("").trim().to_string();
-                        Answer::say(if out.is_empty() { text::NO_DIFF.to_string() } else { out })
+                        if out.is_empty() { Answer::say(text::NO_DIFF) } else { Answer::raw(out) }
                     }
                     "resume" if arg.is_empty() && kind == Kind::Pi => {
                         let dir = d["_dir"].as_str().unwrap_or("");
@@ -735,7 +739,7 @@ fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> An
                         a.file = Some((name, body.into_bytes()));
                         a
                     }
-                    "session" => Answer::say(text::session_stats(&d)),
+                    "session" => Answer::raw(text::session_stats(&d)),
                     "export" => Answer::say(text::exported(d["path"].as_str().unwrap_or("—"))),
                     "fork" if arg.is_empty() && kind == Kind::Pi => {
                         let items: Vec<(String, String)> = d["messages"].as_array().into_iter().flatten().filter_map(|m| {
@@ -744,8 +748,8 @@ fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> An
                         if items.is_empty() { Answer::say(text::NO_FORK_POINTS) } else { Answer::choose(text::CHOOSE_FORK, choice_buttons(chat, &cmd, items, 1)) }
                     }
                     "fork" if d["cancelled"] == true => Answer::say(text::FORK_CANCELLED),
-                    "fork" => Answer::say(text::forked(d["text"].as_str().unwrap_or(""))),
-                    "status" if kind == Kind::Codex => Answer::say(text::codex_status(d["_model"].as_str().unwrap_or(text::DEFAULT_MODEL), &d["rateLimits"])),
+                    "fork" => Answer::raw(text::forked(d["text"].as_str().unwrap_or(""))),
+                    "status" if kind == Kind::Codex => Answer::raw(text::codex_status(d["_model"].as_str().unwrap_or(text::DEFAULT_MODEL), &d["rateLimits"])),
                     "review" => {
                         let t = agents::review_target(arg);
                         let v = t["sha"].as_str().or(t["branch"].as_str()).unwrap_or("");
@@ -754,7 +758,7 @@ fn control(c: &agents::Ctl, chat: &str, kind: Kind, name: &str, arg: &str) -> An
                         a
                     }
                     // the commands that only show information
-                    _ => Answer::say(text::show(&d)),
+                    _ => Answer::raw(text::show(&d)),
                 };
                 a.session = d["_session"].as_str().map(String::from);
                 a
