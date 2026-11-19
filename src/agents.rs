@@ -203,6 +203,11 @@ impl Agent {
         let (out, last) = self.spawn(args)?;
         let (tx, tid, gen, child, busy, pending, info) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone(), self.info.clone());
         let interrupted = self.interrupted.clone();
+        // effort auto (the default) has no command-line form: it is set with "/effort auto" right after start,
+        // and the answer to that is swallowed
+        let auto = self.spec.effort.as_deref().map(|e| e == "auto").unwrap_or(true);
+        let silent = Arc::new(std::sync::atomic::AtomicU64::new(auto as u64));
+        let quiet = silent.clone();
         std::thread::spawn(move || {
             let mut known = String::new();
             for line in BufReader::new(out).lines().map_while(Result::ok) {
@@ -220,6 +225,10 @@ impl Agent {
                 // a new text block (after a tool call, say) is a new paragraph
                 if v["event"]["type"] == "content_block_start" && v["event"]["content_block"]["type"] == "text" { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
                 if let Some(d) = v["event"]["delta"]["text"].as_str() { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() }); }
+                if v["type"] == "result" && quiet.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    quiet.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    continue;
+                }
                 if v["type"] == "result" {
                     *busy.lock().unwrap() = false;
                     let sub = v["subtype"].as_str().unwrap_or("");
@@ -239,6 +248,9 @@ impl Agent {
         });
         // ask for the commands and models once, right away
         put(&self.stdin, &json!({"type": "control_request", "request_id": "init", "request": {"subtype": "initialize"}}))?;
+        if silent.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            put(&self.stdin, &json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "/effort auto"}]}}))?;
+        }
         Ok(())
     }
 

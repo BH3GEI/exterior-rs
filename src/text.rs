@@ -58,7 +58,7 @@ pub const NOTHING_RUNNING: &str = "当前没有正在执行的任务。";
 pub const CHOOSE_MODEL: &str = "请选择模型：";
 pub const NO_MODELS: &str = "该 agent 没有可选的模型。";
 pub const CHOOSE_THINKING: &str = "请选择思考强度：";
-pub fn choose_effort(cur: Option<&str>) -> String { format!("请选择 effort（当前：{}）：", cur.unwrap_or("默认")) }
+pub fn choose_effort(cur: Option<&str>) -> String { format!("请选择 effort（当前：{}）：", cur.unwrap_or("auto")) }
 pub const COMPACTED: &str = "上下文已压缩。";
 pub const NEW_SESSION: &str = "已开启新会话。";
 pub const RESTART_CUT: &str = "exterior 重启时本回合尚未完成，请重新发送该消息。";
