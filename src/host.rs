@@ -391,7 +391,7 @@ mod tests {
         let dir = d.join("topic dir");
         let args: Vec<String> = ["plain", "two words", "quote\"inside", "\"wrapped\"", "multi\nline", "中文 text", r"C:\dir with space\", r"back\\slash", "$HOME %PATH% `t 'single'", "end\\"]
             .iter().map(|s| s.to_string()).collect();
-        let py = "python -c \"import sys,os,json; print(json.dumps([sys.argv[1:], os.getcwd(), os.environ.get('EXTERIOR_TOPIC'), os.environ['PATH'].split(';')[0], 'EXTERIOR_ARGS' in os.environ]))\"";
+        let py = "python -c \"import sys,os,json; print(json.dumps([sys.argv[1:], os.getcwd(), os.environ.get('EXTERIOR_TOPIC'), os.environ['PATH'].split(';')[:2], 'EXTERIOR_ARGS' in os.environ]))\"";
         for ps in ["powershell", "pwsh"] {
             if !super::on_path(ps) { continue; }
             std::env::set_var("EXTERIOR_POWERSHELL", ps);
@@ -402,7 +402,8 @@ mod tests {
             // the temporary folder may come back in its short (8.3) form
             assert!(v[1].as_str().unwrap().to_lowercase().ends_with(&format!("exterior-agent-{}\\topic dir", std::process::id())), "{ps}: {}", v[1]);
             assert_eq!(v[2], "t:1");
-            assert_eq!(v[3], r"C:\x\bin");
+            // first (PowerShell 7 puts its own folder in front of everything)
+            assert!(v[3].as_array().unwrap().iter().any(|p| p == r"C:\x\bin"), "{ps}: {}", v[3]);
             assert_eq!(v[4], false);
         }
         std::env::remove_var("EXTERIOR_POWERSHELL");
