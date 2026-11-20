@@ -25,18 +25,28 @@ const SELF_SENDER: &str = "我";
 
 pub fn from_user(m: &Value) -> bool { m["sender"] == SELF_SENDER }
 
-/// One API call. Ok(json) on 2xx, Err((status, json)) otherwise (status 0 = no answer at all).
+/// Uploads are assumed to go at least this fast (1 Mbit/s).
+const UPLOAD_BYTES_PER_S: u64 = 125_000;
+
+/// How long one call may take: brief_timeout_s, and for a body (a file being sent, say) the time it takes to upload
+/// at UPLOAD_BYTES_PER_S on top.
+pub fn time_limit(body_len: usize) -> u64 { crate::params::num("brief_timeout_s") + body_len as u64 / UPLOAD_BYTES_PER_S }
+
+/// One API call. Ok(json) on 2xx, Err((status, json)) otherwise. Status 0: no answer at all; then the json says
+/// whether brief may have got the request anyway ("maybe_sent"): only when curl could not reach it did it surely not.
 pub fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, (u16, Value)> {
     let (base, key) = conf();
     if base.is_empty() || key.is_empty() { return Err((0, Value::String(crate::text::BRIEF_NOT_SET.into()))); }
+    let body = body.map(|b| b.to_string());
     let mut c = Command::new("curl");
-    c.args(["-s", "-m", "70", "-w", "\n%{http_code}", "-X", method, "-H", "@-"]).arg(format!("{base}{path}"));
+    let limit = time_limit(body.as_ref().map_or(0, |b| b.len())).to_string();
+    c.args(["-s", "-m", &limit, "-w", "\n%{http_code}", "-X", method, "-H", "@-"]).arg(format!("{base}{path}"));
     // the body goes through a file: one command-line argument can hold at most 128 KB (a picture is more)
-    let file = body.map(|b| {
+    let file = body.as_ref().map(|b| {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let f = crate::store::path(&format!("tmp/body-{}-{}.json", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
         let _ = std::fs::create_dir_all(crate::store::path("tmp"));
-        (std::fs::write(&f, b.to_string()), f)
+        (std::fs::write(&f, b), f)
     });
     if let Some((w, f)) = &file {
         if let Err(e) = w { return Err((1, Value::String(e.to_string()))); }
@@ -50,12 +60,21 @@ pub fn call(method: &str, path: &str, body: Option<&Value>) -> Result<Value, (u1
     { use std::io::Write; let mut i = ch.stdin.take().unwrap(); let _ = writeln!(i, "Authorization: Bearer {key}"); }
     let out = ch.wait_with_output();
     gone();
-    let out = match out { Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(), Err(_) => return Err((0, Value::Null)) };
-    let (body, code) = out.rsplit_once('\n').unwrap_or(("", "0"));
+    let out = match out { Ok(o) => o, Err(_) => return Err((0, no_answer(body.is_some()))) };
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (answer, code) = text.rsplit_once('\n').unwrap_or(("", "0"));
     let code: u16 = code.trim().parse().unwrap_or(0);
-    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    // 1xx ("100 Continue" for an upload) and nothing after it within the time limit: no answer either
+    if code < 200 {
+        // 6: brief's name not resolved, 7: no connection to it; nothing reached it
+        let reached = !matches!(out.status.code(), Some(6) | Some(7));
+        return Err((0, no_answer(reached && body.is_some())));
+    }
+    let v: Value = serde_json::from_str(answer).unwrap_or(Value::Null);
     if (200..300).contains(&code) { Ok(v) } else { Err((code, v)) }
 }
+
+fn no_answer(maybe_sent: bool) -> Value { serde_json::json!({"error": "no_answer", "maybe_sent": maybe_sent}) }
 
 /// Download a file (e.g. /api/media/<id>) as bytes.
 pub fn download(path: &str) -> Result<Vec<u8>, String> {
@@ -250,24 +269,73 @@ mod tests {
         assert_eq!(call("POST", "/api/send_file", Some(&big)).unwrap()["len"], big.to_string().len());
     }
 
-    /// Callers enter the queue one after another while the next slot is still ahead: "u…" urgent, "x…" not urgent
-    /// until `late` is set (its topic's turn ends while it waits), the rest not. Returns the order they got slots in.
+    #[test]
+    fn upload_without_answer() {
+        use std::io::{Read, Write};
+        let _g = crate::store::TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("exterior-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("EXTERIOR_VAR", &dir);
+        // brief says "100 Continue" to the upload, takes all of it, and answers nothing within the time limit
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            std::thread::spawn(move || {
+                let (mut buf, mut head) = ([0u8; 65536], Vec::new());
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) { Ok(0) | Err(_) => return, Ok(n) => head.extend_from_slice(&buf[..n]) }
+                }
+                let _ = s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+                while let Ok(n) = s.read(&mut buf) { if n == 0 { return; } }
+            });
+        });
+        let conf = |port: u16| crate::store::set_config(&serde_json::json!({"brief": {"url": format!("http://127.0.0.1:{port}"), "key": crate::crypt::seal("k")}, "params": {"brief_timeout_s": "2"}}));
+        conf(port);
+        // the time limit grows with what is uploaded: 1 Mbit/s on top
+        assert_eq!(time_limit(0), 2);
+        assert_eq!(time_limit(50_000_000), 402);
+        let big = serde_json::json!({"data": "A".repeat(300_000)});
+        let t = Instant::now();
+        let (c, v) = call("POST", "/api/send_file", Some(&big)).unwrap_err();
+        assert_eq!((c, &v["maybe_sent"]), (0, &serde_json::json!(true)), "{v}");
+        assert!(t.elapsed() >= Duration::from_secs(4), "gave up after {:?}", t.elapsed());
+        // nobody there at all: the file surely did not go out
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        conf(free);
+        let (c, v) = call("POST", "/api/send_file", Some(&big)).unwrap_err();
+        assert_eq!((c, &v["maybe_sent"]), (0, &serde_json::json!(false)), "{v}");
+    }
+
+    /// Callers enter the queue one after another while it is closed: "u…" urgent, "x…" not urgent until `late` is
+    /// set (its topic's turn ends while it waits), the rest not. Each is in line before the next comes, and the queue
+    /// opens only once they are all in line and every urgent one is known as urgent, so no timing decides the order.
+    /// Returns the order they got slots in.
     fn line_up(who: &[&'static str], late: impl FnOnce(&std::sync::atomic::AtomicBool)) -> Vec<&'static str> {
         use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
-        queue().next = Some(Instant::now() + Duration::from_millis(400));
+        let until = |what: &dyn Fn(&Queue) -> bool| {
+            let t = Instant::now();
+            while !what(&queue()) { assert!(t.elapsed() < Duration::from_secs(30), "queue never got there"); std::thread::sleep(Duration::from_millis(5)); }
+        };
+        queue().next = Some(Instant::now() + Duration::from_secs(3600));
         queue().urgent_run = 0;
         let (got, flag) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)));
-        let hs: Vec<_> = who.iter().map(|w| {
+        let hs: Vec<_> = who.iter().enumerate().map(|(i, w)| {
             let (g, f, w) = (got.clone(), flag.clone(), *w);
             let h = std::thread::spawn(move || {
                 let ok = match w.as_bytes()[0] { b'u' => slot(true), b'x' => with_urgency(move || f.load(Ordering::SeqCst), || slot(true)), _ => with_urgency(|| false, || slot(true)) };
                 assert!(ok);
+                // the next slot is a gap away: there is time to note this one first
                 g.lock().unwrap().push(w);
             });
-            std::thread::sleep(Duration::from_millis(30));
+            until(&|q| q.waiting.len() == i + 1);
             h
         }).collect();
         late(&flag);
+        let urgent = who.iter().filter(|w| w.starts_with('u') || (w.starts_with('x') && flag.load(Ordering::SeqCst))).count();
+        until(&|q| q.waiting.iter().filter(|w| w.1).count() == urgent);
+        queue().next = None;
+        FREED.notify_all();
         for h in hs { h.join().unwrap(); }
         let v = got.lock().unwrap().clone();
         v
@@ -279,7 +347,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("exterior-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("EXTERIOR_VAR", &dir);
-        crate::store::set_config(&serde_json::json!({"params": {"tg_gap_ms": "100"}}));
+        crate::store::set_config(&serde_json::json!({"params": {"tg_gap_ms": "300"}}));
         let none = |_: &std::sync::atomic::AtomicBool| {};
         // urgent callers overtake the others, but after every STARVE of them one of the others goes
         assert_eq!(line_up(&["l1", "u1", "u2", "u3", "u4", "u5"], none), vec!["u1", "u2", "u3", "l1", "u4", "u5"]);

@@ -182,6 +182,55 @@ pub fn kill(child: &mut Child) {
     let _ = child.kill();
 }
 
+/// Windows: what exterior starts ends with it. exterior puts itself in a job object that ends every process in it
+/// when its last handle closes, which happens when exterior ends, however it ends; the agents it starts, and what
+/// they start in turn, are in the job with it. A process that explicitly asks to leave the job (a deliberately
+/// detached one) may. Elsewhere an agent ends with its pipes: its ssh session or its shell goes away.
+#[cfg(windows)]
+pub mod job {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
+
+    pub struct Job(HANDLE);
+    // a handle may be used and closed from any thread
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    fn last_error() -> String { std::io::Error::last_os_error().to_string() }
+
+    impl Job {
+        /// A job that ends its processes when it is dropped (or its owner ends).
+        pub fn new() -> Result<Job, String> {
+            unsafe {
+                let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if h.is_null() { return Err(last_error()); }
+                let job = Job(h);
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+                let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+                if SetInformationJobObject(job.0, JobObjectExtendedLimitInformation, &info as *const _ as *const std::ffi::c_void, size) == 0 { return Err(last_error()); }
+                Ok(job)
+            }
+        }
+
+        pub fn add(&self, process: HANDLE) -> Result<(), String> {
+            if unsafe { AssignProcessToJobObject(self.0, process) } == 0 { Err(last_error()) } else { Ok(()) }
+        }
+    }
+
+    impl Drop for Job { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
+
+    /// Put exterior itself in a job, held until exterior ends.
+    pub fn enter() -> Result<(), String> {
+        static JOB: std::sync::OnceLock<Job> = std::sync::OnceLock::new();
+        let j = Job::new()?;
+        j.add(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() })?;
+        let _ = JOB.set(j);
+        Ok(())
+    }
+}
+
 pub fn wait(mut child: Child, secs: u64) -> Result<Output, String> {
     // read the output while waiting: a child whose output fills the pipe would otherwise block until the time limit
     fn drain<R: std::io::Read + Send + 'static>(r: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
@@ -303,6 +352,25 @@ pub fn read_local(path: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[cfg(windows)]
+    #[test]
+    fn job_ends_what_it_holds() {
+        use std::os::windows::io::AsRawHandle;
+        let job = super::job::Job::new().unwrap();
+        // cmd, and the ping it starts in turn, would run for a minute
+        let mut c = std::process::Command::new("cmd").args(["/c", "ping -n 60 127.0.0.1 >nul"]).spawn().unwrap();
+        job.add(c.as_raw_handle() as _).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(c.try_wait().unwrap().is_none());
+        // the job's last handle goes, as when exterior ends
+        drop(job);
+        let t = std::time::Instant::now();
+        while c.try_wait().unwrap().is_none() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "still running");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 
     #[test]
     fn big_file_reads_at_once() {

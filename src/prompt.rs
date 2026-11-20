@@ -87,7 +87,19 @@ pub fn send_key() -> String {
 }
 
 /// `exterior send <话题> <内容>`: hands a message for another topic to exterior, which signs it and sends it.
-fn send_script(dev: &Value) -> String {
+fn send_script(dev: &Value) -> String { send_sh(dev, host::is_local(dev) && cfg!(windows)) }
+
+/// The sh form. `windows`: for Git Bash on this Windows machine, where curl is a Windows program that receives its
+/// command line in the local code page, so Chinese in it arrives garbled. There nothing but ASCII goes on curl's
+/// command line: the topic name is percent-encoded byte by byte by the script, and the text goes in through stdin.
+fn send_sh(dev: &Value, windows: bool) -> String {
+    let (key, url) = (host::quote(&format!("{}/.exterior-key", root(dev))), host::quote(&format!("{}/api/send", self_url(dev))));
+    let post = if windows {
+        format!(r#"enc() {{ printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g'; }}
+printf '%s' "$text" | curl -sS --fail-with-body -H "Authorization: Bearer $(cat {key})" --data "cmd=$cmd" --data "from=$(enc "$EXTERIOR_TOPIC")" --data "to=$(enc "$to")" --data-urlencode "text@-" {url}"#)
+    } else {
+        format!(r#"exec curl -sS --fail-with-body -H "Authorization: Bearer $(cat {key})" --data-urlencode "cmd=$cmd" --data-urlencode "from=$EXTERIOR_TOPIC" --data-urlencode "to=$to" --data-urlencode "text=$text" {url}"#)
+    };
     format!(r#"#!/bin/sh
 # exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
 # exterior watch <会话ID> / exterior unwatch <会话ID> / exterior watch：让 exterior 盯住一个会话（如微信群），新消息自动交给你。
@@ -99,8 +111,8 @@ case "$1" in
   unwatch) [ $# -eq 2 ] || usage; cmd=unwatch; to=$2; text= ;;
   *) usage ;;
 esac
-exec curl -sS --fail-with-body -H "Authorization: Bearer $(cat {key})" --data-urlencode "cmd=$cmd" --data-urlencode "from=$EXTERIOR_TOPIC" --data-urlencode "to=$to" --data-urlencode "text=$text" {url}
-"#, key = host::quote(&format!("{}/.exterior-key", root(dev))), url = host::quote(&format!("{}/api/send", self_url(dev))))
+{post}
+"#)
 }
 
 /// The same for PowerShell on Windows (`exterior.ps1`; `exterior.cmd` runs it from cmd). Agents running in Git Bash
@@ -150,12 +162,37 @@ pub fn install(dev: &Value) -> Result<(), String> {
 mod tests {
     use super::url_for;
 
+    /// A form body as name → value.
+    #[cfg(unix)]
+    fn form(b: &str) -> std::collections::HashMap<String, String> {
+        let dec = |s: &str| {
+            let (s, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
+            while i < s.len() {
+                match s[i] {
+                    b'+' => out.push(b' '),
+                    b'%' => { out.push(u8::from_str_radix(std::str::from_utf8(&s[i + 1..i + 3]).unwrap(), 16).unwrap()); i += 2; }
+                    c => out.push(c),
+                }
+                i += 1;
+            }
+            String::from_utf8(out).unwrap()
+        };
+        let mut f: std::collections::HashMap<String, String> = b.split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (dec(k), dec(v))).collect();
+        // a field curl leaves out (empty stdin) reads as empty on exterior's side
+        for k in ["cmd", "from", "to", "text"] { f.entry(k.to_string()).or_default(); }
+        f
+    }
+
     #[cfg(unix)]
     #[test]
     fn send_script_commands() {
         let dir = std::env::temp_dir().join(format!("exterior-script-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join(".exterior-key"), "k").unwrap();
+        // curl as Git Bash on Windows runs it: what it is given on its command line is written down
+        let curl = String::from_utf8(std::process::Command::new("sh").args(["-c", "command -v curl"]).output().unwrap().stdout).unwrap();
+        std::fs::write(dir.join("bin/curl"), format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$ARGS_LOG\"\nexec {} \"$@\"\n", curl.trim())).unwrap();
+        std::process::Command::new("chmod").args(["755", dir.join("bin/curl").to_str().unwrap()]).status().unwrap();
         let srv = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}/api/send", srv.server_addr().to_ip().unwrap().port());
         let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -164,19 +201,32 @@ mod tests {
             got.lock().unwrap().push(b); let _ = r.respond(tiny_http::Response::from_string("ok"));
         }); }
         let dev = serde_json::json!({"root": dir.to_str().unwrap(), "host": "local"});
-        let script = super::send_script(&dev);
-        let start = script.rfind(" '").unwrap();
-        let script = format!("{} '{url}'\n", &script[..start]);
-        let f = dir.join("exterior");
-        std::fs::write(&f, script).unwrap();
-        let run = |args: &[&str]| std::process::Command::new("sh").arg(&f).args(args).env("EXTERIOR_TOPIC", "tgbot:1").output().unwrap().status.code();
-        assert_eq!(run(&["watch", "wx@chatroom"]), Some(0));
-        assert_eq!(run(&["send", "全局", "a", "b"]), Some(0));
-        assert_eq!(run(&["unwatch"]), Some(2));
-        assert_eq!(run(&["bogus"]), Some(2));
-        let g = got.lock().unwrap().clone();
-        assert!(g[0].contains("cmd=watch") && g[0].contains("to=wx%40chatroom") && g[0].contains("from=tgbot%3A1"), "{g:?}");
-        assert!(g[1].contains("cmd=send") && g[1].contains("text=a+b"), "{g:?}");
+        // the form used everywhere, and the one for Git Bash on Windows
+        for windows in [false, true] {
+            got.lock().unwrap().clear();
+            let log = dir.join(format!("args-{windows}"));
+            let script = super::send_sh(&dev, windows);
+            let start = script.rfind(" '").unwrap();
+            let script = format!("{} '{url}'\n", &script[..start]);
+            let f = dir.join("exterior");
+            std::fs::write(&f, script).unwrap();
+            let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+            let run = |args: &[&str]| std::process::Command::new("sh").arg(&f).args(args).env("EXTERIOR_TOPIC", "tgbot:1").env("PATH", &path).env("ARGS_LOG", &log)
+                .output().unwrap().status.code();
+            assert_eq!(run(&["watch", "wx@chatroom"]), Some(0));
+            assert_eq!(run(&["send", "全局", "a", "b"]), Some(0));
+            assert_eq!(run(&["unwatch"]), Some(2));
+            assert_eq!(run(&["bogus"]), Some(2));
+            assert_eq!(run(&["send", "exterior 开发", "中文 & 符号 = %20 + \"引号\"\n第二行", "'单引号'"]), Some(0));
+            assert_eq!(run(&["watch"]), Some(0));
+            let g: Vec<_> = got.lock().unwrap().iter().map(|b| form(b)).collect();
+            let want = |cmd: &str, to: &str, text: &str| [("cmd", cmd), ("from", "tgbot:1"), ("to", to), ("text", text)].map(|(k, v)| (k.to_string(), v.to_string())).into_iter().collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(g, vec![want("watch", "wx@chatroom", ""), want("send", "全局", "a b"),
+                               want("send", "exterior 开发", "中文 & 符号 = %20 + \"引号\"\n第二行 '单引号'"), want("watch", "", "")], "windows {windows}");
+            // on Windows nothing but ASCII may reach curl's command line
+            let args = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(args.is_ascii(), windows, "{args}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

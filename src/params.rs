@@ -33,6 +33,7 @@ pub const PARAMS: &[Param] = &[
     Param { key: "limit_warn_pct", label: "codex 用量达到多少百分比时提醒", default: "90" },
     Param { key: "refresh_s", label: "同步话题列表的间隔（秒）", default: "60" },
     Param { key: "wait_s", label: "向 brief 等待新消息的时长（秒）", default: "20" },
+    Param { key: "brief_timeout_s", label: "向 brief 发出一个请求的时限（秒）；上传文件时另加按 1 Mbps 估算的上传时间；须大于等待新消息的时长", default: "70" },
     Param { key: "retry_wait_s", label: "发送失败后等待多少秒再重试", default: "3" },
     Param { key: "reconnect_s", label: "brief 连接失败后等待多少秒再重连", default: "5" },
     Param { key: "menu_retry_min", label: "命令菜单生成失败后的重试间隔（分钟）", default: "5" },

@@ -72,6 +72,15 @@ pub fn tool_waiting(title: &str) -> String { format!("{title}（结果稍后）"
 /// exterior's own "/effort auto" to claude at start (claude has no command-line form for it), and claude's reply
 pub const EFFORT_AUTO_SENT: &str = "exterior → claude（启动时设置 effort auto，claude 没有对应的启动参数）";
 pub const EFFORT_AUTO_REPLY: &str = "claude 对 /effort auto 的回复";
+/// Folded: what claude says again, after the user's /compact, of what its last local command said.
+pub const COMPACT_REPEAT: &str = "claude 在压缩回合中重复输出的内容（不是回答）";
+/// pi's agent_end in short: the conversation it carries was shown message by message already.
+pub fn agent_end(n: usize, last: Option<(&str, String, bool)>, rest: &str) -> String {
+    let mut s = format!("本回合结束，会话共 {n} 条消息（各条已逐条转发，此处不重复）。");
+    if let Some((role, head, more)) = last { s.push_str(&format!("\n最后一条（{role}）：{head}{}", if more { "…" } else { "" })); }
+    if !rest.is_empty() { s.push_str(&format!("\n{rest}")); }
+    s
+}
 pub const THINKING: &str = "💭 思考";
 pub const STDERR: &str = "🖥 stderr";
 pub const STDOUT: &str = "🖥 stdout";
@@ -233,6 +242,9 @@ pub fn shown(t: &str) -> String { format!("```\n{t}\n```") }
 pub fn codex_model_kept(v: &str) -> String { format!("codex 没有切换模型的请求，模型随每一轮发送：从下一轮起使用 {v}。") }
 pub fn file_not_sent(path: &str, e: &str) -> String { sys_warn(&format!("文件没有发出去：{path}：{e}")) }
 pub const FILE_MISSING: &str = "文件不存在";
+/// A file upload that brief received but did not answer in time: brief may still send it, so it is not sent again.
+pub const FILE_MAYBE_SENT: &str = "上传后没有收到 brief 的应答，文件可能已经发出；为避免重复发送，没有重发";
+pub fn file_unsure(path: &str) -> String { sys_warn(&format!("文件可能没有发出去：{path}：{FILE_MAYBE_SENT}")) }
 /// Shown before a remote device's test result when its password cannot be used on this machine.
 pub const NO_SSHPASS: &str = "本机没有 sshpass，无法使用密码，已改用 SSH 密钥登录；";
 pub const ACCOUNT_SWITCH_WINDOWS: &str = "切换 claude 账号需要复制会话记录，目前只支持 Linux 和 macOS 设备";

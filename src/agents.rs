@@ -226,97 +226,7 @@ impl Agent {
         let silent = Arc::new(std::sync::atomic::AtomicU64::new(auto as u64));
         let quiet = silent.clone();
         std::thread::spawn(move || {
-            let mut known = String::new();
-            let mut tools: HashMap<String, (String, Value)> = HashMap::new();
-            // text that arrived piece by piece since the last whole message; a command's own output (/goal…) comes
-            // only as a whole message, and must not be lost
-            let mut streamed = false;
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-                if v["type"] == "control_response" {
-                    let id = v["response"]["request_id"].as_str().map(String::from);
-                    if id.as_deref() == Some("init") { *info.lock().unwrap() = v["response"]["response"].clone(); continue; }
-                    route(&pending, id, &v["response"]);
-                    continue;
-                }
-                if let Some(s) = v["session_id"].as_str() {
-                    if s != known { known = s.to_string(); let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: known.clone() }); }
-                }
-                // everything the agent does besides answering: thinking, tool calls with their output, system events
-                let step = |title: String, body: String| { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title, body }); };
-                match v["type"].as_str() {
-                    Some("assistant") => for b in v["message"]["content"].as_array().into_iter().flatten() {
-                        match b["type"].as_str() {
-                            Some("thinking") => if let Some(t) = b["thinking"].as_str().filter(|t| !t.trim().is_empty()) { step(text::THINKING.into(), t.trim().to_string()); },
-                            Some("redacted_thinking") => step(text::THINKING.into(), text::THINKING_HIDDEN.into()),
-                            // a subagent's words (with --forward-subagent-text) are part of its work, not the answer
-                            Some("text") if !v["parent_tool_use_id"].is_null() => step(text::SUBAGENT.into(), b["text"].as_str().unwrap_or("").to_string()),
-                            // claude's answer to exterior's own "/effort auto": not part of the user's answer
-                            Some("text") if quiet.load(std::sync::atomic::Ordering::SeqCst) > 0 => step(text::event_title(text::EFFORT_AUTO_REPLY), b["text"].as_str().unwrap_or("").to_string()),
-                            Some("text") if !streamed => if let Some(t) = b["text"].as_str().filter(|t| !t.trim().is_empty()) {
-                                let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: format!("\n\n{t}") });
-                            },
-                            Some("tool_use") => { tools.insert(b["id"].as_str().unwrap_or("").to_string(), (b["name"].as_str().unwrap_or("?").to_string(), b["input"].clone())); }
-                            Some("text") => {}
-                            _ => step(text::event_title(&format!("assistant · {}", b["type"].as_str().unwrap_or("?"))), pretty(b)),
-                        }
-                    },
-                    Some("user") => match &v["message"]["content"] {
-                        Value::Array(a) => for b in a {
-                            if b["type"] == "tool_result" {
-                                let (name, input) = tools.remove(b["tool_use_id"].as_str().unwrap_or("")).unwrap_or(("?".into(), Value::Null));
-                                let failed = b["is_error"] == true;
-                                step(tool_title(&name, &input, failed), tool_body(&input, Some(&result_text(&b["content"]))));
-                            } else {
-                                // what claude put in front of the model itself: command output, hook text, reminders
-                                step(text::event_title(&format!("user · {}", b["type"].as_str().unwrap_or("?"))), result_text(&Value::Array(vec![b.clone()])));
-                            }
-                        },
-                        c => step(text::event_title("user"), pretty(c)),
-                    },
-                    // thinking_tokens is a running counter of the thinking that arrives in full anyway
-                    Some("system") if v["subtype"] != "thinking_tokens" => {
-                        step(text::event_title(&format!("system · {}", v["subtype"].as_str().unwrap_or(""))), pretty(&v));
-                    }
-                    Some("rate_limit_event") => step(text::event_title("rate_limit_event"), pretty(&v)),
-                    Some("result") => {
-                        // calls still without a result (a background subagent's, say): shown now with what they were
-                        // asked, and kept, so the result that comes later is shown under the same call
-                        for (name, input) in tools.values() { step(text::tool_waiting(&tool_title(name, input, false)), tool_body(input, None)); }
-                        step(text::event_title("result"), pretty(&v));
-                    }
-                    // stream_event pieces come again whole in the assistant message; control_response answers exterior
-                    Some("stream_event") | Some("control_response") | Some("system") => {}
-                    Some(t) => step(text::event_title(t), pretty(&v)),
-                    None => step(text::STDOUT.into(), line.clone()),
-                }
-                if let Some(t) = claude_note(&v) {
-                    if v["type"] == "rate_limit_event" && v["rate_limit_info"]["status"] == "rejected" {
-                        let _ = tx.send(Ev::Exhausted { tid: tid.clone(), gen, why: t.clone() });
-                    }
-                    let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: t });
-                }
-                // a new text block (after a tool call, say) is a new paragraph
-                if v["event"]["type"] == "content_block_start" && v["event"]["content_block"]["type"] == "text" { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
-                if let Some(d) = v["event"]["delta"]["text"].as_str() { streamed = true; let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() }); }
-                if v["type"] == "assistant" { streamed = false; }
-                if v["type"] == "result" && quiet.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                    quiet.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    continue;
-                }
-                if v["type"] == "result" {
-                    *busy.lock().unwrap() = false;
-                    let sub = v["subtype"].as_str().unwrap_or("");
-                    let stopped = interrupted.swap(false, std::sync::atomic::Ordering::SeqCst) && sub == "error_during_execution";
-                    let failed = !stopped && (v["is_error"] == true || sub.starts_with("error"));
-                    let error = failed.then(|| {
-                        let listed: Vec<&str> = v["errors"].as_array().into_iter().flatten().filter_map(|e| e.as_str()).collect();
-                        let said = v["result"].as_str().filter(|s| !s.trim().is_empty()).map(String::from);
-                        said.or_else(|| (!listed.is_empty()).then(|| clip(&listed.join("；")))).unwrap_or_else(|| text::result_error(sub))
-                    });
-                    let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: if failed { None } else { v["result"].as_str().map(String::from) }, stopped, error });
-                }
-            }
+            read_claude(out, tx.clone(), tid.clone(), gen, busy, pending, info, interrupted, quiet);
             if let Some(mut c) = child.lock().unwrap().take() { let _ = c.wait(); }
             let why = last.lock().unwrap().clone();
             let _ = tx.send(Ev::Exited { tid, gen, why });
@@ -339,93 +249,7 @@ impl Agent {
         let (tx, tid, gen, child, busy, pending) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone());
         let stdin = self.stdin.clone();
         std::thread::spawn(move || {
-            let mut last_text: Option<String> = None;
-            let mut last_err: Option<String> = None;
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-                if v["type"] == "response" && route(&pending, v["id"].as_str().map(String::from), &v) { continue; }
-                match v["type"].as_str() {
-                    Some("message_update") => {
-                        let e = &v["assistantMessageEvent"];
-                        if e["type"] == "text_delta" { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: e["delta"].as_str().unwrap_or("").to_string() }); }
-                        if e["type"] == "thinking_end" {
-                            if let Some(t) = e["content"].as_str().filter(|t| !t.trim().is_empty()) { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::THINKING.into(), body: t.trim().to_string() }); }
-                        }
-                    }
-                    Some("tool_execution_end") => {
-                        let failed = v["isError"] == true;
-                        let out = v["result"]["content"].as_array().map(|a| a.iter().map(|c| c["text"].as_str().map(String::from).unwrap_or_else(|| pretty(c))).collect::<Vec<_>>().join("\n")).unwrap_or_else(|| pretty(&v["result"]));
-                        let name = v["toolName"].as_str().unwrap_or("?");
-                        let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: tool_title(name, &v["args"], failed), body: tool_body(&v["args"], Some(&out)) });
-                    }
-                    Some("turn_end") => {
-                        let t: String = v["message"]["content"].as_array().into_iter().flatten()
-                            .filter(|c| c["type"] == "text").filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("");
-                        if !t.is_empty() { last_text = Some(t); }
-                        if v["message"]["stopReason"] == "error" {
-                            let m = v["message"]["errorMessage"].as_str().unwrap_or(text::MODEL_ERROR);
-                            // pi writes "<status> <json body>": show the status and the body's message
-                            let inner = serde_json::from_str::<Value>(m.split_once(' ').map(|x| x.1).unwrap_or("")).ok()
-                                .and_then(|j| j["error"]["message"].as_str().map(String::from));
-                            last_err = Some(match inner { Some(i) => format!("{} {i}", m.split(' ').next().unwrap_or("")), None => clip(m) });
-                        } else { last_err = None; }
-                    }
-                    Some("auto_retry_start") => {
-                        let a = v["attempt"].as_i64().unwrap_or(0);
-                        if worth_noting(a) {
-                            let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::retrying(text::Source::Model, a, v["maxAttempts"].as_i64().unwrap_or(0), &clip(v["errorMessage"].as_str().unwrap_or(""))) });
-                        }
-                    }
-                    Some("auto_retry_end") if v["success"] == false => {
-                        if let Some(e) = v["finalError"].as_str() { if last_err.is_none() { last_err = Some(clip(e)); } }
-                    }
-                    Some("summarization_retry_scheduled") => {
-                        let a = v["attempt"].as_i64().unwrap_or(0);
-                        if worth_noting(a) {
-                            let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::retrying(text::Source::Compaction, a, v["maxAttempts"].as_i64().unwrap_or(0), &clip(v["errorMessage"].as_str().unwrap_or(""))) });
-                        }
-                    }
-                    Some("compaction_end") => {
-                        if let Some(e) = v["errorMessage"].as_str() { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::compaction_failed(&clip(e)) }); }
-                    }
-                    Some("extension_ui_request") => {
-                        let what = v["title"].as_str().or(v["message"].as_str()).unwrap_or("").to_string();
-                        match v["method"].as_str().unwrap_or("") {
-                            "notify" if matches!(v["notifyType"].as_str(), Some("warning") | Some("error")) => {
-                                let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::extension_notice(&clip(&what)) });
-                            }
-                            // dialogs wait for an answer; exterior has no way to ask the user yet, so it cancels them and says so
-                            m @ ("select" | "confirm" | "input" | "editor") => {
-                                let _ = put(&stdin, &json!({"type": "extension_ui_response", "id": v["id"], "cancelled": true}));
-                                let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::dialog_cancelled(m, &clip(&what)) });
-                            }
-                            m => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title(&format!("extension_ui · {m}")), body: pretty(&v) }); }
-                        }
-                    }
-                    Some("response") if v["command"] == "prompt" && v["data"]["disposition"] == "handled" => {
-                        // an extension consumed the prompt: no run follows
-                        *busy.lock().unwrap() = false;
-                        let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: None, stopped: false, error: None });
-                    }
-                    Some("extension_error") => {
-                        let e = v["error"].as_str().map(String::from).unwrap_or_else(|| v.to_string());
-                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::extension_error(&clip(&e)) });
-                    }
-                    Some("agent_settled") => {
-                        *busy.lock().unwrap() = false;
-                        let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: last_text.take(), stopped: v["aborted"] == true, error: last_err.take() });
-                    }
-                    Some("response") if v["success"] == false => {
-                        *busy.lock().unwrap() = false;
-                        let err = v["error"].as_str().unwrap_or(text::PI_REJECTED).to_string();
-                        let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: None, stopped: false, error: Some(err) });
-                    }
-                    // these repeat what tool_execution_end and the streamed text already carry in full
-                    Some("tool_execution_start") | Some("tool_execution_update") | Some("message_start") | Some("message_end") => {}
-                    Some(t) => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title(t), body: pretty(&v) }); }
-                    None => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::STDOUT.into(), body: line.clone() }); }
-                }
-            }
+            read_pi(out, tx.clone(), tid.clone(), gen, busy, pending, stdin);
             if let Some(mut c) = child.lock().unwrap().take() { let _ = c.wait(); }
             let why = last.lock().unwrap().clone();
             let _ = tx.send(Ev::Exited { tid, gen, why });
@@ -816,6 +640,207 @@ fn codex_turn(thread: &str, text: &str, model: Option<String>) -> Value {
     json!({"jsonrpc": "2.0", "id": format!("turn-{}", crate::store::now()), "method": "turn/start", "params": p})
 }
 
+/// claude's output (stream-json), one JSON line after another, as events.
+#[allow(clippy::too_many_arguments)]
+fn read_claude(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, busy: Arc<Mutex<bool>>, pending: Pending, info: Arc<Mutex<Value>>,
+               interrupted: Arc<std::sync::atomic::AtomicBool>, quiet: Arc<std::sync::atomic::AtomicU64>) {
+    let mut known = String::new();
+    let mut tools: HashMap<String, (String, Value)> = HashMap::new();
+    // text that arrived piece by piece since the last whole message; a command's own output (/goal…) comes
+    // only as a whole message, and must not be lost
+    let mut streamed = false;
+    // after the user's /compact (not one claude does by itself mid-turn) and until that turn's result, claude says
+    // again what its last local command said: shown folded, it is not an answer
+    let mut compacting = false;
+    for line in BufReader::new(out).lines().map_while(Result::ok) {
+        let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+        if v["type"] == "control_response" {
+            let id = v["response"]["request_id"].as_str().map(String::from);
+            if id.as_deref() == Some("init") { *info.lock().unwrap() = v["response"]["response"].clone(); continue; }
+            route(&pending, id, &v["response"]);
+            continue;
+        }
+        if let Some(s) = v["session_id"].as_str() {
+            if s != known { known = s.to_string(); let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: known.clone() }); }
+        }
+        // everything the agent does besides answering: thinking, tool calls with their output, system events
+        let step = |title: String, body: String| { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title, body }); };
+        match v["type"].as_str() {
+            Some("assistant") => for b in v["message"]["content"].as_array().into_iter().flatten() {
+                match b["type"].as_str() {
+                    Some("thinking") => if let Some(t) = b["thinking"].as_str().filter(|t| !t.trim().is_empty()) { step(text::THINKING.into(), t.trim().to_string()); },
+                    Some("redacted_thinking") => step(text::THINKING.into(), text::THINKING_HIDDEN.into()),
+                    // a subagent's words (with --forward-subagent-text) are part of its work, not the answer
+                    Some("text") if !v["parent_tool_use_id"].is_null() => step(text::SUBAGENT.into(), b["text"].as_str().unwrap_or("").to_string()),
+                Some("text") if compacting => step(text::event_title(text::COMPACT_REPEAT), b["text"].as_str().unwrap_or("").to_string()),
+                    // claude's answer to exterior's own "/effort auto": not part of the user's answer
+                    Some("text") if quiet.load(std::sync::atomic::Ordering::SeqCst) > 0 => step(text::event_title(text::EFFORT_AUTO_REPLY), b["text"].as_str().unwrap_or("").to_string()),
+                    Some("text") if !streamed => if let Some(t) = b["text"].as_str().filter(|t| !t.trim().is_empty()) {
+                        let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: format!("\n\n{t}") });
+                    },
+                    Some("tool_use") => { tools.insert(b["id"].as_str().unwrap_or("").to_string(), (b["name"].as_str().unwrap_or("?").to_string(), b["input"].clone())); }
+                    Some("text") => {}
+                    _ => step(text::event_title(&format!("assistant · {}", b["type"].as_str().unwrap_or("?"))), pretty(b)),
+                }
+            },
+            Some("user") => match &v["message"]["content"] {
+                Value::Array(a) => for b in a {
+                    if b["type"] == "tool_result" {
+                        let (name, input) = tools.remove(b["tool_use_id"].as_str().unwrap_or("")).unwrap_or(("?".into(), Value::Null));
+                        let failed = b["is_error"] == true;
+                        step(tool_title(&name, &input, failed), tool_body(&input, Some(&result_text(&b["content"]))));
+                    } else {
+                        // what claude put in front of the model itself: command output, hook text, reminders
+                        step(text::event_title(&format!("user · {}", b["type"].as_str().unwrap_or("?"))), result_text(&Value::Array(vec![b.clone()])));
+                    }
+                },
+                c => step(text::event_title("user"), pretty(c)),
+            },
+            // thinking_tokens is a running counter of the thinking that arrives in full anyway
+            Some("system") if v["subtype"] != "thinking_tokens" => {
+                if v["subtype"] == "compact_boundary" {
+                    let m = if v["compact_metadata"].is_object() { &v["compact_metadata"] } else { &v["compactMetadata"] };
+                    compacting = m["trigger"] != "auto";
+                }
+                step(text::event_title(&format!("system · {}", v["subtype"].as_str().unwrap_or(""))), pretty(&v));
+            }
+            Some("rate_limit_event") => step(text::event_title("rate_limit_event"), pretty(&v)),
+            Some("result") => {
+                // calls still without a result (a background subagent's, say): shown now with what they were
+                // asked, and kept, so the result that comes later is shown under the same call
+                for (name, input) in tools.values() { step(text::tool_waiting(&tool_title(name, input, false)), tool_body(input, None)); }
+                step(text::event_title("result"), pretty(&v));
+            }
+            // stream_event pieces come again whole in the assistant message; control_response answers exterior
+            Some("stream_event") | Some("control_response") | Some("system") => {}
+            Some(t) => step(text::event_title(t), pretty(&v)),
+            None => step(text::STDOUT.into(), line.clone()),
+        }
+        if let Some(t) = claude_note(&v) {
+            if v["type"] == "rate_limit_event" && v["rate_limit_info"]["status"] == "rejected" {
+                let _ = tx.send(Ev::Exhausted { tid: tid.clone(), gen, why: t.clone() });
+            }
+            let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: t });
+        }
+        // a new text block (after a tool call, say) is a new paragraph
+        if !compacting && v["event"]["type"] == "content_block_start" && v["event"]["content_block"]["type"] == "text" { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: "\n\n".into() }); }
+        if let Some(d) = v["event"]["delta"]["text"].as_str().filter(|_| !compacting) { streamed = true; let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d.to_string() }); }
+        if v["type"] == "assistant" { streamed = false; }
+        let repeat = compacting;
+        if v["type"] == "result" { compacting = false; }
+        if v["type"] == "result" && quiet.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            quiet.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            continue;
+        }
+        if v["type"] == "result" {
+            *busy.lock().unwrap() = false;
+            let sub = v["subtype"].as_str().unwrap_or("");
+            let stopped = interrupted.swap(false, std::sync::atomic::Ordering::SeqCst) && sub == "error_during_execution";
+            let failed = !stopped && (v["is_error"] == true || sub.starts_with("error"));
+            let error = failed.then(|| {
+                let listed: Vec<&str> = v["errors"].as_array().into_iter().flatten().filter_map(|e| e.as_str()).collect();
+                let said = v["result"].as_str().filter(|s| !s.trim().is_empty()).map(String::from);
+                said.or_else(|| (!listed.is_empty()).then(|| clip(&listed.join("；")))).unwrap_or_else(|| text::result_error(sub))
+            });
+            let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: if failed || repeat { None } else { v["result"].as_str().map(String::from) }, stopped, error });
+        }
+    }
+}
+
+/// pi's output (rpc), one JSON line after another, as events.
+fn read_pi(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, busy: Arc<Mutex<bool>>, pending: Pending, stdin: Arc<Mutex<Option<ChildStdin>>>) {
+    let mut last_text: Option<String> = None;
+    let mut last_err: Option<String> = None;
+    for line in BufReader::new(out).lines().map_while(Result::ok) {
+        let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+        if v["type"] == "response" && route(&pending, v["id"].as_str().map(String::from), &v) { continue; }
+        match v["type"].as_str() {
+            Some("message_update") => {
+                let e = &v["assistantMessageEvent"];
+                if e["type"] == "text_delta" { let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: e["delta"].as_str().unwrap_or("").to_string() }); }
+                if e["type"] == "thinking_end" {
+                    if let Some(t) = e["content"].as_str().filter(|t| !t.trim().is_empty()) { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::THINKING.into(), body: t.trim().to_string() }); }
+                }
+            }
+            Some("tool_execution_end") => {
+                let failed = v["isError"] == true;
+                let out = v["result"]["content"].as_array().map(|a| a.iter().map(|c| c["text"].as_str().map(String::from).unwrap_or_else(|| pretty(c))).collect::<Vec<_>>().join("\n")).unwrap_or_else(|| pretty(&v["result"]));
+                let name = v["toolName"].as_str().unwrap_or("?");
+                let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: tool_title(name, &v["args"], failed), body: tool_body(&v["args"], Some(&out)) });
+            }
+            Some("turn_end") => {
+                let t: String = v["message"]["content"].as_array().into_iter().flatten()
+                    .filter(|c| c["type"] == "text").filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("");
+                if !t.is_empty() { last_text = Some(t); }
+                if v["message"]["stopReason"] == "error" {
+                    let m = v["message"]["errorMessage"].as_str().unwrap_or(text::MODEL_ERROR);
+                    // pi writes "<status> <json body>": show the status and the body's message
+                    let inner = serde_json::from_str::<Value>(m.split_once(' ').map(|x| x.1).unwrap_or("")).ok()
+                        .and_then(|j| j["error"]["message"].as_str().map(String::from));
+                    last_err = Some(match inner { Some(i) => format!("{} {i}", m.split(' ').next().unwrap_or("")), None => clip(m) });
+                } else { last_err = None; }
+            }
+            Some("auto_retry_start") => {
+                let a = v["attempt"].as_i64().unwrap_or(0);
+                if worth_noting(a) {
+                    let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::retrying(text::Source::Model, a, v["maxAttempts"].as_i64().unwrap_or(0), &clip(v["errorMessage"].as_str().unwrap_or(""))) });
+                }
+            }
+            Some("auto_retry_end") if v["success"] == false => {
+                if let Some(e) = v["finalError"].as_str() { if last_err.is_none() { last_err = Some(clip(e)); } }
+            }
+            Some("summarization_retry_scheduled") => {
+                let a = v["attempt"].as_i64().unwrap_or(0);
+                if worth_noting(a) {
+                    let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::retrying(text::Source::Compaction, a, v["maxAttempts"].as_i64().unwrap_or(0), &clip(v["errorMessage"].as_str().unwrap_or(""))) });
+                }
+            }
+            Some("compaction_end") => {
+                if let Some(e) = v["errorMessage"].as_str() { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::compaction_failed(&clip(e)) }); }
+            }
+            Some("extension_ui_request") => {
+                let what = v["title"].as_str().or(v["message"].as_str()).unwrap_or("").to_string();
+                match v["method"].as_str().unwrap_or("") {
+                    "notify" if matches!(v["notifyType"].as_str(), Some("warning") | Some("error")) => {
+                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::extension_notice(&clip(&what)) });
+                    }
+                    // dialogs wait for an answer; exterior has no way to ask the user yet, so it cancels them and says so
+                    m @ ("select" | "confirm" | "input" | "editor") => {
+                        let _ = put(&stdin, &json!({"type": "extension_ui_response", "id": v["id"], "cancelled": true}));
+                        let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::dialog_cancelled(m, &clip(&what)) });
+                    }
+                    m => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title(&format!("extension_ui · {m}")), body: pretty(&v) }); }
+                }
+            }
+            Some("response") if v["command"] == "prompt" && v["data"]["disposition"] == "handled" => {
+                // an extension consumed the prompt: no run follows
+                *busy.lock().unwrap() = false;
+                let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: None, stopped: false, error: None });
+            }
+            Some("extension_error") => {
+                let e = v["error"].as_str().map(String::from).unwrap_or_else(|| v.to_string());
+                let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::extension_error(&clip(&e)) });
+            }
+            Some("agent_settled") => {
+                *busy.lock().unwrap() = false;
+                let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: last_text.take(), stopped: v["aborted"] == true, error: last_err.take() });
+            }
+            Some("response") if v["success"] == false => {
+                *busy.lock().unwrap() = false;
+                let err = v["error"].as_str().unwrap_or(text::PI_REJECTED).to_string();
+                let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: None, stopped: false, error: Some(err) });
+            }
+            // these repeat what tool_execution_end and the streamed text already carry in full
+            Some("tool_execution_start") | Some("tool_execution_update") | Some("message_start") | Some("message_end") => {}
+            // it carries the whole conversation, which went out piece by piece already
+            Some("agent_end") => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title("agent_end"), body: agent_end_summary(&v) }); }
+            Some(t) => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title(t), body: pretty(&v) }); }
+            None => { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::STDOUT.into(), body: line.clone() }); }
+        }
+    }
+}
+
+
 /// One question, one answer: used by the 测试 button on the 设备 page.
 pub fn test(dev: &Value, dir: &str, command: &str, kind: Kind) -> Result<String, String> {
     let q = crate::prompt::read(dev, "test_prompt")?;
@@ -1086,4 +1111,95 @@ mod error_tests {
         assert_eq!(claude_note(&json!({"type":"system","subtype":"init","mcp_servers":[{"name":"b","status":"connected"}]})), None);
         assert!(claude_note(&json!({"type":"auth_status","error":"expired"})).unwrap().contains("expired"));
     }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+
+    fn feed_claude(lines: &[Value]) -> Vec<Ev> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        read_claude(std::io::Cursor::new(input.into_bytes()), tx, "tgbot:1".into(), 1, Arc::default(), Arc::default(), Arc::default(), Arc::default(), Arc::default());
+        rx.try_iter().collect()
+    }
+
+    fn feed_pi(lines: &[Value]) -> Vec<Ev> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        read_pi(std::io::Cursor::new(input.into_bytes()), tx, "tgbot:1".into(), 1, Arc::default(), Arc::default(), Arc::default());
+        rx.try_iter().collect()
+    }
+
+    /// What the user would read as the answer: the text pieces and the final texts.
+    fn answers(evs: &[Ev]) -> Vec<String> {
+        evs.iter().filter_map(|e| match e { Ev::Text { delta, .. } => Some(delta.trim().to_string()), Ev::Done { text, .. } => text.clone(), _ => None })
+            .filter(|t| !t.is_empty()).collect()
+    }
+
+    fn steps(evs: &[Ev]) -> Vec<(String, String)> {
+        evs.iter().filter_map(|e| match e { Ev::Step { title, body, .. } => Some((title.clone(), body.clone())), _ => None }).collect()
+    }
+
+    #[test]
+    fn compact_repeat_is_not_the_answer() {
+        let said = |t: &str| json!({"type": "assistant", "parent_tool_use_id": null, "message": {"content": [{"type": "text", "text": t}]}});
+        let result = |t: &str| json!({"type": "result", "subtype": "success", "is_error": false, "result": t});
+        let evs = feed_claude(&[
+            json!({"type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "manual", "pre_tokens": 14495}}),
+            json!({"type": "user", "message": {"content": "<local-command-stdout>Compacted </local-command-stdout>"}}),
+            // claude says again what the last local command (/model) said
+            said("Set model to opus"),
+            result("Set model to opus"),
+            // the next turn is answered as usual
+            said("真正的回答"),
+            result("真正的回答"),
+        ]);
+        assert_eq!(answers(&evs), vec!["真正的回答", "真正的回答"]);
+        // shown folded, nothing dropped
+        assert!(steps(&evs).iter().any(|(t, b)| t.contains("压缩") && b == "Set model to opus"), "{:?}", steps(&evs));
+        // a turn that ends after a compaction still ends
+        assert_eq!(evs.iter().filter(|e| matches!(e, Ev::Done { .. })).count(), 2);
+        // compacting by itself in the middle of a turn changes nothing: what follows is the answer
+        let evs = feed_claude(&[
+            json!({"type": "system", "subtype": "compact_boundary", "compact_metadata": {"trigger": "auto"}}),
+            said("继续回答"),
+            result("继续回答"),
+        ]);
+        assert_eq!(answers(&evs), vec!["继续回答", "继续回答"]);
+    }
+
+    #[test]
+    fn pi_agent_end_is_summed_up() {
+        let msg = |role: &str, t: String| json!({"role": role, "content": [{"type": "text", "text": t}]});
+        let evs = feed_pi(&[json!({"type": "agent_end", "messages": [
+            msg("user", "问".repeat(30_000)), msg("assistant", "答".repeat(30_000)), msg("user", "再问".into()), msg("assistant", format!("最后{}", "尾".repeat(5_000))),
+        ]})]);
+        let s = steps(&evs);
+        assert_eq!(s.len(), 1, "{s:?}");
+        let (title, body) = &s[0];
+        assert!(title.contains("agent_end"), "{title}");
+        // what was forwarded one by one already is not repeated: the count and the start of the last message
+        assert!(body.chars().count() < 1_000, "{} 字", body.chars().count());
+        assert!(body.contains('4') && body.contains("最后尾尾"), "{body}");
+    }
+}
+
+
+/// How much of the last message pi's agent_end shows.
+const AGENT_END_HEAD: usize = 300;
+
+/// pi's agent_end in short: how many messages the conversation has, and the start of the last one.
+fn agent_end_summary(v: &Value) -> String {
+    let msgs = v["messages"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+    let last = msgs.last().map(|m| {
+        let t = match &m["content"] {
+            Value::String(t) => t.clone(),
+            Value::Array(a) => a.iter().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join(""),
+            _ => String::new(),
+        };
+        (m["role"].as_str().unwrap_or("?").to_string(), t)
+    });
+    let rest: Vec<String> = v.as_object().into_iter().flatten().filter(|(k, _)| *k != "type" && *k != "messages").map(|(k, x)| format!("{k}: {x}")).collect();
+    text::agent_end(msgs.len(), last.as_ref().map(|(r, t)| (r.as_str(), t.chars().take(AGENT_END_HEAD).collect::<String>(), t.chars().count() > AGENT_END_HEAD)), &rest.join("\n"))
 }

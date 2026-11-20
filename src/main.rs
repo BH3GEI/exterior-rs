@@ -14,6 +14,9 @@ mod web;
 fn main() {
     // `exterior probe <claude|pi|codex> <command> <dir> <question> [model]`: start one agent on this machine with no
     // start text, list its models, optionally switch, ask the question, print what comes back. For checking the drivers.
+    // Windows: the agents exterior starts must not outlive it
+    #[cfg(windows)]
+    if let Err(e) = host::job::enter() { eprintln!("job object: {e}"); }
     let a: Vec<String> = std::env::args().collect();
     if a.get(1).map(|s| s.as_str()) == Some("probe") { return probe(&a[2..]); }
     let addr = web::listen_addr(store::on_lazycat(), std::env::var("EXTERIOR_ADDR").ok().as_deref(), std::env::var("PORT").ok().as_deref());

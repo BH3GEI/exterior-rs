@@ -118,6 +118,46 @@ fn relay_split(t: &str) -> Option<(&str, &str)> {
     t.split_once(&format!(" {mark} "))
 }
 
+/// Who sent a message in topic `me` that the user did not write himself, when it is another topic's message: only
+/// "<the name of another topic> → …" counts. exterior's own messages can look like that too (the folded
+/// "ℹ️ exterior → claude（…）" a new session starts with, an answer quoting another topic).
+fn relayed_from<'a>(text: &'a str, me: &str, names: &[&str]) -> Option<&'a str> {
+    let (who, _) = relay_split(text)?;
+    let who = who.trim();
+    (!who.is_empty() && who != me && !who.contains('\n') && names.contains(&who)).then_some(who)
+}
+
+/// Sends exterior has under way, per chat: a message of its own can come back from brief before the send that put it
+/// there has returned its id.
+static SENDING: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+/// Counts as a send under way while it lives.
+struct Sending(String);
+impl Sending {
+    fn new(chat: &str) -> Sending { *SENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(chat.to_string()).or_default() += 1; Sending(chat.to_string()) }
+}
+impl Drop for Sending {
+    fn drop(&mut self) {
+        let mut g = SENDING.lock().unwrap();
+        if let Some(m) = g.as_mut() { if let Some(n) = m.get_mut(&self.0) { *n -= 1; if *n == 0 { m.remove(&self.0); } } }
+    }
+}
+
+/// How long a message waits for exterior's sends to `chat` under way to finish before it is judged.
+const OWN_WAIT: Duration = Duration::from_secs(5);
+
+/// Message `id` in `chat` is one exterior sent itself. While sends to that chat are still under way, wait for them
+/// (at most OWN_WAIT): the message may be one of theirs.
+fn mine(own: &Own, chat: &str, id: u64) -> bool {
+    let t = Instant::now();
+    loop {
+        if own.lock().unwrap().contains(&id) { return true; }
+        let busy = SENDING.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(chat));
+        if !busy || t.elapsed() >= OWN_WAIT { return own.lock().unwrap().contains(&id); }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn send(own: &Own, sessions: &Sessions, chat: &str, text: &str) -> Option<u64> { send_with(own, sessions, chat, text, None) }
 
 /// Buttons: rows of (label, what pressing it says).
@@ -139,6 +179,7 @@ fn send_with(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Optio
 fn send_one(own: &Own, sessions: &Sessions, chat: &str, text: &str, btns: Option<Value>) -> Option<u64> {
     let mut body = json!({"chat": chat, "text": text});
     if let Some(b) = &btns { body["buttons"] = b.clone(); }
+    let _s = Sending::new(chat);
     let id = post(sessions, chat, "/api/send", body).ok()?["id"].as_u64();
     if let Some(i) = id { own.lock().unwrap().insert(i); }
     id
@@ -153,6 +194,10 @@ fn post(sessions: &Sessions, chat: &str, path: &str, body: Value) -> Result<Valu
         match brief::tg_post(path, body.clone(), true) {
             Ok(v) => return Ok(v),
             Err((410, v)) => { gone(sessions, chat); return Err(format!("410 {v}")); }
+            Err((c, v)) if maybe_sent(path, c, &v) => {
+                store::log(&format!("{path} {chat}: {c} {v}; may have been sent, not retried"));
+                return Err(text::FILE_MAYBE_SENT.into());
+            }
             Err((c, v)) if c == 0 || c >= 500 => {
                 tries += 1;
                 if tries == 1 || tries % 20 == 0 { store::log(&format!("{path} {chat}: {c} {v}; retrying (attempt {tries})")); }
@@ -161,6 +206,14 @@ fn post(sessions: &Sessions, chat: &str, path: &str, body: Value) -> Result<Valu
             Err((c, v)) => { store::log(&format!("{path} {chat} failed {c} {v}")); return Err(format!("{c} {v}")); }
         }
     }
+}
+
+/// A file brief may have sent although the post failed: brief received it (no answer after the upload began, or the
+/// gateway in front of brief gave up waiting, 504) and goes on sending it to Telegram. It is not posted again, which
+/// would show it twice, and is reported as possibly not sent. Texts are posted again as before: an answer that is
+/// lost is worse than one that shows twice, and a text goes out within seconds.
+fn maybe_sent(path: &str, c: u16, v: &Value) -> bool {
+    path == "/api/send_file" && ((c == 0 && v["maybe_sent"] == true) || c == 504)
 }
 
 /// Telegram takes files up to 50 MB from a bot.
@@ -172,6 +225,7 @@ fn send_file(own: &Own, sessions: &Sessions, chat: &str, dev: &str, dir: &str, a
     let data = crate::host::read_file(&device, path, dir, FILE_MAX)?;
     if data.len() > FILE_MAX { return Err(text::file_too_big(FILE_MAX / 1_000_000)); }
     let name = path.rsplit(|c| c == '/' || (cfg!(windows) && c == '\\')).next().unwrap_or(path).to_string();
+    let _s = Sending::new(chat);
     let v = post(sessions, chat, "/api/send_file", json!({"chat": chat, "name": name, "data": brief::base64(&data), "text": alt}))?;
     if let Some(i) = v["id"].as_u64() { own.lock().unwrap().insert(i); }
     store::log(&format!("file to {chat}: {path}"));
@@ -189,7 +243,7 @@ fn deliver(own: &Own, sessions: &Sessions, chat: &str, msg: &str) -> Option<u64>
             text::Piece::Text(t) => id = send(own, sessions, chat, &t),
             text::Piece::File { alt, path } => if let Err(e) = send_file(own, sessions, chat, &dev, &dir, &alt, &path) {
                 store::log(&format!("file to {chat} failed: {path}: {e}"));
-                send(own, sessions, chat, &text::file_not_sent(&path, &e));
+                send(own, sessions, chat, &if e == text::FILE_MAYBE_SENT { text::file_unsure(&path) } else { text::file_not_sent(&path, &e) });
             },
         }
     }
@@ -734,14 +788,15 @@ fn run(sessions: Sessions) {
             if !sessions.lock().unwrap().contains_key(&chat) { refresh(&sessions); refreshed = Instant::now(); }
             let mut text = strip_bot_mention(m["text"].as_str().unwrap_or(""));
             let from_user = brief::from_user(m);
+            // asked before taking the sessions: it may wait for a send under way
+            if !from_user && mine(&own, &chat, id) { continue; }
             let to_name = {
                 let ss = sessions.lock().unwrap();
                 let Some(s) = ss.get(&chat) else { continue };
                 if s.deleted { continue; }
                 if !from_user {
-                    if own.lock().unwrap().contains(&id) { continue; }
-                    let Some((who, _)) = relay_split(&text) else { continue };
-                    if who.trim().is_empty() || who.trim() == s.name || who.contains('\n') { continue; }
+                    let names: Vec<&str> = ss.values().map(|t| t.name.as_str()).collect();
+                    if relayed_from(&text, &s.name, &names).is_none() { continue; }
                 }
                 s.name.clone()
             };
@@ -1332,6 +1387,50 @@ mod lane_tests {
         let (tx, rx) = channel();
         { let s = sessions.clone(); std::thread::spawn(move || output(rx, s, Arc::new(Mutex::new(HashSet::new())))); }
         (sessions, tx)
+    }
+
+    #[test]
+    fn own_messages_are_not_relays() {
+        let _g = store::TEST.lock().unwrap_or_else(|e| e.into_inner());
+        test_dir();
+        let names = ["exterior 开发", "全局", "T1"];
+        // the folded note a new claude session starts with is exterior's own, though it has " → " in it
+        assert_eq!(relayed_from("ℹ️ exterior → claude（启动时设置 effort auto…）\n/effort auto", "T1", &names), None);
+        assert_eq!(relayed_from("exterior → claude", "T1", &names), None);
+        // another topic's message
+        assert_eq!(relayed_from("exterior 开发 → 任务：修复", "T1", &names), Some("exterior 开发"));
+        assert_eq!(relayed_from("全局 → a → b", "T1", &names), Some("全局"));
+        // the topic itself, or no mark at all
+        assert_eq!(relayed_from("T1 → 自己", "T1", &names), None);
+        assert_eq!(relayed_from("没有分隔符", "T1", &names), None);
+    }
+
+    #[test]
+    fn file_that_may_have_gone_out_is_not_sent_again() {
+        let unsure = json!({"error": "no_answer", "maybe_sent": true});
+        assert!(maybe_sent("/api/send_file", 0, &unsure));
+        assert!(maybe_sent("/api/send_file", 504, &Value::Null));
+        // brief was never reached, or refused it: sending again is safe
+        assert!(!maybe_sent("/api/send_file", 0, &json!({"error": "no_answer", "maybe_sent": false})));
+        assert!(!maybe_sent("/api/send_file", 502, &Value::Null));
+        // a text is sent again as before
+        assert!(!maybe_sent("/api/send", 0, &unsure));
+    }
+
+    #[test]
+    fn own_message_back_before_its_send_returns() {
+        let own: Own = Arc::default();
+        // brief hands exterior's message back while the send that put it there is still waiting for its answer
+        let s = Sending::new("tgbot:own");
+        let o = own.clone();
+        let h = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(300)); o.lock().unwrap().insert(42); drop(s); });
+        assert!(mine(&own, "tgbot:own", 42));
+        h.join().unwrap();
+        assert!(SENDING.lock().unwrap().as_ref().is_none_or(|m| !m.contains_key("tgbot:own")));
+        // nothing under way: decided at once
+        let t = Instant::now();
+        assert!(!mine(&own, "tgbot:own", 43));
+        assert!(t.elapsed() < Duration::from_secs(1));
     }
 
     fn done(tid: &str, t: &str) -> Ev { Ev::Done { tid: tid.into(), gen: 1, text: Some(t.into()), stopped: false, error: None } }
