@@ -637,6 +637,7 @@ fn run(sessions: Sessions) {
             refresh(&sessions);
             refreshed = Instant::now();
             retry_waiting(&sessions, &own, &tx);
+            scheduled(&sessions, &own, &tx);
             let idle = Duration::from_secs(params::num("idle_hours") * 3600);
             for s in sessions.lock().unwrap().values_mut() {
                 if s.agent.is_some() && !s.pending && s.active.elapsed() > idle {
@@ -733,6 +734,47 @@ fn switch_account(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, d
             handle(sessions, own, tx, chat, &line);
         }
         None => { send(own, sessions, chat, &text::sys(&text::account_switched(to))); }
+    }
+}
+
+/// The 定时消息 setting: "HH:MM|话题名|内容 || …". Each fires once a day, at or up to SCHEDULE_LATE minutes after
+/// its time in exterior's time zone (so a restart around that time does not skip it, and setting one up in the
+/// evening does not fire it at once). The content goes to the topic's agent as a message from "定时"; exterior only
+/// passes it on.
+const SCHEDULE_LATE: i64 = 120;
+
+fn schedules(spec: &str) -> Vec<(i64, String, String)> {
+    spec.split("||").filter_map(|e| {
+        let mut f = e.trim().splitn(3, '|');
+        let (t, topic, content) = (f.next()?.trim(), f.next()?.trim(), f.next()?.trim());
+        let (h, m) = t.split_once(':')?;
+        let (h, m): (i64, i64) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
+        (h < 24 && m < 60 && !topic.is_empty() && !content.is_empty()).then(|| (h * 60 + m, topic.to_string(), content.to_string()))
+    }).collect()
+}
+
+/// Which schedules are due now: (minute of day, day number) in local time → entries to fire, given what fired today.
+fn due(list: &[(i64, String, String)], minute: i64, day: i64, fired: &Value) -> Vec<(String, String, String)> {
+    list.iter().filter(|(at, _, _)| minute >= *at && minute - at <= SCHEDULE_LATE).filter_map(|(at, topic, content)| {
+        let key = format!("{at}|{topic}|{content}");
+        (fired[&key].as_i64() != Some(day)).then(|| (key, topic.clone(), content.clone()))
+    }).collect()
+}
+
+fn scheduled(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
+    let list = schedules(&params::get("schedules"));
+    if list.is_empty() { return; }
+    let local = store::now() as i64 + crate::web::offset();
+    let mut fired = store::state("schedules");
+    if !fired.is_object() { fired = json!({}); }
+    for (key, topic, content) in due(&list, local % 86400 / 60, local / 86400, &fired) {
+        fired[&key] = json!(local / 86400);
+        store::set_state("schedules", fired.clone());
+        let tid = sessions.lock().unwrap().values().find(|s| !s.deleted && s.name == topic).map(|s| s.tid.clone());
+        let Some(tid) = tid else { store::log(&format!("schedule: no topic named {topic}")); continue };
+        store::log(&format!("schedule -> {topic}: {}", content.chars().take(60).collect::<String>()));
+        send(own, sessions, &tid, &text::sys(&text::scheduled(&content)));
+        handle(sessions, own, tx, &tid, &format!("{} {} {content}", text::SCHEDULE_FROM, params::get("relay_mark")));
     }
 }
 
@@ -1069,6 +1111,21 @@ mod tests {
         // a long notice keeps its whole text, folded
         let n = text::sys_warn(&format!("出错了\n{}", "细节 ".repeat(100)));
         assert!(n.starts_with("<footer>⚠️ exterior · 出错了</footer>") && n.contains(&"细节 ".repeat(100).trim_end().to_string()));
+    }
+
+    #[test]
+    fn schedule_times() {
+        let l = schedules(" 07:30|dream|整理 inbox || bad || 25:00|x|y || 8:05|全局|a|b ");
+        assert_eq!(l, vec![(450, "dream".into(), "整理 inbox".into()), (485, "全局".into(), "a|b".into())]);
+        let none = json!({});
+        assert!(due(&l, 449, 10, &none).is_empty());
+        assert_eq!(due(&l, 450, 10, &none).len(), 1);
+        assert_eq!(due(&l, 450 + SCHEDULE_LATE, 10, &none).len(), 2);
+        assert!(due(&l, 450 + SCHEDULE_LATE + 1, 10, &none).iter().all(|d| d.1 == "全局"));
+        // once a day
+        let fired = json!({"450|dream|整理 inbox": 10});
+        assert!(due(&l, 460, 10, &fired).is_empty());
+        assert_eq!(due(&l, 460, 11, &fired).len(), 1);
     }
 
     #[test]

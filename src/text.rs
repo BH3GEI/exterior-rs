@@ -237,6 +237,9 @@ pub fn relay_to_unknown(to: &str, names: &str) -> String { format!("没有名为
 pub const RELAY_EMPTY: &str = "内容为空";
 pub fn relayed(to: &str) -> String { format!("已发送到「{to}」") }
 pub const NOT_READY: &str = "exterior 尚未就绪";
+/// a scheduled message handed to a topic's agent (the 定时消息 setting)
+pub fn scheduled(content: &str) -> String { format!("定时消息已交给 agent：{content}") }
+pub const SCHEDULE_FROM: &str = "定时";
 pub fn session_ended(agent: &str) -> String { format!("会话已结束。下一条消息将开启新的 {agent} 会话。") }
 pub fn wrong_agent(owner: &str, cur: &str) -> String { format!("该命令只适用于 {owner}，当前话题使用的是 {cur}。") }
 pub fn start_failed(agent: &str, e: &str) -> String { sys_warn(&format!("无法启动 {agent}：{e}")) }

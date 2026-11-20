@@ -9,7 +9,7 @@ use tiny_http::{Header, Request, Response, Server};
 // ---- small helpers ----
 
 static OFFSET: OnceLock<i64> = OnceLock::new();
-fn offset() -> i64 {
+pub fn offset() -> i64 {
     *OFFSET.get_or_init(|| {
         if cfg!(windows) {
             // no `date` there: ask PowerShell for the offset in minutes
