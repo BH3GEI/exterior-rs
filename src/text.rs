@@ -133,11 +133,16 @@ pub fn split_text(t: &str, n: usize) -> Vec<String> {
     out
 }
 
-/// Pieces (paragraphs, folded steps) → messages of at most MESSAGE_MAX characters, in order.
+/// Pieces (paragraphs, folded steps) → messages of at most MESSAGE_MAX characters, in order. Folded steps and what
+/// the agent says are never in the same message: an answer after a long run of steps would be easy to miss.
 pub fn pack(pieces: Vec<String>) -> Vec<String> {
     let mut msgs: Vec<String> = Vec::new();
     let mut cur = String::new();
+    let mut cur_step = false;
     for p in pieces {
+        let step = p.starts_with("<details>");
+        if !cur.is_empty() && step != cur_step { msgs.push(std::mem::take(&mut cur)); }
+        cur_step = step;
         for p in if p.chars().count() > MESSAGE_MAX { split_text(&p, MESSAGE_MAX) } else { vec![p] } {
             if !cur.is_empty() && cur.chars().count() + 2 + p.chars().count() > MESSAGE_MAX { msgs.push(std::mem::take(&mut cur)); }
             if !cur.is_empty() { cur.push_str("\n\n"); }

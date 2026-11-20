@@ -1103,6 +1103,10 @@ mod tests {
         assert!(msgs.iter().all(|m| m.chars().count() <= text::MESSAGE_MAX));
         let all = msgs.join("\n");
         for i in [0, 2500, 4999] { assert_eq!(all.matches(&format!("第 {i} 行\n")).count(), 2, "line {i}"); }
+        // the answer never hides at the end of a message full of folded steps
+        let m = text::pack(vec![text::step("💭 思考", "x")[0].clone(), "回答".into(), text::step("🔧 Bash", "y")[0].clone(), text::step("🔧 Bash", "z")[0].clone()]);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1], "回答");
         // a blank line early on does not make it cut mid-line
         let body = format!("\n\n── 输出 ──\n{}", "一行代码;\n".repeat(20000));
         for part in text::split_text(&body, 28000) { assert!(part.ends_with(';') || part.ends_with(";\n"), "{}", &part[part.len() - 20..]); }
@@ -1346,19 +1350,19 @@ mod lane_tests {
         std::thread::sleep(Duration::from_millis(1500));
         assert!(of(&got, "tgbot:run").is_empty());
         assert_eq!(running("tgbot:run"), Some((false, true)));
-        // its turn ends: everything goes out at once, as one message
+        // its turn ends: everything goes out at once: the steps as one message, the answer as its own
         tx.send(Ev::Text { tid: "tgbot:run".into(), gen: 1, delta: "ans".into() }).unwrap();
         tx.send(done("tgbot:run", "ans")).unwrap();
-        wait(&|| !of(&got, "tgbot:run").is_empty());
+        wait(&|| of(&got, "tgbot:run").len() >= 2);
         let run = of(&got, "tgbot:run");
-        assert_eq!(run.len(), 1, "{run:?}");
-        assert!(run[0].contains("s1") && run[0].contains("s2") && run[0].contains("ans"), "{run:?}");
+        assert_eq!(run.len(), 2, "{run:?}");
+        assert!(run[0].contains("s1") && run[0].contains("s2") && run[1] == "ans", "{run:?}");
         // not busy: merge_s again
         brief::BUSY_TEST.store(false, std::sync::atomic::Ordering::SeqCst);
         sessions.lock().unwrap().get_mut("tgbot:run").unwrap().pending = true;
         tx.send(step("tgbot:run", "s3")).unwrap();
-        wait(&|| of(&got, "tgbot:run").len() == 2);
-        assert!(of(&got, "tgbot:run")[1].contains("s3"));
+        wait(&|| of(&got, "tgbot:run").len() == 3);
+        assert!(of(&got, "tgbot:run")[2].contains("s3"));
         wait(&|| running("tgbot:run") == Some((false, false)) || handed("tgbot:run") == 0);
     }
 }
