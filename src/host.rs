@@ -399,7 +399,8 @@ mod tests {
             let out = super::exec(c, 60).unwrap();
             let v: serde_json::Value = serde_json::from_str(out.lines().last().unwrap()).unwrap_or_else(|_| panic!("{ps}: {out}"));
             assert_eq!(v[0], json!(args), "{ps}");
-            assert_eq!(v[1].as_str().unwrap().to_lowercase(), dir.to_str().unwrap().to_lowercase(), "{ps}");
+            // the temporary folder may come back in its short (8.3) form
+            assert!(v[1].as_str().unwrap().to_lowercase().ends_with(&format!("exterior-agent-{}\\topic dir", std::process::id())), "{ps}: {}", v[1]);
             assert_eq!(v[2], "t:1");
             assert_eq!(v[3], r"C:\x\bin");
             assert_eq!(v[4], false);
