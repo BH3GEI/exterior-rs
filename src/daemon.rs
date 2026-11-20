@@ -199,6 +199,75 @@ fn deliver(own: &Own, sessions: &Sessions, chat: &str, msg: &str) -> Option<u64>
 /// `exterior send <话题> <内容>` from an agent: signed with the sending topic's name and sent to the other topic
 /// (or to any chat brief knows, by its id), files included. Not marked as exterior's own, so the receiving topic's
 /// agent gets it.
+/// `exterior watch <会话ID>` / `exterior unwatch <会话ID>` / `exterior watch` (list): which chats brief knows (a WeChat
+/// group, say) the topic's agent wants to follow. exterior itself waits for their new messages and hands them to the
+/// agent in small batches, so the agent needs no polling script of its own.
+pub fn watch(from: &str, chat: &str, on: bool) -> Result<String, String> {
+    let sessions = LIVE.lock().unwrap().clone().ok_or(text::NOT_READY)?;
+    if !sessions.lock().unwrap().get(from).map(|s| !s.deleted).unwrap_or(false) { return Err(text::relay_from_unknown(from)); }
+    let mut list: Vec<String> = store::note(from)["watch"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
+    let chat = chat.trim();
+    if chat.is_empty() { return Ok(text::watching(&list)); }
+    if chat.starts_with(brief::TOPIC_PREFIX) { return Err(text::WATCH_TOPIC.into()); }
+    list.retain(|c| c != chat);
+    if on { list.push(chat.to_string()); }
+    store::note_set(from, "watch", json!(list));
+    store::log(&format!("{from}: {} {chat}", if on { "watch" } else { "unwatch" }));
+    Ok(if on { text::watch_on(chat) } else { text::watch_off(chat) })
+}
+
+/// A watched chat's new messages wait this long for more before going to the agent, and at most WATCH_MAX.
+const WATCH_QUIET: Duration = Duration::from_secs(20);
+const WATCH_MAX: Duration = Duration::from_secs(120);
+
+/// One message from a watched chat, as the agent reads it: "[时间] 发送者：内容".
+fn watch_line(m: &Value) -> String {
+    let t = m["ts"].as_u64().map(|t| crate::web::fmt_time(t)).unwrap_or_default();
+    let kind = m["type"].as_str().filter(|k| !k.is_empty() && *k != "text").map(|k| format!("[{k}] ")).unwrap_or_default();
+    format!("[{t}] {}：{kind}{}", m["sender"].as_str().unwrap_or("?"), m["text"].as_str().unwrap_or("").trim())
+}
+
+fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
+    // topic → (chat name, lines, first, last arrival)
+    let mut pend: HashMap<String, (String, Vec<String>, Instant, Instant)> = HashMap::new();
+    let latest = || brief::get("/api/messages?limit=1").and_then(|v| v.as_array().and_then(|a| a.iter().filter_map(|m| m["id"].as_u64()).max()));
+    let mut last = store::state("watch_after").as_u64().filter(|l| *l > 0).or_else(latest).unwrap_or(0);
+    loop {
+        let mut watched: HashMap<String, Vec<String>> = HashMap::new();
+        for n in store::notes().iter().filter(|n| n["deleted"] != true) {
+            for c in n["watch"].as_array().into_iter().flatten().filter_map(|c| c.as_str()) {
+                watched.entry(c.to_string()).or_default().push(n["topic"].as_str().unwrap_or("").to_string());
+            }
+        }
+        if watched.is_empty() && pend.is_empty() {
+            // nothing followed: keep the mark current, so a new watch starts from now, not from old messages
+            std::thread::sleep(Duration::from_secs(20));
+            if let Some(l) = latest() { last = last.max(l); store::set_state("watch_after", json!(last)); }
+            continue;
+        }
+        match brief::call("GET", &format!("/api/wait?after_id={last}&timeout=15&limit=500"), None) {
+            Ok(v) => for m in v.as_array().into_iter().flatten() {
+                last = last.max(m["id"].as_u64().unwrap_or(0));
+                let chat = m["chat"].as_str().unwrap_or("");
+                for tid in watched.get(chat).into_iter().flatten() {
+                    let name = m["chat_name"].as_str().filter(|n| !n.is_empty()).unwrap_or(chat).to_string();
+                    let e = pend.entry(tid.clone()).or_insert_with(|| (name, Vec::new(), Instant::now(), Instant::now()));
+                    e.1.push(watch_line(m));
+                    e.3 = Instant::now();
+                }
+            },
+            Err(_) => std::thread::sleep(params::secs("reconnect_s")),
+        }
+        store::set_state("watch_after", json!(last));
+        let ready: Vec<String> = pend.iter().filter(|(_, (_, _, first, at))| at.elapsed() >= WATCH_QUIET || first.elapsed() >= WATCH_MAX).map(|(t, _)| t.clone()).collect();
+        for tid in ready {
+            let Some((name, lines, _, _)) = pend.remove(&tid) else { continue };
+            store::log(&format!("watch -> {tid}: {} messages from {name}", lines.len()));
+            handle(&sessions, &own, &tx, &tid, &format!("{name} {} {}\n{}", params::get("relay_mark"), text::WATCH_HEADER, lines.join("\n")));
+        }
+    }
+}
+
 pub fn relay(from: &str, to: &str, body: &str) -> Result<String, String> {
     let sessions = LIVE.lock().unwrap().clone().ok_or(text::NOT_READY)?;
     let to = to.trim();
@@ -620,6 +689,7 @@ fn run(sessions: Sessions) {
     });
     std::thread::spawn(|| for d in store::devices() { if let Err(e) = crate::prompt::install(&d) { store::log(&format!("install brief key on {}: {e}", d["name"])); } });
     refresh(&sessions);
+    { let (s, o, t) = (sessions.clone(), own.clone(), tx.clone()); std::thread::spawn(move || watcher(s, o, t)); }
     for (tid, msg) in resend {
         send(&own, &sessions, &tid, &text::sys(text::RESTART_RESEND));
         let line = if msg.starts_with('/') { msg } else { text::resent(&msg) };

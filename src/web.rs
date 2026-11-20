@@ -456,7 +456,12 @@ fn respond(mut req: Request) {
                 let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
                 let f = form(&body);
                 let g = |k: &str| f.get(k).cloned().unwrap_or_default();
-                match daemon::relay(&g("from"), &g("to"), &g("text")) { Ok(m) => (200, m), Err(e) => (400, e) }
+                let r = match g("cmd").as_str() {
+                    "watch" => daemon::watch(&g("from"), &g("to"), true),
+                    "unwatch" => daemon::watch(&g("from"), &g("to"), false),
+                    _ => daemon::relay(&g("from"), &g("to"), &g("text")),
+                };
+                match r { Ok(m) => (200, m), Err(e) => (400, e) }
             };
         let _ = req.respond(Response::from_string(format!("{msg}\n")).with_status_code(code));
         return;

@@ -90,10 +90,16 @@ pub fn send_key() -> String {
 fn send_script(dev: &Value) -> String {
     format!(r#"#!/bin/sh
 # exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
+# exterior watch <会话ID> / exterior unwatch <会话ID> / exterior watch：让 exterior 盯住一个会话（如微信群），新消息自动交给你。
 # 由 exterior 安装，每次启动时覆盖。
-if [ "$1" != send ] || [ $# -lt 3 ]; then echo '用法：exterior send <话题名> <内容>' >&2; exit 2; fi
-to=$2; shift 2
-exec curl -sS --fail-with-body -H "Authorization: Bearer $(cat {key})" --data-urlencode "from=$EXTERIOR_TOPIC" --data-urlencode "to=$to" --data-urlencode "text=$*" {url}
+usage() {{ echo '用法：exterior send <话题名> <内容> | exterior watch [会话ID] | exterior unwatch <会话ID>' >&2; exit 2; }}
+case "$1" in
+  send) [ $# -ge 3 ] || usage; to=$2; shift 2; cmd=send; text="$*" ;;
+  watch) [ $# -le 2 ] || usage; cmd=watch; to=${{2:-}}; text= ;;
+  unwatch) [ $# -eq 2 ] || usage; cmd=unwatch; to=$2; text= ;;
+  *) usage ;;
+esac
+exec curl -sS --fail-with-body -H "Authorization: Bearer $(cat {key})" --data-urlencode "cmd=$cmd" --data-urlencode "from=$EXTERIOR_TOPIC" --data-urlencode "to=$to" --data-urlencode "text=$text" {url}
 "#, key = host::quote(&format!("{}/.exterior-key", root(dev))), url = host::quote(&format!("{}/api/send", self_url(dev))))
 }
 
@@ -103,12 +109,15 @@ fn send_ps1(dev: &Value) -> String {
     // with a byte order mark: Windows PowerShell reads a file without one in the local code page
     format!("\u{feff}{}", format!(r#"# exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
 # 由 exterior 安装，每次启动时覆盖。
-if ($args.Count -lt 3 -or $args[0] -ne 'send') {{ [Console]::Error.WriteLine('用法：exterior send <话题名> <内容>'); exit 2 }}
-$to = [string]$args[1]
-$text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' '
+$usage = '用法：exterior send <话题名> <内容> | exterior watch [会话ID] | exterior unwatch <会话ID>'
+$cmd = [string]$args[0]; $to = ''; $text = ''
+if ($cmd -eq 'send' -and $args.Count -ge 3) {{ $to = [string]$args[1]; $text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }}
+elseif ($cmd -eq 'watch' -and $args.Count -le 2) {{ if ($args.Count -eq 2) {{ $to = [string]$args[1] }} }}
+elseif ($cmd -eq 'unwatch' -and $args.Count -eq 2) {{ $to = [string]$args[1] }}
+else {{ [Console]::Error.WriteLine($usage); exit 2 }}
 $key = (Get-Content -Raw -Encoding UTF8 -LiteralPath {key}).Trim()
 $e = {{ param($s) [Uri]::EscapeDataString([string]$s) }}
-$body = 'from=' + (& $e $env:EXTERIOR_TOPIC) + '&to=' + (& $e $to) + '&text=' + (& $e $text)
+$body = 'cmd=' + (& $e $cmd) + '&from=' + (& $e $env:EXTERIOR_TOPIC) + '&to=' + (& $e $to) + '&text=' + (& $e $text)
 try {{ [Console]::OutputEncoding = [Text.Encoding]::UTF8 }} catch {{}}
 try {{
   $r = Invoke-WebRequest -UseBasicParsing -Method Post -Uri {url} -Headers @{{ Authorization = "Bearer $key" }} -ContentType 'application/x-www-form-urlencoded; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
@@ -140,6 +149,36 @@ pub fn install(dev: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::url_for;
+
+    #[cfg(unix)]
+    #[test]
+    fn send_script_commands() {
+        let dir = std::env::temp_dir().join(format!("exterior-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".exterior-key"), "k").unwrap();
+        let srv = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/api/send", srv.server_addr().to_ip().unwrap().port());
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        { let got = got.clone(); std::thread::spawn(move || for mut r in srv.incoming_requests() {
+            let mut b = String::new(); let _ = std::io::Read::read_to_string(r.as_reader(), &mut b);
+            got.lock().unwrap().push(b); let _ = r.respond(tiny_http::Response::from_string("ok"));
+        }); }
+        let dev = serde_json::json!({"root": dir.to_str().unwrap(), "host": "local"});
+        let script = super::send_script(&dev);
+        let start = script.rfind(" '").unwrap();
+        let script = format!("{} '{url}'\n", &script[..start]);
+        let f = dir.join("exterior");
+        std::fs::write(&f, script).unwrap();
+        let run = |args: &[&str]| std::process::Command::new("sh").arg(&f).args(args).env("EXTERIOR_TOPIC", "tgbot:1").output().unwrap().status.code();
+        assert_eq!(run(&["watch", "wx@chatroom"]), Some(0));
+        assert_eq!(run(&["send", "全局", "a", "b"]), Some(0));
+        assert_eq!(run(&["unwatch"]), Some(2));
+        assert_eq!(run(&["bogus"]), Some(2));
+        let g = got.lock().unwrap().clone();
+        assert!(g[0].contains("cmd=watch") && g[0].contains("to=wx%40chatroom") && g[0].contains("from=tgbot%3A1"), "{g:?}");
+        assert!(g[1].contains("cmd=send") && g[1].contains("text=a+b"), "{g:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn address_for_devices() {

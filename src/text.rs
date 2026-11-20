@@ -245,6 +245,11 @@ pub const NOT_READY: &str = "exterior 尚未就绪";
 /// a scheduled message handed to a topic's agent (the 定时消息 setting)
 pub fn scheduled(content: &str) -> String { format!("定时消息已交给 agent：{content}") }
 pub const SCHEDULE_FROM: &str = "定时";
+pub fn watching(list: &[String]) -> String { if list.is_empty() { "没有在盯的会话".into() } else { format!("正在盯：{}", list.join("、")) } }
+pub fn watch_on(c: &str) -> String { format!("开始盯 {c}：有新消息时，exterior 会攒一小批交给你") }
+pub fn watch_off(c: &str) -> String { format!("不再盯 {c}") }
+pub const WATCH_TOPIC: &str = "Telegram 话题之间请用 exterior send";
+pub const WATCH_HEADER: &str = "（exterior watch 收到的新消息）";
 pub fn session_ended(agent: &str) -> String { format!("会话已结束。下一条消息将开启新的 {agent} 会话。") }
 pub fn wrong_agent(owner: &str, cur: &str) -> String { format!("该命令只适用于 {owner}，当前话题使用的是 {cur}。") }
 pub fn start_failed(agent: &str, e: &str) -> String { sys_warn(&format!("无法启动 {agent}：{e}")) }
