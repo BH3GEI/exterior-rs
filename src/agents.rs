@@ -615,7 +615,7 @@ impl Agent {
 
     pub fn kill(&mut self) {
         *self.stdin.lock().unwrap() = None;
-        if let Some(c) = self.child.lock().unwrap().as_mut() { let _ = c.kill(); }
+        if let Some(c) = self.child.lock().unwrap().as_mut() { crate::host::kill(c); }
     }
 
 }
@@ -716,7 +716,7 @@ impl Ctl {
             (Kind::Pi, "resume") if arg.is_empty() => {
                 // pi has no "list sessions" request: list the session files next to the current one, through pi's own shell
                 let st = self.ask(|id| json!({"type": "get_state", "id": id}))?;
-                let dir = st["data"]["sessionFile"].as_str().and_then(|f| f.rsplit_once('/')).map(|x| x.0.to_string()).ok_or(text::NO_SESSIONS)?;
+                let dir = st["data"]["sessionFile"].as_str().and_then(|f| f.rsplit_once(['/', '\\'])).map(|x| x.0.to_string()).ok_or(text::NO_SESSIONS)?;
                 self.ask(|id| json!({"type": "bash", "id": id, "command": format!("ls -t {} | head -n 10", crate::host::quote(&dir))}))?
                     .pipe(|mut r| { r["data"]["_dir"] = json!(dir); r })
             }
@@ -857,7 +857,7 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
     // never wait forever: if the agent does not answer in time, close it
     let stdout = child.stdout.take().unwrap();
     let child = Arc::new(Mutex::new(child));
-    { let c = child.clone(); std::thread::spawn(move || { std::thread::sleep(params::secs("commands_timeout_s")); let _ = c.lock().unwrap().kill(); }); }
+    { let c = child.clone(); std::thread::spawn(move || { std::thread::sleep(params::secs("commands_timeout_s")); crate::host::kill(&mut c.lock().unwrap()); }); }
     let mut out = vec![];
     let lines = BufReader::new(stdout).lines();
     for line in lines.map_while(Result::ok).take(500) {
@@ -871,7 +871,7 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
         break;
     }
     drop(stdin);
-    let _ = child.lock().unwrap().kill();
+    crate::host::kill(&mut child.lock().unwrap());
     out
 }
 

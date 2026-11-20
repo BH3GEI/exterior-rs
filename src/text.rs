@@ -228,6 +228,9 @@ pub fn shown(t: &str) -> String { format!("```\n{t}\n```") }
 pub fn codex_model_kept(v: &str) -> String { format!("codex 没有切换模型的请求，模型随每一轮发送：从下一轮起使用 {v}。") }
 pub fn file_not_sent(path: &str, e: &str) -> String { sys_warn(&format!("文件没有发出去：{path}：{e}")) }
 pub const FILE_MISSING: &str = "文件不存在";
+/// Shown before a remote device's test result when its password cannot be used on this machine.
+pub const NO_SSHPASS: &str = "本机没有 sshpass，无法使用密码，已改用 SSH 密钥登录；";
+pub const ACCOUNT_SWITCH_WINDOWS: &str = "切换 claude 账号需要复制会话记录，目前只支持 Linux 和 macOS 设备";
 pub fn file_too_big(mb: usize) -> String { format!("文件超过 {mb} MB") }
 pub fn relay_from_unknown(from: &str) -> String { format!("exterior 不认识发送方话题「{from}」（`exterior send` 要在 exterior 启动的 agent 中运行）") }
 pub fn relay_to_unknown(to: &str, names: &str) -> String { format!("没有名为「{to}」的话题。现有话题：{names}") }

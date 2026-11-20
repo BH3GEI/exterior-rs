@@ -169,12 +169,9 @@ const FILE_MAX: usize = 50_000_000;
 /// A file on the topic's device, sent to `chat` with the agent's caption. A relative path is in the topic's folder.
 fn send_file(own: &Own, sessions: &Sessions, chat: &str, dev: &str, dir: &str, alt: &str, path: &str) -> Result<(), String> {
     let device = store::device(dev).ok_or_else(|| text::device_missing(dev))?;
-    let word = if let Some(r) = path.strip_prefix("~/") { format!("\"$HOME\"/{}", crate::host::quote(r)) }
-               else if path.starts_with('/') { crate::host::quote(path) }
-               else { crate::host::quote(&format!("{}/{path}", dir.trim_end_matches('/'))) };
-    let data = crate::host::read_bytes(&device, &word, FILE_MAX)?;
+    let data = crate::host::read_file(&device, path, dir, FILE_MAX)?;
     if data.len() > FILE_MAX { return Err(text::file_too_big(FILE_MAX / 1_000_000)); }
-    let name = path.rsplit('/').next().unwrap_or(path).to_string();
+    let name = path.rsplit(|c| c == '/' || (cfg!(windows) && c == '\\')).next().unwrap_or(path).to_string();
     let v = post(sessions, chat, "/api/send_file", json!({"chat": chat, "name": name, "data": brief::base64(&data), "text": alt}))?;
     if let Some(i) = v["id"].as_u64() { own.lock().unwrap().insert(i); }
     store::log(&format!("file to {chat}: {path}"));
@@ -240,9 +237,10 @@ fn gone(sessions: &Sessions, chat: &str) {
     }
 }
 
-fn safe(name: &str) -> String {
-    let s: String = name.trim().chars().map(|c| if matches!(c, '/' | ':' | '\\' | '\0') { '_' } else { c }).collect();
-    let s = s.trim_matches('.').to_string();
+/// A topic's title as a folder name. `windows`: also without the characters Windows does not allow in names.
+fn safe(name: &str, windows: bool) -> String {
+    let s: String = name.trim().chars().map(|c| if matches!(c, '/' | ':' | '\\' | '\0') || (windows && (matches!(c, '<' | '>' | '"' | '|' | '?' | '*') || c.is_control())) { '_' } else { c }).collect();
+    let s = if windows { s.trim_end_matches([' ', '.']).trim_matches('.').to_string() } else { s.trim_matches('.').to_string() };
     if s.is_empty() { text::UNNAMED_TOPIC.into() } else { s }
 }
 
@@ -253,7 +251,7 @@ fn dir_for(dev: &str, tid: &str, name: &str) -> String {
     if name.trim() == params::get("global_topic") { return crate::prompt::global_dir(&device); }
     let root = crate::prompt::root(&device);
     let taken: Vec<String> = store::notes().iter().filter(|n| n["topic"] != tid).filter_map(|n| n["dir"].as_str().map(String::from)).collect();
-    let mut d = format!("{root}/{}", safe(name));
+    let mut d = format!("{root}/{}", safe(name, cfg!(windows) && crate::host::is_local(&device)));
     let reserved = [params::get("global_dir"), params::get("knowledge_dir")];
     if taken.contains(&d) || reserved.iter().any(|r| r == name.trim()) { d = format!("{d}-{}", brief::topic_id(tid)); }
     d
@@ -696,7 +694,8 @@ fn run(sessions: Sessions) {
 /// The other claude accounts with their usage, as buttons that switch to them.
 fn account_buttons(dev: &Value, cur: &str) -> Result<(String, Value), String> {
     let path = params::get("cc_usage");
-    let raw = crate::host::run(dev, &format!("cat {path}"), 20).map_err(|e| text::accounts_failed(&e))?;
+    let raw = if crate::host::is_local(dev) { crate::host::read_local(&path) } else { crate::host::run(dev, &format!("cat {path}"), 20) }
+        .map_err(|e| text::accounts_failed(&e))?;
     let mut age = 0;
     let mut items = Vec::new();
     for l in raw.lines() {
@@ -714,6 +713,8 @@ fn account_buttons(dev: &Value, cur: &str) -> Result<(String, Value), String> {
 /// own config folder), resume it there, and re-send the message that ran out of quota, if any.
 fn switch_account(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, dev: Option<Value>, from: &str, to: &str, sid: Option<String>) {
     let Some(dev) = dev else { send(own, sessions, chat, &text::sys_warn(text::NO_DEVICE)); return };
+    // the copy below is a sh script
+    if crate::host::is_local(&dev) && cfg!(windows) { send(own, sessions, chat, &text::sys_warn(text::ACCOUNT_SWITCH_WINDOWS)); return; }
     if let Some(id) = &sid {
         let dir = |name: &str| params::get("claude_dir").replace("{name}", name);
         let script = format!("f=$(ls {src}/projects/*/{id}.jsonl 2>/dev/null | head -1); [ -n \"$f\" ] || {{ echo 'no record of {id} under {src}'; exit 3; }}; \
@@ -754,7 +755,7 @@ fn retry_waiting(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
                 continue;
             }
             let dev = n["device"].as_str().unwrap_or("").to_string();
-            let ok = *up.entry(dev.clone()).or_insert_with(|| store::device(&dev).map(|d| crate::host::run(&d, "true", 30).is_ok()).unwrap_or(false));
+            let ok = *up.entry(dev.clone()).or_insert_with(|| store::device(&dev).map(|d| crate::host::alive(&d)).unwrap_or(false));
             if !ok { continue; }
             // the user may have moved on in the meantime: then his newer message stands, nothing to repeat
             if store::note(&tid)["wait_msg"].as_str() != Some(msg.as_str()) { continue; }
@@ -1302,5 +1303,16 @@ mod lane_tests {
         wait(&|| of(&got, "tgbot:run").len() == 2);
         assert!(of(&got, "tgbot:run")[1].contains("s3"));
         wait(&|| running("tgbot:run") == Some((false, false)) || handed("tgbot:run") == 0);
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    #[test]
+    fn folder_names() {
+        // as before for Linux and macOS devices; Windows names lose what Windows does not allow
+        assert_eq!(super::safe("a/b:c?*<>|\"d.", false), "a_b_c?*<>|\"d");
+        assert_eq!(super::safe("a/b:c?*<>|\"d. ", true), "a_b_c______d");
+        assert_eq!(super::safe("..", true), crate::text::UNNAMED_TOPIC);
     }
 }

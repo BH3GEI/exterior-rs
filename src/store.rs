@@ -1,11 +1,34 @@
-//! Everything exterior keeps, in one folder (on Lazycat: /lzcapp/var):
+//! Everything exterior keeps, in one folder (on Lazycat: /lzcapp/var; elsewhere a folder of the user's, see `default_var`):
 //! config.json (devices, agents, brief, settings), secret.key, sessions/<topic>.json, state.json,
 //! messages.jsonl (session → session), exterior.log.
 use serde_json::{json, Value};
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
-pub fn var() -> String { std::env::var("EXTERIOR_VAR").unwrap_or_else(|_| "/lzcapp/var".into()) }
+/// Running as the Lazycat app (its domain is in the environment, or its folders exist).
+pub fn on_lazycat() -> bool {
+    static L: OnceLock<bool> = OnceLock::new();
+    *L.get_or_init(|| std::env::var("LAZYCAT_APP_DOMAIN").is_ok_and(|d| !d.is_empty()) || std::path::Path::new("/lzcapp").is_dir())
+}
+
+/// The data folder: EXTERIOR_VAR if set; on Lazycat /lzcapp/var; else the user's own application data folder.
+pub fn var() -> String {
+    std::env::var("EXTERIOR_VAR").ok().filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default_var(on_lazycat(), std::env::consts::OS, &|k| std::env::var(k).ok().filter(|v| !v.is_empty())))
+}
+
+/// macOS: ~/Library/Application Support/exterior; Windows: %APPDATA%\exterior; other systems: $XDG_DATA_HOME/exterior
+/// (or ~/.local/share/exterior).
+pub fn default_var(lazycat: bool, os: &str, env: &dyn Fn(&str) -> Option<String>) -> String {
+    if lazycat { return "/lzcapp/var".into(); }
+    let home = env("HOME").or_else(|| env("USERPROFILE"));
+    let p = match os {
+        "macos" => home.map(|h| format!("{h}/Library/Application Support/exterior")),
+        "windows" => env("APPDATA").map(|a| format!("{a}\\exterior")).or_else(|| env("USERPROFILE").or(home).map(|h| format!("{h}\\AppData\\Roaming\\exterior"))),
+        _ => env("XDG_DATA_HOME").map(|x| format!("{x}/exterior")).or_else(|| home.map(|h| format!("{h}/.local/share/exterior"))),
+    };
+    p.unwrap_or_else(|| "exterior-data".into())
+}
 pub fn path(p: &str) -> String { format!("{}/{p}", var()) }
 
 static LOCK: Mutex<()> = Mutex::new(());
@@ -94,4 +117,23 @@ pub fn set_state(k: &str, v: Value) {
     let mut s = load(&p);
     s[k] = v;
     save(&p, &s);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_var;
+
+    #[test]
+    fn data_folder() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|p| p.0 == k).map(|p| p.1.to_string());
+        let mac = env(&[("HOME", "/Users/a")]);
+        assert_eq!(default_var(true, "macos", &mac), "/lzcapp/var");
+        assert_eq!(default_var(true, "linux", &env(&[])), "/lzcapp/var");
+        assert_eq!(default_var(false, "macos", &mac), "/Users/a/Library/Application Support/exterior");
+        assert_eq!(default_var(false, "windows", &env(&[("APPDATA", r"C:\Users\a\AppData\Roaming"), ("USERPROFILE", r"C:\Users\a")])), r"C:\Users\a\AppData\Roaming\exterior");
+        assert_eq!(default_var(false, "windows", &env(&[("USERPROFILE", r"C:\Users\a")])), r"C:\Users\a\AppData\Roaming\exterior");
+        assert_eq!(default_var(false, "linux", &env(&[("HOME", "/home/a")])), "/home/a/.local/share/exterior");
+        assert_eq!(default_var(false, "linux", &env(&[("HOME", "/home/a"), ("XDG_DATA_HOME", "/x")])), "/x/exterior");
+        assert_eq!(default_var(false, "linux", &env(&[])), "exterior-data");
+    }
 }

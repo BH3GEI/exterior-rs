@@ -11,7 +11,7 @@ pub const PARAMS: &[Param] = &[
     Param { key: "session_prompt", label: "启动说明文件（相对 knowledge）", default: "exterior-session.md" },
     Param { key: "global_prompt", label: "全局话题追加说明文件（相对 knowledge）", default: "exterior-global.md" },
     Param { key: "test_prompt", label: "测试 agent 时发送的问题所在文件（相对 knowledge）", default: "exterior-test.md" },
-    Param { key: "self_url", label: "设备访问 exterior 的地址（`exterior send` 使用；留空则用懒猫应用域名）", default: "" },
+    Param { key: "self_url", label: "设备访问 exterior 的地址（`exterior send` 使用；留空则用懒猫应用域名，不在懒猫上时本机设备用 http://127.0.0.1:端口）", default: "" },
     Param { key: "relay_mark", label: "会话之间转发消息的分隔符", default: "→" },
     Param { key: "pick_mark", label: "启动命令选定账号时输出的前缀", default: "→" },
     Param { key: "claude_args", label: "claude 的额外启动参数", default: "--dangerously-skip-permissions" },

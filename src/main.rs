@@ -16,10 +16,10 @@ fn main() {
     // start text, list its models, optionally switch, ask the question, print what comes back. For checking the drivers.
     let a: Vec<String> = std::env::args().collect();
     if a.get(1).map(|s| s.as_str()) == Some("probe") { return probe(&a[2..]); }
-    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3000);
+    let addr = web::listen_addr(store::on_lazycat(), std::env::var("EXTERIOR_ADDR").ok().as_deref(), std::env::var("PORT").ok().as_deref());
     let _ = std::fs::create_dir_all(store::var());
     daemon::start();
-    web::serve(port);
+    web::serve(&addr);
 }
 
 fn probe(a: &[String]) {

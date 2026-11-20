@@ -11,6 +11,11 @@ use tiny_http::{Header, Request, Response, Server};
 static OFFSET: OnceLock<i64> = OnceLock::new();
 fn offset() -> i64 {
     *OFFSET.get_or_init(|| {
+        if cfg!(windows) {
+            // no `date` there: ask PowerShell for the offset in minutes
+            let c = crate::host::powershell("[int][TimeZoneInfo]::Local.GetUtcOffset([DateTime]::Now).TotalMinutes", false);
+            return crate::host::exec(c, 30).ok().and_then(|m| m.trim().parse::<i64>().ok()).map(|m| m * 60).unwrap_or(0);
+        }
         let z = std::process::Command::new("date").arg("+%z").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         if z.len() == 5 {
             let sign = if z.starts_with('-') { -1 } else { 1 };
@@ -213,6 +218,7 @@ fn devices_page() -> String {
             Kind::ALL.iter().map(|k| format!("<option value=\"{}\">{}</option>", k.name(), k.label())).collect::<String>()));
     }
     body.push_str(r#"<h2>添加设备</h2><div class="card"><form method="post" action="/devices/save"><input type="hidden" name="i" value="new">
+<div class="row mute">地址填 local 表示运行 exterior 的这台机器（agent 在本机启动，不经过 SSH）。远程设备通过 SSH 登录：填了密码时用 sshpass 输入密码；没有填密码，或本机没有 sshpass（Windows、未安装 sshpass 的 Mac）时，用本机用户自己的 SSH 密钥登录，需事先把公钥加入设备的 authorized_keys。远程设备须为 Linux 或 macOS。</div>
 <div class="grid"><div><label class="mute">名称</label><br><input name="name"></div><div><label class="mute">地址</label><br><input name="host" placeholder="local 表示本机"></div>
 <div><label class="mute">端口</label><br><input name="port" value="22"></div><div><label class="mute">用户</label><br><input name="user"></div>
 <div><label class="mute">密码</label><br><input name="password" type="password" autocomplete="new-password"></div><div><label class="mute">根目录</label><br><input name="root"></div></div>
@@ -225,7 +231,7 @@ fn memory_page() -> String {
     for d in store::devices() {
         let dn = d["name"].as_str().unwrap_or("").to_string();
         let p = crate::prompt::infra(&d);
-        let tree = crate::host::run(&d, &format!("cd {} && find . -name '*.md' -not -path './.git/*' -not -path './archive/*' | sed 's#^./##' | sort", crate::host::quote(&p)), 30).unwrap_or_else(|e| text::read_failed(&e));
+        let tree = crate::infra::files(&d);
         let remote = crate::infra::remote(&d);
         let last = &store::state("infra")[&dn];
         let status = if last.is_null() { "<span class=\"mute\">exterior 尚未提交过修改</span>".to_string() } else {
@@ -341,9 +347,10 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
                 let key = format!("dev:{}", d["name"].as_str().unwrap_or(""));
                 background(key, move || {
                     let root = d["root"].as_str().unwrap_or("").to_string();
-                    let out = crate::host::run(&d, &format!("uname -sn; mkdir -p {r} && test -w {r} && echo 根目录可写", r = crate::host::quote(&root)), 40)?;
+                    let out = crate::host::check(&d, &root).map_err(|e| if crate::host::password_unused(&d) { format!("{}{e}", text::NO_SSHPASS) } else { e })?;
                     let _ = crate::prompt::install(&d);
-                    Ok(out.replace('\n', "；"))
+                    let note = if crate::host::password_unused(&d) { text::NO_SSHPASS } else { "" };
+                    Ok(format!("{note}{}", out.replace('\n', "；")))
                 });
             }
             "/devices".into()
@@ -475,9 +482,30 @@ fn respond(mut req: Request) {
     let _ = req.respond(Response::from_string(out).with_header(html));
 }
 
-pub fn serve(port: u16) {
-    let server = Server::http(("0.0.0.0", port)).expect("listen");
-    store::log(&format!("interface on :{port}"));
+static LISTEN: OnceLock<std::net::SocketAddr> = OnceLock::new();
+
+/// Where the interface listens (once it does).
+pub fn listening() -> Option<std::net::SocketAddr> { LISTEN.get().copied() }
+
+/// The address to listen on: EXTERIOR_ADDR ("host:port", or a host to use with PORT); else all addresses on
+/// Lazycat (its gateway reaches the app from outside), this machine only elsewhere; PORT, else 3000.
+pub fn listen_addr(lazycat: bool, addr: Option<&str>, port: Option<&str>) -> String {
+    let port: u16 = port.and_then(|p| p.trim().parse().ok()).unwrap_or(3000);
+    match addr.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) if a.parse::<std::net::SocketAddr>().is_ok() => a.to_string(),
+        Some(a) if a.rsplit_once(':').is_some_and(|(h, p)| !h.contains(':') && p.parse::<u16>().is_ok()) => a.to_string(),
+        Some(a) if a.parse::<std::net::Ipv6Addr>().is_ok() => format!("[{a}]:{port}"),
+        Some(a) => format!("{a}:{port}"),
+        None => format!("{}:{port}", if lazycat { "0.0.0.0" } else { "127.0.0.1" }),
+    }
+}
+
+pub fn serve(addr: &str) {
+    let server = match Server::http(addr) { Ok(s) => s, Err(e) => { eprintln!("exterior: cannot listen on {addr}: {e}"); std::process::exit(1) } };
+    let at = server.server_addr().to_ip();
+    if let Some(a) = at { let _ = LISTEN.set(a); }
+    store::log(&format!("interface on {}", at.map(|a| a.to_string()).unwrap_or_else(|| addr.to_string())));
+    if !store::on_lazycat() { println!("exterior: {} (data: {})", crate::prompt::url_for("", None, false, true, at), store::var()); }
     for req in server.incoming_requests() {
         std::thread::spawn(move || respond(req));
     }
@@ -485,3 +513,22 @@ pub fn serve(port: u16) {
 
 #[allow(dead_code)]
 pub fn brief_ok() -> bool { brief::configured() }
+
+#[cfg(test)]
+mod tests {
+    use super::listen_addr;
+
+    #[test]
+    fn listen_address() {
+        // Lazycat: all addresses, as before; elsewhere this machine only
+        assert_eq!(listen_addr(true, None, Some("3000")), "0.0.0.0:3000");
+        assert_eq!(listen_addr(true, None, None), "0.0.0.0:3000");
+        assert_eq!(listen_addr(false, None, None), "127.0.0.1:3000");
+        assert_eq!(listen_addr(false, Some(""), Some("3456")), "127.0.0.1:3456");
+        assert_eq!(listen_addr(false, Some("0.0.0.0:8080"), Some("3456")), "0.0.0.0:8080");
+        assert_eq!(listen_addr(false, Some("localhost:8080"), None), "localhost:8080");
+        assert_eq!(listen_addr(false, Some("0.0.0.0"), Some("3456")), "0.0.0.0:3456");
+        assert_eq!(listen_addr(false, Some("::"), None), "[::]:3000");
+        assert_eq!(listen_addr(false, Some("[::1]:9000"), None), "[::1]:9000");
+    }
+}
