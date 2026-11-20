@@ -58,7 +58,7 @@ lzc-cli app install --apk n dist/bh3gei.lzcapp.exterior-v*.lpk
 
 1. 「设置」：填写 brief 地址和密钥。
 2. 「设备」：添加设备（地址、端口、用户、密码、根目录），添加 agent（名称、启动命令、类型），点击「测试」确认可用。启动命令在设备上通过交互式 shell 执行，因此可以使用 shell 函数（例如多账号的 `cc0`）。
-3. 在设备的根目录下准备 knowledge 目录和其中的启动说明文件。
+3. 在设备的根目录下准备 knowledge 目录，把本仓库 `templates/` 中的三个说明文件复制进去（`exterior-session.md`：每个话题启动时交给 agent 的说明；`exterior-global.md`：「全局」话题额外的说明；`exterior-test.md`：设备页「测试」按钮的问题）。按需修改，花括号中的占位符由 exterior 填入。
 4. 在 Telegram 群组中新建话题并发送消息。
 
 设备密码和 brief 密钥在 exterior 中加密保存。所有可调参数（名称、路径、时限、启动参数等）都在「设置」页中，清空即恢复默认值。
