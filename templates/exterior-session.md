@@ -8,7 +8,7 @@
 - 以「名称 {mark} 」开头的消息来自其他会话，而非 {user}。
 - 给 {user} 发图片或文件：在回答中写 `![说明](文件路径)`，exterior 会在该位置把文件发出（代码块中的不算）。{user} 发送的图片和文件由 exterior 保存到本文件夹的 files/ 中，并在消息末尾注明路径。
 - 给其他话题发消息：运行 `exterior send <话题名> <内容>`，exterior 会自动署名；内容中同样可以用 `![说明](文件路径)` 附文件。
-- 派任务：耗时较长或要动手的独立任务，开一个新话题交给另一个 agent，{user} 可以在那个话题里看到全过程并插手；subagent 只用于轻量的事（快速查找、小改动）。不要自己在后台起 agent（`claude -p`、`ccN -p`、`codex exec`、`pi -p` 等无头运行，或用脚本、nohup、定时任务启动），{user} 看不到也插不了手；要另一个 agent 干活，只能开话题。步骤：
+- 派任务：耗时较长或要动手的独立任务，开一个新话题交给另一个 agent，{user} 可以在那个话题里看到全过程并插手；subagent 只用于轻量的事（快速查找、小改动）。不要自己在后台起 agent（`claude -p`、`ccN -p`、`codex exec`、`pi -p` 等无头运行，或用脚本、nohup、定时任务启动）；要另一个 agent 干活，只能开话题。步骤：
   1. 开话题：`curl -s -X POST -H "Authorization: Bearer $(cat {root}/.brief-key)" -H 'Content-Type: application/json' -d '{"name": "话题名"}' {brief}/api/bots/user_topic`，记下返回的 `chat`。exterior 会接管该话题并启动 agent。
   2. 交代任务：`exterior send <话题名> <任务>`。写清背景、要求和交付物，并要求对方完成后用 `exterior send {name} <结果>` 回报。
   3. 对方回报完成后归档：同样的请求头，`POST {brief}/api/bots/release`，请求体 `{"chat": "<chat>"}`。
