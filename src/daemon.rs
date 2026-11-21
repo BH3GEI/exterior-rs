@@ -816,6 +816,8 @@ fn run(sessions: Sessions) {
             }
             store::note_set(&chat, "turn_resent", Value::Null);
             store::note_set(&chat, "wait_msg", Value::Null);
+            // someone talked: an idle compaction may happen again after this turn
+            store::note_set(&chat, "idle_compact_wait", Value::Null);
             handle(&sessions, &own, &tx, &chat, &text);
         }
         store::set_state("last_id", json!(last));
@@ -904,6 +906,8 @@ fn scheduled(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
         let Some(tid) = tid else { store::log(&format!("schedule: no topic named {topic}")); continue };
         store::log(&format!("schedule -> {topic}: {}", content.chars().take(60).collect::<String>()));
         send(own, sessions, &tid, &text::sys(&text::scheduled(&content)));
+        // a scheduled turn is a turn like any other: an idle compaction may follow it (dream has no other)
+        store::note_set(&tid, "idle_compact_wait", Value::Null);
         handle(sessions, own, tx, &tid, &format!("{} {} {content}", text::SCHEDULE_FROM, params::get("relay_mark")));
     }
 }
@@ -914,8 +918,10 @@ fn scheduled(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
 /// ended, once per turn, when the agent's process is still there and the context is at least idle_compact_tokens.
 fn due_compact(n: &Value, now: u64, running: bool, min: u64, tokens: u64) -> bool {
     let end = n["turn_end"].as_u64().unwrap_or(0);
+    // after one idle compaction, nothing more until someone talks in the topic again: compacting a conversation
+    // nobody came back to only burns tokens
     min > 0 && running && end > 0 && now >= end + min * 60 && n["context"].as_u64().unwrap_or(0) >= tokens
-        && n["idle_compacted"].as_u64() != Some(end) && n["status"] == st::IDLE
+        && n["idle_compacted"].as_u64() != Some(end) && n["status"] == st::IDLE && n["idle_compact_wait"] != true
 }
 
 fn idle_compact(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
@@ -928,6 +934,7 @@ fn idle_compact(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
     for (tid, ctx) in due {
         let end = store::note(&tid)["turn_end"].clone();
         store::note_set(&tid, "idle_compacted", end);
+        store::note_set(&tid, "idle_compact_wait", json!(true));
         store::log(&format!("{tid}: idle {min} min, context {ctx} tokens: /compact"));
         send(own, sessions, &tid, &text::sys(&text::idle_compact(min, ctx)));
         handle(sessions, own, tx, &tid, "/compact");
@@ -1283,6 +1290,8 @@ mod tests {
         assert!(!due_compact(&json!({"turn_end": 1000, "context": 90000, "status": "idle"}), 9000, true, 50, 100000), "short context");
         assert!(!due_compact(&json!({"turn_end": 1000, "context": 150000, "status": "idle", "idle_compacted": 1000}), 9000, true, 50, 100000), "once per turn");
         assert!(!due_compact(&json!({"turn_end": 1000, "context": 150000, "status": "error"}), 9000, true, 50, 100000));
+        // the compaction's own turn ended later, context still reported high: no second compaction without a message
+        assert!(!due_compact(&json!({"turn_end": 5000, "context": 150000, "status": "idle", "idle_compacted": 1000, "idle_compact_wait": true}), 99999, true, 50, 100000));
     }
 
     #[test]
