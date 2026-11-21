@@ -7,10 +7,22 @@ exterior 是单个 Rust 程序，可以直接运行在 Linux、macOS、Windows �
 ## 工作方式
 
 1. 在 Telegram 群组中新建一个话题并发送消息。brief 通过 Telegram Bot API 收到消息。
-2. exterior 通过 brief 的 `/api/wait` 读取新消息，为每个话题在设备上建立一个文件夹，并通过 SSH 在其中启动该话题的 agent。agent 保持运行，多轮对话共用一个会话。
+2. exterior 通过 brief 的 `/api/wait` 读取新消息，为每个话题在设备上建立一个文件夹，并在其中启动该话题的 agent（远程设备通过 SSH，本机设备直接启动）。agent 保持运行，多轮对话共用一个会话。
 3. exterior 与 agent 通过标准输入输出交换 JSON：claude 使用 stream-json，pi 使用 rpc，codex 使用 app-server。agent 的回答在生成过程中持续写回话题。
 4. 图片和文件：你发送的图片和文件保存到话题文件夹的 `files/` 中，并告知 agent 路径。agent 在回答中写 `![说明](路径)`，exterior 就把该文件按原位置发到话题中（代码块里的不算）。
 5. 会话之间：agent 运行 `exterior send <话题名> <内容>`（exterior 装在设备的 `<根目录>/.exterior/bin` 中，并加入 agent 的 PATH），exterior 加上「名称 → 」署名后发到该话题，再转交给该话题的 agent。这一请求发往 exterior 的 `/api/send`，凭 `<根目录>/.exterior-key` 中的密钥访问；作为懒猫应用运行时，这是唯一不需要懒猫登录的地址。
+
+6. 发送：每个话题有自己的发送顺序，一个话题发得慢不会耽误其他话题；所有话题共用一个限流队列（间隔见设置项 `tg_gap_ms`）。用户正在等的回答（话题的当前回合）优先于其他消息发出。队列拥堵时，仍在运行的话题把更长时间内说的话合并成一条（`busy_merge_s`）。思考、工具调用等折叠步骤和 agent 的回答分开成条，回答单独成一条消息。
+7. 盯会话：agent 运行 `exterior watch <会话ID>`（会话ID 见 brief 的 `/api/chats`，例如以 `@chatroom` 结尾的微信群），exterior 自己向 brief 等这个会话的新消息，攒 20 秒（最多 2 分钟）一批，以「群名 → …」交给该话题的 agent；没有新消息时不打扰 agent。`exterior unwatch <会话ID>` 取消，`exterior watch` 列出正在盯的会话。exterior 本身不调用模型。
+8. 定时消息：设置项 `schedules`，每条为 `HH:MM|话题名|内容`，多条用 `||` 隔开。exterior 每天到点（按所在机器的时区，到点后两小时内补发，重启不漏）把内容以「定时 → 内容」交给该话题的 agent，可用于每天整理 knowledge 等例行工作。
+
+## 话题之间的协作
+
+以下约定写在启动说明 `templates/exterior-session.md` 中，由 agent 执行，exterior 只提供 `exterior send` 和话题管理：
+
+- 派任务：耗时较长或要动手的独立任务，agent 通过 brief 的 `/api/bots/user_topic` 开一个新话题，exterior 接管该话题并启动另一个 agent；用 `exterior send <话题名> <任务>` 交代背景、要求和交付物，对方完成后用 `exterior send <原话题> <结果>` 回报；完成后通过 brief 的 `/api/bots/release` 归档该话题。用户可以在新话题里看到全过程并插手。
+- 话题笔记：每个话题文件夹中的 `NOTES.md` 记录目标、关键决定和进度。新会话开始、换 agent 或压缩上下文后，agent 先读它。
+- knowledge：agent 把以后还用得上的信息追加到 `knowledge/inbox.md`（一行一条，「日期 · 话题名 · 内容」），不直接改 knowledge 的其他文件；可用定时消息让一个话题定期把 inbox 整理进对应文件。
 
 ## 话题中的命令
 
@@ -116,6 +128,8 @@ Windows 本机设备另装有 `exterior.ps1` 和 `exterior.cmd`，`exterior send
 在设备的根目录下准备 knowledge 目录，把本仓库 `templates/` 中的三个说明文件复制进去（`exterior-session.md`：每个话题启动时交给 agent 的说明；`exterior-global.md`：「全局」话题额外的说明；`exterior-test.md`：设备页「测试」按钮的问题）。按需修改，花括号中的占位符由 exterior 填入。knowledge 需要是一个 git 仓库，exterior 每个回合结束后提交并推送其中的修改。
 
 设备密码和 brief 密钥在 exterior 中加密保存。所有可调参数（名称、路径、时限、启动参数等）都在「设置」页中，清空即恢复默认值。
+
+启动参数示例：设置项 `claude_args`（claude 的额外启动参数，按空格分隔）可以加上 `--disallowedTools`，限制 claude 可用的工具或 subagent 类型，例如 `--dangerously-skip-permissions --disallowedTools Agent(Explore)` 禁止使用 Explore 类型的 subagent（较旧的 claude 版本中该工具名为 `Task`）。
 
 ## 开发
 
