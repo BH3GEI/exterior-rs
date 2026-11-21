@@ -25,7 +25,7 @@ fn sshpass() -> bool { static S: OnceLock<bool> = OnceLock::new(); *S.get_or_ini
 pub fn password(dev: &Value) -> String { dev["password"].as_str().and_then(crate::crypt::open).unwrap_or_default() }
 
 /// A remote device is logged into with the user's ssh keys (no password asked) when it has no password set, or
-/// when this machine has no sshpass (Windows, a Mac without it).
+/// when this machine has no sshpass (Windows, a Mac or Linux machine without it).
 pub fn uses_keys(dev: &Value) -> bool { password(dev).is_empty() || !sshpass() }
 
 /// The device has a password, but it cannot be used here (no sshpass): keys are tried instead.

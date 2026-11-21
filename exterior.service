@@ -1,0 +1,24 @@
+# Example systemd user unit for exterior on Linux.
+#   mkdir -p ~/.config/systemd/user && cp exterior.service ~/.config/systemd/user/
+#   (edit ExecStart to where the exterior program is)
+#   systemctl --user daemon-reload && systemctl --user enable --now exterior
+#   journalctl --user -u exterior -f          # log
+#   loginctl enable-linger "$USER"            # keep it running when you are logged out
+# Agents are started through your login shell ($SHELL -ic), so PATH and shell functions come from your shell's rc file.
+[Unit]
+Description=exterior (Telegram topics to agents)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/exterior/exterior
+# Environment=PORT=3000
+# Environment=EXTERIOR_ADDR=127.0.0.1:3000
+# Environment=EXTERIOR_VAR=%h/.local/share/exterior
+Restart=on-failure
+RestartSec=5
+# stop only exterior's own processes (the agents it started) when the service stops
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

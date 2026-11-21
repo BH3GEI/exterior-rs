@@ -218,7 +218,7 @@ fn devices_page() -> String {
             Kind::ALL.iter().map(|k| format!("<option value=\"{}\">{}</option>", k.name(), k.label())).collect::<String>()));
     }
     body.push_str(r#"<h2>添加设备</h2><div class="card"><form method="post" action="/devices/save"><input type="hidden" name="i" value="new">
-<div class="row mute">地址填 local 表示运行 exterior 的这台机器（agent 在本机启动，不经过 SSH）。远程设备通过 SSH 登录：填了密码时用 sshpass 输入密码；没有填密码，或本机没有 sshpass（Windows、未安装 sshpass 的 Mac）时，用本机用户自己的 SSH 密钥登录，需事先把公钥加入设备的 authorized_keys。远程设备须为 Linux 或 macOS。</div>
+<div class="row mute">地址填 local 表示运行 exterior 的这台机器（agent 在本机启动，不经过 SSH）。远程设备通过 SSH 登录：填了密码时用 sshpass 输入密码；没有填密码，或本机没有 sshpass（Windows，以及未安装 sshpass 的 Mac 和 Linux）时，用本机用户自己的 SSH 密钥登录，需事先把公钥加入设备的 authorized_keys。远程设备须为 Linux 或 macOS。</div>
 <div class="grid"><div><label class="mute">名称</label><br><input name="name"></div><div><label class="mute">地址</label><br><input name="host" placeholder="local 表示本机"></div>
 <div><label class="mute">端口</label><br><input name="port" value="22"></div><div><label class="mute">用户</label><br><input name="user"></div>
 <div><label class="mute">密码</label><br><input name="password" type="password" autocomplete="new-password"></div><div><label class="mute">根目录</label><br><input name="root"></div></div>

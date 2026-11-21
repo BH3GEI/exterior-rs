@@ -136,4 +136,25 @@ mod tests {
         assert_eq!(default_var(false, "linux", &env(&[("HOME", "/home/a"), ("XDG_DATA_HOME", "/x")])), "/x/exterior");
         assert_eq!(default_var(false, "linux", &env(&[])), "exterior-data");
     }
+
+    /// The Lazycat package stays as it is: data in /lzcapp/var, port 3000, only /api/ open without the login,
+    /// San Francisco time, the static x86_64 program, and the same version as the program.
+    #[test]
+    fn lazycat_package() {
+        let start = include_str!("../pkg/content/start.sh").replace('\r', "");
+        assert!(start.contains("export EXTERIOR_VAR=/lzcapp/var PORT=3000 HOME=/lzcapp/var\n"), "{start}");
+        assert!(start.contains("exec /lzcapp/pkg/content/exterior\n"), "{start}");
+        assert!(start.contains("apk add -q --no-network --no-cache /lzcapp/pkg/content/apk/*.apk"), "{start}");
+        let manifest = include_str!("../pkg/lzc-manifest.yml").replace('\r', "");
+        for want in ["subdomain: exterior\n", "public_path:\n    - /api/\n", "- /=http://worker:3000/\n",
+                     "command: /bin/sh /lzcapp/pkg/content/start.sh\n", "- TZ=America/Los_Angeles\n"] {
+            assert!(manifest.contains(want), "{want:?} not in lzc-manifest.yml");
+        }
+        let build = include_str!("../pkg/build.sh").replace('\r', "");
+        assert!(build.contains("--target x86_64-unknown-linux-musl"), "{build}");
+        assert!(build.contains("cp ../target/x86_64-unknown-linux-musl/release/exterior content/exterior"), "{build}");
+        let package = include_str!("../pkg/package.yml").replace('\r', "");
+        assert!(package.contains("package: bh3gei.lzcapp.exterior\n"), "{package}");
+        assert!(package.contains(&format!("\nversion: {}\n", env!("CARGO_PKG_VERSION"))), "pkg/package.yml version differs from Cargo.toml");
+    }
 }
