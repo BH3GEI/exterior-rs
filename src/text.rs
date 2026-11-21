@@ -262,6 +262,7 @@ pub fn watch_on(c: &str) -> String { format!("开始盯 {c}：有新消息时，
 pub fn watch_off(c: &str) -> String { format!("不再盯 {c}") }
 pub const WATCH_TOPIC: &str = "Telegram 话题之间请用 exterior send";
 pub const WATCH_HEADER: &str = "（exterior watch 收到的新消息）";
+pub fn idle_compact(min: u64, ctx: u64) -> String { format!("exterior 闲置压缩：本话题已闲置 {min} 分钟，上下文约 {} 万 token，在缓存过期前发送 /compact（设置项 idle_compact_min、idle_compact_tokens）", ctx / 10000) }
 pub fn session_ended(agent: &str) -> String { format!("会话已结束。下一条消息将开启新的 {agent} 会话。") }
 pub fn wrong_agent(owner: &str, cur: &str) -> String { format!("该命令只适用于 {owner}，当前话题使用的是 {cur}。") }
 pub fn start_failed(agent: &str, e: &str) -> String { sys_warn(&format!("无法启动 {agent}：{e}")) }

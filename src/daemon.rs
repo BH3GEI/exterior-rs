@@ -581,6 +581,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                         });
                     }
                     set_status(&tid, if error.is_some() { st::ERROR } else { st::IDLE });
+                    store::note_set(&tid, "turn_end", json!(store::now()));
                     store::note_set(&tid, "last_error", error.map(Value::String).unwrap_or(Value::Null));
                     store::note_set(&tid, "from", Value::Null);
                     store::note_set(&tid, "turn_msg", Value::Null);
@@ -608,6 +609,9 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
             }
             Ev::Exhausted { tid, gen, why } => {
                 if current(&tid, gen) { store::note_set(&tid, "exhausted", json!(why)); }
+            }
+            Ev::Context { tid, gen, tokens } => {
+                if current(&tid, gen) { store::note_set(&tid, "context", json!(tokens)); }
             }
             Ev::Resolved { tid, gen, name } => {
                 if current(&tid, gen) { store::note_set(&tid, "resolved", json!(name)); }
@@ -762,6 +766,7 @@ fn run(sessions: Sessions) {
             refreshed = Instant::now();
             retry_waiting(&sessions, &own, &tx);
             scheduled(&sessions, &own, &tx);
+            idle_compact(&sessions, &own, &tx);
             let idle = Duration::from_secs(params::num("idle_hours") * 3600);
             for s in sessions.lock().unwrap().values_mut() {
                 if s.agent.is_some() && !s.pending && s.active.elapsed() > idle {
@@ -900,6 +905,32 @@ fn scheduled(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
         store::log(&format!("schedule -> {topic}: {}", content.chars().take(60).collect::<String>()));
         send(own, sessions, &tid, &text::sys(&text::scheduled(&content)));
         handle(sessions, own, tx, &tid, &format!("{} {} {content}", text::SCHEDULE_FROM, params::get("relay_mark")));
+    }
+}
+
+/// Claude Code compacts a long conversation while it sits idle, before the prompt cache expires, so coming back
+/// later does not pay for the whole context again; it does that only in its terminal, not in the mode exterior runs
+/// it in. exterior does the same through the agent's own /compact, in the open: idle_compact_min minutes after a turn
+/// ended, once per turn, when the agent's process is still there and the context is at least idle_compact_tokens.
+fn due_compact(n: &Value, now: u64, running: bool, min: u64, tokens: u64) -> bool {
+    let end = n["turn_end"].as_u64().unwrap_or(0);
+    min > 0 && running && end > 0 && now >= end + min * 60 && n["context"].as_u64().unwrap_or(0) >= tokens
+        && n["idle_compacted"].as_u64() != Some(end) && n["status"] == st::IDLE
+}
+
+fn idle_compact(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
+    let (min, tokens, now) = (params::num("idle_compact_min"), params::num("idle_compact_tokens"), store::now());
+    if min == 0 { return; }
+    let due: Vec<(String, u64)> = sessions.lock().unwrap().values()
+        .filter(|s| !s.deleted && s.agent.is_some() && !s.pending)
+        .filter_map(|s| { let n = store::note(&s.tid); due_compact(&n, now, true, min, tokens).then(|| (s.tid.clone(), n["context"].as_u64().unwrap_or(0))) })
+        .collect();
+    for (tid, ctx) in due {
+        let end = store::note(&tid)["turn_end"].clone();
+        store::note_set(&tid, "idle_compacted", end);
+        store::log(&format!("{tid}: idle {min} min, context {ctx} tokens: /compact"));
+        send(own, sessions, &tid, &text::sys(&text::idle_compact(min, ctx)));
+        handle(sessions, own, tx, &tid, "/compact");
     }
 }
 
@@ -1240,6 +1271,18 @@ mod tests {
         // a long notice keeps its whole text, folded
         let n = text::sys_warn(&format!("出错了\n{}", "细节 ".repeat(100)));
         assert!(n.starts_with("<footer>⚠️ exterior · 出错了</footer>") && n.contains(&"细节 ".repeat(100).trim_end().to_string()));
+    }
+
+    #[test]
+    fn idle_compaction_rule() {
+        let n = json!({"turn_end": 1000, "context": 150000, "status": "idle"});
+        assert!(!due_compact(&n, 1000 + 49 * 60, true, 50, 100000));
+        assert!(due_compact(&n, 1000 + 50 * 60, true, 50, 100000));
+        assert!(!due_compact(&n, 1000 + 50 * 60, false, 50, 100000), "no process, no cache to keep");
+        assert!(!due_compact(&n, 1000 + 50 * 60, true, 0, 100000), "off");
+        assert!(!due_compact(&json!({"turn_end": 1000, "context": 90000, "status": "idle"}), 9000, true, 50, 100000), "short context");
+        assert!(!due_compact(&json!({"turn_end": 1000, "context": 150000, "status": "idle", "idle_compacted": 1000}), 9000, true, 50, 100000), "once per turn");
+        assert!(!due_compact(&json!({"turn_end": 1000, "context": 150000, "status": "error"}), 9000, true, 50, 100000));
     }
 
     #[test]

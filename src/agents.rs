@@ -60,6 +60,8 @@ pub enum Ev {
     Step { tid: String, gen: u64, title: String, body: String },
     /// claude refused for lack of quota on this account (rate limit "rejected")
     Exhausted { tid: String, gen: u64, why: String },
+    /// how long the conversation is now, in tokens (for compacting idle topics); 0 right after a compaction
+    Context { tid: String, gen: u64, tokens: u64 },
     Exited { tid: String, gen: u64, why: String },
 }
 
@@ -665,6 +667,12 @@ fn read_claude(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, b
         }
         // everything the agent does besides answering: thinking, tool calls with their output, system events
         let step = |title: String, body: String| { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title, body }); };
+        // the context the model saw for this answer: what it was given plus what it wrote
+        if v["type"] == "assistant" && v["parent_tool_use_id"].is_null() {
+            let u = &v["message"]["usage"];
+            let n: u64 = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"].iter().filter_map(|k| u[*k].as_u64()).sum();
+            if n > 0 { let _ = tx.send(Ev::Context { tid: tid.clone(), gen, tokens: n }); }
+        }
         match v["type"].as_str() {
             Some("assistant") => for b in v["message"]["content"].as_array().into_iter().flatten() {
                 match b["type"].as_str() {
@@ -699,6 +707,7 @@ fn read_claude(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, b
             // thinking_tokens is a running counter of the thinking that arrives in full anyway
             Some("system") if v["subtype"] != "thinking_tokens" => {
                 if v["subtype"] == "compact_boundary" {
+                    let _ = tx.send(Ev::Context { tid: tid.clone(), gen, tokens: 0 });
                     let m = if v["compact_metadata"].is_object() { &v["compact_metadata"] } else { &v["compactMetadata"] };
                     compacting = m["trigger"] != "auto";
                 }
@@ -769,6 +778,9 @@ fn read_pi(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, busy:
                 let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: tool_title(name, &v["args"], failed), body: tool_body(&v["args"], Some(&out)) });
             }
             Some("turn_end") => {
+                let u = &v["message"]["usage"];
+                let n = u["totalTokens"].as_u64().unwrap_or_else(|| ["input", "output", "cacheRead", "cacheWrite"].iter().filter_map(|k| u[*k].as_u64()).sum());
+                if n > 0 { let _ = tx.send(Ev::Context { tid: tid.clone(), gen, tokens: n }); }
                 let t: String = v["message"]["content"].as_array().into_iter().flatten()
                     .filter(|c| c["type"] == "text").filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("");
                 if !t.is_empty() { last_text = Some(t); }
@@ -796,6 +808,7 @@ fn read_pi(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, busy:
                 }
             }
             Some("compaction_end") => {
+                if v["errorMessage"].is_null() { let _ = tx.send(Ev::Context { tid: tid.clone(), gen, tokens: 0 }); }
                 if let Some(e) = v["errorMessage"].as_str() { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::compaction_failed(&clip(e)) }); }
             }
             Some("extension_ui_request") => {
