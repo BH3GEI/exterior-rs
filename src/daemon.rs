@@ -613,6 +613,16 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
             Ev::Context { tid, gen, tokens } => {
                 if current(&tid, gen) { store::note_set(&tid, "context", json!(tokens)); }
             }
+            Ev::Usage { tid, uses } => {
+                let (name, dev) = sessions.lock().unwrap().get(&tid).map(|s| (s.name.clone(), s.dev.clone())).unwrap_or_else(|| (tid.clone(), String::new()));
+                let n = store::note(&tid);
+                let agent = n["agent"].as_str().unwrap_or("");
+                crate::usage::record(&name, &dev, agent, n["resolved"].as_str().unwrap_or(agent), &uses);
+            }
+            Ev::Quota { tid, windows } => {
+                let n = store::note(&tid);
+                crate::usage::set_windows(n["resolved"].as_str().or(n["agent"].as_str()).unwrap_or(""), &windows);
+            }
             Ev::Resolved { tid, gen, name } => {
                 if current(&tid, gen) { store::note_set(&tid, "resolved", json!(name)); }
             }

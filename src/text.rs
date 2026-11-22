@@ -420,3 +420,5 @@ pub const ID_PLACEHOLDER: &str = "<编号>";
 /// Sample values for the 启动说明 page.
 pub const SAMPLE_TOPIC: &str = "示例话题";
 pub const SAMPLE_TID: &str = "tgbot:编号";
+
+pub const USAGE_SPAN: &str = "时间范围写成 5h、24h、7d 这样（数字加 m、h 或 d）";

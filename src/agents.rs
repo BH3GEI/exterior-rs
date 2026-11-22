@@ -62,6 +62,10 @@ pub enum Ev {
     Exhausted { tid: String, gen: u64, why: String },
     /// how long the conversation is now, in tokens (for compacting idle topics); 0 right after a compaction
     Context { tid: String, gen: u64, tokens: u64 },
+    /// what a turn used, per model (see usage.rs); kept whatever the generation: the use happened anyway
+    Usage { tid: String, uses: Vec<crate::usage::Use> },
+    /// the account's quota windows as the agent last heard them
+    Quota { tid: String, windows: Vec<crate::usage::Window> },
     Exited { tid: String, gen: u64, why: String },
 }
 
@@ -267,6 +271,8 @@ impl Agent {
         std::thread::spawn(move || {
             let (mut reply, mut error, mut retries): (String, Option<String>, i64) = (String::new(), None, 0);
             let mut limits = CodexLimits::default();
+            // this turn's use so far, per model, and the thread's model when not picked with /model
+            let (mut turn_uses, mut cx_model): (Vec<crate::usage::Use>, String) = (vec![], String::new());
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                 let method = v["method"].as_str().unwrap_or("");
@@ -288,6 +294,7 @@ impl Agent {
                 let p = &v["params"];
                 match method {
                     "thread/started" => {
+                        if let Some(m) = p["thread"]["model"].as_str() { cx_model = m.to_string(); }
                         if let Some(t) = p["thread"]["id"].as_str() {
                             *thread.lock().unwrap() = Some(t.to_string());
                             let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: t.to_string() });
@@ -327,7 +334,14 @@ impl Agent {
                     "model/rerouted" => {
                         let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::fallback(p["fromModel"].as_str().unwrap_or("?"), p["toModel"].as_str().unwrap_or("?")) });
                     }
+                    "thread/tokenUsage/updated" => {
+                        let m = model.lock().unwrap().clone().unwrap_or_else(|| cx_model.clone());
+                        if let Some(u) = crate::usage::from_codex(&p["tokenUsage"]["last"], &m) { crate::usage::merge(&mut turn_uses, u); }
+                        let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title(method), body: pretty(p) });
+                    }
                     "account/rateLimits/updated" => {
+                        let w = crate::usage::codex_windows(&p["rateLimits"]);
+                        if !w.is_empty() { let _ = tx.send(Ev::Quota { tid: tid.clone(), windows: w }); }
                         let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: text::event_title("rateLimits"), body: pretty(&p["rateLimits"]) });
                         for t in limits.update(&p["rateLimits"]) { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: t }); }
                     }
@@ -346,6 +360,7 @@ impl Agent {
                         let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::hook_failed(r["eventName"].as_str().unwrap_or(""), &clip(&detail)) });
                     }
                     "turn/completed" => {
+                        if !turn_uses.is_empty() { let _ = tx.send(Ev::Usage { tid: tid.clone(), uses: std::mem::take(&mut turn_uses) }); }
                         *turn.lock().unwrap() = None;
                         let st = p["turn"]["status"].as_str().unwrap_or("");
                         if st == "failed" && error.is_none() { error = Some(codex_error(&p["turn"]["error"])); }
@@ -713,8 +728,14 @@ fn read_claude(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, b
                 }
                 step(text::event_title(&format!("system · {}", v["subtype"].as_str().unwrap_or(""))), pretty(&v));
             }
-            Some("rate_limit_event") => step(text::event_title("rate_limit_event"), pretty(&v)),
+            Some("rate_limit_event") => {
+                let w = crate::usage::claude_windows(&v["rate_limit_info"]);
+                if !w.is_empty() { let _ = tx.send(Ev::Quota { tid: tid.clone(), windows: w }); }
+                step(text::event_title("rate_limit_event"), pretty(&v))
+            }
             Some("result") => {
+                let uses = crate::usage::from_claude_result(&v);
+                if !uses.is_empty() { let _ = tx.send(Ev::Usage { tid: tid.clone(), uses }); }
                 // calls still without a result (a background subagent's, say): shown now with what they were
                 // asked, and kept, so the result that comes later is shown under the same call
                 for (name, input) in tools.values() { step(text::tool_waiting(&tool_title(name, input, false)), tool_body(input, None)); }
@@ -760,6 +781,9 @@ fn read_claude(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, b
 fn read_pi(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, busy: Arc<Mutex<bool>>, pending: Pending, stdin: Arc<Mutex<Option<ChildStdin>>>) {
     let mut last_text: Option<String> = None;
     let mut last_err: Option<String> = None;
+    // what this run used so far, per model; reported when the run ends
+    let mut uses: Vec<crate::usage::Use> = vec![];
+    let used = |uses: &mut Vec<crate::usage::Use>| if !uses.is_empty() { let _ = tx.send(Ev::Usage { tid: tid.clone(), uses: std::mem::take(uses) }); };
     for line in BufReader::new(out).lines().map_while(Result::ok) {
         let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
         if v["type"] == "response" && route(&pending, v["id"].as_str().map(String::from), &v) { continue; }
@@ -778,6 +802,7 @@ fn read_pi(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, busy:
                 let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title: tool_title(name, &v["args"], failed), body: tool_body(&v["args"], Some(&out)) });
             }
             Some("turn_end") => {
+                if let Some(u) = crate::usage::from_pi(&v["message"]) { crate::usage::merge(&mut uses, u); }
                 let u = &v["message"]["usage"];
                 let n = u["totalTokens"].as_u64().unwrap_or_else(|| ["input", "output", "cacheRead", "cacheWrite"].iter().filter_map(|k| u[*k].as_u64()).sum());
                 if n > 0 { let _ = tx.send(Ev::Context { tid: tid.clone(), gen, tokens: n }); }
@@ -835,10 +860,12 @@ fn read_pi(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, busy:
                 let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::extension_error(&clip(&e)) });
             }
             Some("agent_settled") => {
+                used(&mut uses);
                 *busy.lock().unwrap() = false;
                 let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: last_text.take(), stopped: v["aborted"] == true, error: last_err.take() });
             }
             Some("response") if v["success"] == false => {
+                used(&mut uses);
                 *busy.lock().unwrap() = false;
                 let err = v["error"].as_str().unwrap_or(text::PI_REJECTED).to_string();
                 let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: None, stopped: false, error: Some(err) });

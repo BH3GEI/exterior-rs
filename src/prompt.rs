@@ -103,12 +103,14 @@ printf '%s' "$text" | curl -sS --fail-with-body -H "Authorization: Bearer $(cat 
     format!(r#"#!/bin/sh
 # exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
 # exterior watch <会话ID> / exterior unwatch <会话ID> / exterior watch：让 exterior 盯住一个会话（如微信群），新消息自动交给你。
+# exterior usage [5h|24h|7d]：各订阅当前的额度窗口，以及这段时间各话题、各订阅用了多少。
 # 由 exterior 安装，每次启动时覆盖。
-usage() {{ echo '用法：exterior send <话题名> <内容> | exterior watch [会话ID] | exterior unwatch <会话ID>' >&2; exit 2; }}
+usage() {{ echo '用法：exterior send <话题名> <内容> | exterior watch [会话ID] | exterior unwatch <会话ID> | exterior usage [5h|24h|7d]' >&2; exit 2; }}
 case "$1" in
   send) [ $# -ge 3 ] || usage; to=$2; shift 2; cmd=send; text="$*" ;;
   watch) [ $# -le 2 ] || usage; cmd=watch; to=${{2:-}}; text= ;;
   unwatch) [ $# -eq 2 ] || usage; cmd=unwatch; to=$2; text= ;;
+  usage) [ $# -le 2 ] || usage; cmd=usage; to=${{2:-}}; text= ;;
   *) usage ;;
 esac
 {post}
@@ -121,11 +123,12 @@ fn send_ps1(dev: &Value) -> String {
     // with a byte order mark: Windows PowerShell reads a file without one in the local code page
     format!("\u{feff}{}", format!(r#"# exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
 # 由 exterior 安装，每次启动时覆盖。
-$usage = '用法：exterior send <话题名> <内容> | exterior watch [会话ID] | exterior unwatch <会话ID>'
+$usage = '用法：exterior send <话题名> <内容> | exterior watch [会话ID] | exterior unwatch <会话ID> | exterior usage [5h|24h|7d]'
 $cmd = [string]$args[0]; $to = ''; $text = ''
 if ($cmd -eq 'send' -and $args.Count -ge 3) {{ $to = [string]$args[1]; $text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }}
 elseif ($cmd -eq 'watch' -and $args.Count -le 2) {{ if ($args.Count -eq 2) {{ $to = [string]$args[1] }} }}
 elseif ($cmd -eq 'unwatch' -and $args.Count -eq 2) {{ $to = [string]$args[1] }}
+elseif ($cmd -eq 'usage' -and $args.Count -le 2) {{ if ($args.Count -eq 2) {{ $to = [string]$args[1] }} }}
 else {{ [Console]::Error.WriteLine($usage); exit 2 }}
 $key = (Get-Content -Raw -Encoding UTF8 -LiteralPath {key}).Trim()
 $e = {{ param($s) [Uri]::EscapeDataString([string]$s) }}
@@ -219,10 +222,12 @@ mod tests {
             assert_eq!(run(&["bogus"]), Some(2));
             assert_eq!(run(&["send", "exterior 开发", "中文 & 符号 = %20 + \"引号\"\n第二行", "'单引号'"]), Some(0));
             assert_eq!(run(&["watch"]), Some(0));
+            assert_eq!(run(&["usage", "7d"]), Some(0));
+            assert_eq!(run(&["usage", "7d", "x"]), Some(2));
             let g: Vec<_> = got.lock().unwrap().iter().map(|b| form(b)).collect();
             let want = |cmd: &str, to: &str, text: &str| [("cmd", cmd), ("from", "tgbot:1"), ("to", to), ("text", text)].map(|(k, v)| (k.to_string(), v.to_string())).into_iter().collect::<std::collections::HashMap<_, _>>();
             assert_eq!(g, vec![want("watch", "wx@chatroom", ""), want("send", "全局", "a b"),
-                               want("send", "exterior 开发", "中文 & 符号 = %20 + \"引号\"\n第二行 '单引号'"), want("watch", "", "")], "windows {windows}");
+                               want("send", "exterior 开发", "中文 & 符号 = %20 + \"引号\"\n第二行 '单引号'"), want("watch", "", ""), want("usage", "7d", "")], "windows {windows}");
             // on Windows nothing but ASCII may reach curl's command line
             let args = std::fs::read_to_string(&log).unwrap();
             assert_eq!(args.is_ascii(), windows, "{args}");

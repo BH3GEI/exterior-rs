@@ -9,6 +9,7 @@ mod params;
 mod prompt;
 mod store;
 mod text;
+mod usage;
 mod web;
 
 fn main() {

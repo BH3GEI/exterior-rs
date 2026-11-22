@@ -136,7 +136,7 @@ pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,mo
 "#;
 
 fn page(active: &str, title: &str, body: &str, refresh: bool) -> String {
-    let tabs = [("/", "会话"), ("/devices", "设备"), ("/memory", "记忆"), ("/messages", "消息记录"), ("/prompt", "启动说明"), ("/settings", "设置"), ("/log", "日志")];
+    let tabs = [("/", "会话"), ("/devices", "设备"), ("/memory", "记忆"), ("/messages", "消息记录"), ("/prompt", "启动说明"), ("/usage", "用量"), ("/settings", "设置"), ("/log", "日志")];
     let nav: String = tabs.iter().map(|(h, t)| format!("<a href=\"{h}\"{}>{t}</a>", if *h == active { " class=\"on\"" } else { "" })).collect();
     let meta = if refresh { "<meta name=\"live\" content=\"fast\">" } else { "" };
     format!("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{meta}<title>{} · exterior</title><style>{CSS}</style></head><body><header><b>exterior</b>{nav}</header><main>{body}</main>{JS}</body></html>", esc(title))
@@ -300,6 +300,39 @@ fn settings_page() -> String {
     page("/settings", "设置", &body, r["running"] == true)
 }
 
+/// 用量: the same summary `exterior usage` gives, for the last 5 hours, 24 hours or 7 days.
+fn usage_page(query: &str) -> String {
+    let want = query.split('&').find_map(|kv| kv.strip_prefix("span=")).unwrap_or("24h");
+    let secs = crate::usage::span(want).unwrap_or(86400);
+    let tabs: String = ["5h", "24h", "7d"].iter().map(|s| if *s == want { format!("<b>{s}</b> ") } else { format!("<a href=\"/usage?span={s}\">{s}</a> ") }).collect();
+    page("/usage", "用量", &format!("<h2>用量</h2><div class=\"row\">{tabs}<span class=\"mute\">（agent 每轮自报的 token 和折算美元；Telegram 里可用 <code>exterior usage [5h|24h|7d]</code> 查询）</span></div><div class=\"card\">{}</div>", md_html(&crate::usage::report(secs))), false)
+}
+
+/// The little Markdown the usage summary uses (bold, tables, paragraphs) as HTML.
+fn md_html(md: &str) -> String {
+    let bold = |l: &str| { let e = esc(l); let mut out = String::new(); for (i, p) in e.split("**").enumerate() { if i % 2 == 1 { out += &format!("<b>{p}</b>"); } else { out += p; } } out };
+    let mut out = String::new();
+    let mut table: Vec<&str> = vec![];
+    let flush = |table: &mut Vec<&str>, out: &mut String| {
+        if table.is_empty() { return; }
+        let cells = |l: &str| l.trim().trim_matches('|').split('|').map(|c| c.trim().to_string()).collect::<Vec<_>>();
+        out.push_str("<table>");
+        for (i, l) in table.iter().enumerate().filter(|(i, _)| *i != 1) {
+            let tag = if i == 0 { "th" } else { "td" };
+            out.push_str(&format!("<tr>{}</tr>", cells(l).iter().map(|c| format!("<{tag}>{}</{tag}>", bold(c))).collect::<String>()));
+        }
+        out.push_str("</table>");
+        table.clear();
+    };
+    for l in md.lines() {
+        if l.trim_start().starts_with('|') { table.push(l); continue; }
+        flush(&mut table, &mut out);
+        if !l.trim().is_empty() { out.push_str(&format!("<div class=\"row\">{}</div>", bold(l))); }
+    }
+    flush(&mut table, &mut out);
+    out
+}
+
 fn log_page() -> String {
     let lines: String = store::tail("exterior.log", 300).iter().rev().map(|l| format!("{}\n", esc(l))).collect();
     page("/log", "日志", &format!("<h2>日志（最新在上）</h2><div class=\"card\"><pre>{}</pre></div>", if lines.is_empty() { "—".into() } else { lines }), false)
@@ -442,7 +475,8 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
 
 fn respond(mut req: Request) {
     let url = req.url().to_string();
-    let (path, _query) = url.split_once('?').unwrap_or((&url, ""));
+    let (path, query) = url.split_once('?').unwrap_or((&url, ""));
+    let query = query.to_string();
     let path = path.to_string();
     let html = Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
     // the only address open without the Lazycat login (public_path): `exterior send`, with exterior's key
@@ -459,6 +493,7 @@ fn respond(mut req: Request) {
                 let r = match g("cmd").as_str() {
                     "watch" => daemon::watch(&g("from"), &g("to"), true),
                     "unwatch" => daemon::watch(&g("from"), &g("to"), false),
+                    "usage" => crate::usage::span(&g("to")).map(crate::usage::report).ok_or_else(|| text::USAGE_SPAN.to_string()),
                     _ => daemon::relay(&g("from"), &g("to"), &g("text")),
                 };
                 match r { Ok(m) => (200, m), Err(e) => (400, e) }
@@ -480,6 +515,7 @@ fn respond(mut req: Request) {
         "/messages" => messages_page(),
         "/prompt" => prompt_page(),
         "/settings" => settings_page(),
+        "/usage" => usage_page(&query),
         "/log" => log_page(),
         "/healthz" => { let _ = req.respond(Response::from_string("ok")); return; }
         _ => { let _ = req.respond(Response::from_string("页面不存在").with_status_code(404)); return; }
