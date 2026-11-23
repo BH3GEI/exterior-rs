@@ -65,6 +65,39 @@ pub fn from_codex(last: &Value, model: &str) -> Option<Use> {
     (one.tokens() > 0).then_some(one)
 }
 
+/// One agy step's usage (input_tokens leaves out the cached part; thinking counts as output).
+pub fn from_agy(u: &Value, model: &str) -> Option<Use> {
+    let g = |k: &str| u[k].as_u64().unwrap_or(0);
+    let one = Use { model: if model.is_empty() { "agy".into() } else { model.into() }, input: g("input_tokens"),
+                    output: g("output_tokens") + g("thinking_tokens"), cache_read: g("cache_read_tokens"), cache_write: 0, usd: None };
+    (one.tokens() > 0).then_some(one)
+}
+
+/// What `agy -p /usage` prints, one window a line: group, window, share remaining, reset time (ISO, UTC), tab-separated.
+pub fn agy_windows(out: &str) -> Vec<Window> {
+    out.lines().filter_map(|l| {
+        let f: Vec<&str> = l.split('\t').map(str::trim).collect();
+        if f.len() < 4 { return None; }
+        let left = f[2].trim_end_matches('%').parse::<f64>().ok()? / 100.0;
+        let span = if f[1].contains("Five Hour") { "5h" } else if f[1].contains("Weekly") { "7d" } else { f[1] };
+        let group = f[0].replace(" models", "").replace(" Models", "");
+        let used = (1.0 - left).max(0.0);
+        Some(Window { name: format!("{group} {span}"), status: if left <= 0.0 { "rejected" } else { "allowed" }.into(), used: Some(used), resets: iso_secs(f[3]) })
+    }).collect()
+}
+
+/// "2026-11-30T07:52:57Z" as unix seconds.
+fn iso_secs(t: &str) -> Option<i64> {
+    let n = |a: usize, b: usize| t.get(a..b)?.parse::<i64>().ok();
+    let (y, m, d, hh, mm, ss) = (n(0, 4)?, n(5, 7)?, n(8, 10)?, n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * m2 + 2) / 5 + d - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    Some(days * 86400 + hh * 3600 + mm * 60 + ss)
+}
+
 /// Add one call's use to a turn's, per model.
 pub fn merge(into: &mut Vec<Use>, u: Use) {
     match into.iter_mut().find(|x| x.model == u.model) { Some(x) => x.add(&u), None => into.push(u) }
@@ -311,6 +344,18 @@ mod tests {
         assert_eq!(span("90m"), Some(5400));
         assert_eq!(span("x"), None);
         assert_eq!(span("0h"), None);
+    }
+
+    #[test]
+    fn agy_reports() {
+        let w = agy_windows("Gemini Models\tWeekly Limit Remaining\t75%\t2026-11-30T07:52:57Z\nGemini Models\tFive Hour Limit Remaining\t0%\t2026-11-23T12:52:57Z\nnoise\n");
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].name, "Gemini 7d");
+        assert_eq!(w[0].used, Some(0.25));
+        assert_eq!(w[0].resets, Some(1796025177));
+        assert_eq!(w[1].status, "rejected");
+        let u = from_agy(&serde_json::json!({"input_tokens": 2238, "output_tokens": 10, "thinking_tokens": 8, "cache_read_tokens": 6598}), "").unwrap();
+        assert_eq!((u.model.as_str(), u.input, u.output, u.cache_read), ("agy", 2238, 18, 6598));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 package: bh3gei.lzcapp.exterior
-version: 0.9.8
+version: 0.9.9
 name: exterior
 description: >-
   外装代脑：把 Telegram 群里的每个话题接到设备上的一个 agent（Claude、Codex、Pi），所有 agent 共用一份关于你的记忆。

@@ -18,6 +18,8 @@ pub const PARAMS: &[Param] = &[
     Param { key: "relay_mark", label: "会话之间转发消息的分隔符", default: "→" },
     Param { key: "pick_mark", label: "启动命令选定账号时输出的前缀", default: "→" },
     Param { key: "claude_args", label: "claude 的额外启动参数", default: "--dangerously-skip-permissions" },
+    Param { key: "agy_args", label: "agy（Antigravity CLI）的额外启动参数", default: "--dangerously-skip-permissions" },
+    Param { key: "agy_quota_min", label: "agy 一轮结束后查一次额度（agy -p /usage），同一账号最多每多少分钟一次（0 为不查）", default: "10" },
     Param { key: "codex_approval", label: "codex 的审批策略（approvalPolicy）", default: "never" },
     Param { key: "codex_sandbox", label: "codex 的沙箱模式（sandbox）", default: "danger-full-access" },
     Param { key: "ack_emoji", label: "收到消息时添加的回应表情", default: "👀" },

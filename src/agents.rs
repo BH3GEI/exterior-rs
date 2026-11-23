@@ -9,15 +9,15 @@ use std::sync::{Arc, Mutex};
 use crate::{params, text};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Kind { Claude, Pi, Codex }
+pub enum Kind { Claude, Pi, Codex, Agy }
 
 impl Kind {
     pub fn parse(s: &str) -> Option<Kind> {
-        match s.trim().to_lowercase().as_str() { "claude" => Some(Kind::Claude), "pi" => Some(Kind::Pi), "codex" => Some(Kind::Codex), _ => None }
+        match s.trim().to_lowercase().as_str() { "claude" => Some(Kind::Claude), "pi" => Some(Kind::Pi), "codex" => Some(Kind::Codex), "agy" | "antigravity" => Some(Kind::Agy), _ => None }
     }
-    pub fn name(&self) -> &'static str { match self { Kind::Claude => "claude", Kind::Pi => "pi", Kind::Codex => "codex" } }
-    pub fn label(&self) -> &'static str { match self { Kind::Claude => "Claude", Kind::Pi => "Pi", Kind::Codex => "Codex" } }
-    pub const ALL: [Kind; 3] = [Kind::Claude, Kind::Pi, Kind::Codex];
+    pub fn name(&self) -> &'static str { match self { Kind::Claude => "claude", Kind::Pi => "pi", Kind::Codex => "codex", Kind::Agy => "agy" } }
+    pub fn label(&self) -> &'static str { match self { Kind::Claude => "Claude", Kind::Pi => "Pi", Kind::Codex => "Codex", Kind::Agy => "Antigravity" } }
+    pub const ALL: [Kind; 4] = [Kind::Claude, Kind::Pi, Kind::Codex, Kind::Agy];
 }
 
 /// The agents' own commands that their headless protocols take as requests rather than as typed text. Each keeps
@@ -44,7 +44,7 @@ pub fn builtin(kind: Kind, name: &str) -> Option<&'static str> {
 
 /// The line that tells a new agent where the previous session is, in the previous agent's own words.
 pub fn resume_line(kind: Kind, name: &str, id: &str) -> String {
-    match kind { Kind::Claude => format!("{name} --resume {id}"), Kind::Pi => format!("{name} --session {id}"), Kind::Codex => format!("{name} resume {id}") }
+    match kind { Kind::Claude => format!("{name} --resume {id}"), Kind::Pi => format!("{name} --session {id}"), Kind::Codex => format!("{name} resume {id}"), Kind::Agy => format!("{name} --conversation {id}") }
 }
 
 pub enum Ev {
@@ -109,6 +109,8 @@ pub struct Agent {
     thread: Arc<Mutex<Option<String>>>,
     turn: Arc<Mutex<Option<String>>>,
     model: Arc<Mutex<Option<String>>>,
+    /// agy: what exterior tells it, put in front of the first message of a new conversation (agy has no flag for it)
+    first: Arc<Mutex<Option<String>>>,
 }
 
 fn env(spec: &Spec) -> Vec<(&'static str, String)> {
@@ -186,11 +188,12 @@ impl Agent {
         let mut a = Agent { kind: spec.kind, stdin: Arc::new(Mutex::new(None)), child: Arc::new(Mutex::new(None)), spec, tx,
                             busy: Arc::new(Mutex::new(false)), interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)), queue: Arc::new(Mutex::new(vec![])), pending: Arc::new(Mutex::new(HashMap::new())),
                             next: Arc::new(std::sync::atomic::AtomicU64::new(0)), info: Arc::new(Mutex::new(Value::Null)), thread: Arc::new(Mutex::new(None)),
-                            turn: Arc::new(Mutex::new(None)), model: Arc::new(Mutex::new(None)) };
+                            turn: Arc::new(Mutex::new(None)), model: Arc::new(Mutex::new(None)), first: Arc::new(Mutex::new(None)) };
         match a.kind {
             Kind::Claude => a.start_claude()?,
             Kind::Pi => a.start_pi()?,
             Kind::Codex => a.start_codex()?,
+            Kind::Agy => a.start_agy()?,
         }
         Ok(a)
     }
@@ -416,6 +419,26 @@ impl Agent {
         Ok(())
     }
 
+    /// agy (Antigravity CLI): one process per session, prompts as stream-json lines on stdin, one result per prompt.
+    fn start_agy(&mut self) -> Result<(), String> {
+        let mut args: Vec<String> = ["--input-format", "stream-json", "--output-format", "stream-json"].map(String::from).to_vec();
+        args.extend(params::args("agy_args"));
+        match &self.spec.resume {
+            Some(id) => { args.push("--conversation".into()); args.push(id.clone()); }
+            None => if !self.spec.prompt.is_empty() { *self.first.lock().unwrap() = Some(self.spec.prompt.clone()); },
+        }
+        let (out, last) = self.spawn(args)?;
+        let (tx, tid, gen, child, busy) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone());
+        let (stdin, queue, first, spec) = (self.stdin.clone(), self.queue.clone(), self.first.clone(), self.spec.clone());
+        std::thread::spawn(move || {
+            read_agy(out, spec, tx.clone(), tid.clone(), gen, busy, stdin, queue, first);
+            if let Some(mut c) = child.lock().unwrap().take() { let _ = c.wait(); }
+            let why = last.lock().unwrap().clone();
+            let _ = tx.send(Ev::Exited { tid, gen, why });
+        });
+        Ok(())
+    }
+
     /// Hand one message (or one of the agent's own slash commands) to the agent.
     pub fn say(&mut self, text: &str) -> Result<(), String> {
         let was_busy = { let mut b = self.busy.lock().unwrap(); let w = *b; *b = true; w };
@@ -435,6 +458,13 @@ impl Agent {
                 };
                 put(&self.stdin, &codex_turn(&th, text, self.model.lock().unwrap().clone()))
             }
+            Kind::Agy => {
+                // agy takes the next prompt only after the last one's result: wait in the queue until then
+                let mut q = self.queue.lock().unwrap();
+                if was_busy { q.push(text.to_string()); return Ok(()); }
+                drop(q);
+                put(&self.stdin, &agy_prompt(&self.first, text))
+            }
         }
     }
 
@@ -450,6 +480,14 @@ impl Agent {
                 self.queue.lock().unwrap().clear();
                 let (th, tu) = (self.thread.lock().unwrap().clone(), self.turn.lock().unwrap().clone());
                 if let (Some(th), Some(tu)) = (th, tu) { let _ = put(&self.stdin, &json!({"jsonrpc": "2.0", "id": "stop", "method": "turn/interrupt", "params": {"threadId": th, "turnId": tu}})); }
+            }
+            Kind::Agy => {
+                // agy has no way to stop a turn but ending the process; the conversation is kept, the next message resumes it
+                self.queue.lock().unwrap().clear();
+                if std::mem::replace(&mut *self.busy.lock().unwrap(), false) {
+                    let _ = self.tx.send(Ev::Done { tid: self.spec.tid.clone(), gen: self.spec.gen, text: None, stopped: true, error: None });
+                }
+                self.kill();
             }
         }
     }
@@ -509,6 +547,7 @@ impl Ctl {
                     Some(Choice { value: v.into(), label: m["displayName"].as_str().unwrap_or(v).into(), provider: None, id: v.into() })
                 }).collect())
             }
+            Kind::Agy => Err(text::NOT_SUPPORTED.into()),
         }
     }
 
@@ -526,6 +565,7 @@ impl Ctl {
                 self.ask(|id| json!({"type": "set_model", "id": id, "provider": p, "modelId": m}))?
             }
             Kind::Codex => { *self.model.lock().unwrap() = Some(value.to_string()); return Ok(Value::Null); }
+            Kind::Agy => return Err(text::NOT_SUPPORTED.into()),
         };
         if r["success"] == false { return Err(r["error"].as_str().unwrap_or(text::SET_MODEL_FAILED).to_string()); }
         Ok(r["data"].clone())
@@ -622,7 +662,7 @@ impl Ctl {
         if r["success"] == false || !r["error"].is_null() || r["subtype"] == "error" {
             return Err(r["error"]["message"].as_str().or(r["error"].as_str()).unwrap_or(text::BUILTIN_FAILED).to_string());
         }
-        let mut data = match self.kind { Kind::Codex => r["result"].clone(), Kind::Claude => r["response"].clone(), Kind::Pi => r["data"].clone() };
+        let mut data = match self.kind { Kind::Codex => r["result"].clone(), Kind::Claude => r["response"].clone(), Kind::Pi | Kind::Agy => r["data"].clone() };
         if self.kind == Kind::Codex && matches!(name, "new" | "clear" | "resume" | "fork" | "archive") {
             if let Some(t) = data["thread"]["id"].as_str() { *self.thread.lock().unwrap() = Some(t.to_string()); data["_session"] = json!(t); }
         }
@@ -777,6 +817,118 @@ fn read_claude(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, b
     }
 }
 
+/// One prompt line for agy; the first of a new conversation carries exterior's instructions.
+fn agy_prompt(first: &Arc<Mutex<Option<String>>>, text: &str) -> Value {
+    let t = match first.lock().unwrap().take() { Some(p) => format!("{p}\n\n---\n\n{text}"), None => text.to_string() };
+    json!({"event": "user", "message": {"content": t}})
+}
+
+/// agy reports no quota while it works: after a turn, ask `agy -p /usage` in the background, at most every agy_quota_min
+/// minutes per command (one command is one Google account).
+fn agy_quota(spec: &Spec, tx: &Sender<Ev>) {
+    static LAST: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+    let every = params::num("agy_quota_min") * 60;
+    if every == 0 || spec.command.is_empty() { return; }
+    let key = format!("{}|{}", spec.dev["name"].as_str().unwrap_or(""), spec.command);
+    {
+        let mut l = LAST.lock().unwrap();
+        let m = l.get_or_insert_with(HashMap::new);
+        let now = crate::store::now();
+        if m.get(&key).is_some_and(|t| now < t + every) { return; }
+        m.insert(key, now);
+    }
+    let (spec, tx) = (spec.clone(), tx.clone());
+    std::thread::spawn(move || {
+        let c = crate::host::agent(&spec.dev, &spec.dir, &env(&spec), &spec.command, &["-p".into(), "/usage".into()]);
+        if let Ok(out) = crate::host::exec(c, params::num("test_timeout_s")) {
+            let w = crate::usage::agy_windows(&out);
+            if !w.is_empty() { let _ = tx.send(Ev::Quota { tid: spec.tid.clone(), windows: w }); }
+        }
+    });
+}
+
+/// agy's output (stream-json: init, step_update, result), one JSON line after another, as events.
+#[allow(clippy::too_many_arguments)]
+fn read_agy(out: impl std::io::Read, spec: Spec, tx: Sender<Ev>, tid: String, gen: u64, busy: Arc<Mutex<bool>>, stdin: Arc<Mutex<Option<ChildStdin>>>,
+            queue: Arc<Mutex<Vec<String>>>, first: Arc<Mutex<Option<String>>>) {
+    let mut known = String::new();
+    let mut model = String::new();
+    // what this turn used, from each step's own usage (result.usage adds up over the whole conversation)
+    let mut uses: Vec<crate::usage::Use> = vec![];
+    // steps already shown (by index): agy may send a step again
+    let mut shown: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut streamed: HashMap<i64, usize> = HashMap::new();
+    for line in BufReader::new(out).lines().map_while(Result::ok) {
+        let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+        let step = |title: String, body: String| { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title, body }); };
+        // the conversation: from init and result (a step's may be a subagent's)
+        let cid = if v["event"] == "step_update" { None } else { v["conversation_id"].as_str().or(v["result"]["conversation_id"].as_str()) };
+        if let Some(s) = cid.filter(|s| !s.is_empty() && *s != known) { known = s.to_string(); let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: known.clone() }); }
+        match v["event"].as_str() {
+            Some("init") => {
+                if let Some(m) = v["init"]["model"].as_str() { model = m.to_string(); }
+                step(text::event_title("init"), pretty(&v["init"]));
+            }
+            Some("step_update") => {
+                let u = &v["step_update"];
+                // a subagent's steps carry its own conversation: shown and counted, never taken as the answer
+                if u["conversation_id"].as_str().is_some_and(|c| !known.is_empty() && c != known) {
+                    if u["state"] == "DONE" {
+                        if let Some(x) = crate::usage::from_agy(&u["usage"], &model) { crate::usage::merge(&mut uses, x); }
+                        step(text::SUBAGENT.into(), pretty(u));
+                    }
+                    continue;
+                }
+                if u["state"] == "DONE" { if let Some(x) = crate::usage::from_agy(&u["usage"], &model) { crate::usage::merge(&mut uses, x); } }
+                let i = u["step_index"].as_i64().unwrap_or(-1);
+                match u["step_type"].as_str().unwrap_or("") {
+                    "agent_response" => {
+                        // the text so far, or a piece of it: only what was not shown yet goes out
+                        if let Some(d) = u["text_delta"].as_str() {
+                            let sent = streamed.entry(i).or_insert(0);
+                            let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: if *sent == 0 && i > 0 { format!("\n\n{d}") } else { d.to_string() } });
+                            *sent += d.len();
+                        }
+                    }
+                    "user_input" | "checkpoint" => {}
+                    _ if u["state"] == "DONE" && shown.insert(i) => {
+                        let ti = &u["tool_info"];
+                        if ti.is_object() {
+                            let name = ti["name"].as_str().or(u["tool_name"].as_str()).unwrap_or("?");
+                            let failed = !ti["error"].is_null();
+                            let out = if failed { format!("{}\n{}", ti["output"].as_str().unwrap_or(""), ti["error"]["message"].as_str().unwrap_or("")) } else { ti["output"].as_str().unwrap_or("").to_string() };
+                            step(tool_title(name, &ti["parameters"], failed), tool_body(&ti["parameters"], Some(out.trim())));
+                        } else {
+                            step(text::event_title(&format!("step · {}", u["step_type"].as_str().unwrap_or("?"))), pretty(u));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("result") => {
+                let r = &v["result"];
+                if !uses.is_empty() { let _ = tx.send(Ev::Usage { tid: tid.clone(), uses: std::mem::take(&mut uses) }); }
+                agy_quota(&spec, &tx);
+                step(text::event_title("result"), pretty(r));
+                let st = r["status"].as_str().unwrap_or("");
+                let error = (st != "SUCCESS").then(|| {
+                    let e = &r["error"];
+                    e["message"].as_str().or(e.as_str()).map(String::from).unwrap_or_else(|| text::result_error(st))
+                });
+                let answer = r["response"].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && error.is_none());
+                let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: answer, stopped: st == "CANCELED" || st == "INTERRUPTED", error });
+                streamed.clear();
+                // the next waiting message, if any
+                let next = { let mut q = queue.lock().unwrap(); if q.is_empty() { None } else { Some(q.remove(0)) } };
+                match next { Some(t) => { let _ = put(&stdin, &agy_prompt(&first, &t)); } None => *busy.lock().unwrap() = false }
+            }
+            Some(e) => step(text::event_title(e), pretty(&v)),
+            None if !line.trim().is_empty() => step(text::STDOUT.into(), line.clone()),
+            None => {}
+        }
+    }
+}
+
 /// pi's output (rpc), one JSON line after another, as events.
 fn read_pi(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, busy: Arc<Mutex<bool>>, pending: Pending, stdin: Arc<Mutex<Option<ChildStdin>>>) {
     let mut last_text: Option<String> = None;
@@ -889,6 +1041,7 @@ pub fn test(dev: &Value, dir: &str, command: &str, kind: Kind) -> Result<String,
         Kind::Claude => [vec!["-p".into(), q.into()], params::args("claude_args")].concat(),
         Kind::Pi => vec!["-p".into(), "--no-session".into(), q.into()],
         Kind::Codex => vec!["exec".into(), "--skip-git-repo-check".into(), q.into()],
+        Kind::Agy => [vec!["-p".into(), q.into()], params::args("agy_args")].concat(),
     };
     let mut c = crate::host::agent(dev, dir, &[("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1".into())], command, &args);
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -912,7 +1065,7 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
         Kind::Claude => ([["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"].map(String::from).to_vec(), params::args("claude_args")].concat(),
                          json!({"type": "control_request", "request_id": "init", "request": {"subtype": "initialize"}})),
         Kind::Pi => (vec!["--mode".into(), "rpc".into(), "--no-session".into()], json!({"type": "get_commands"})),
-        Kind::Codex => return vec![],
+        Kind::Codex | Kind::Agy => return vec![],
     };
     let Ok(mut child) = crate::host::agent(dev, dir, &env(&Spec { tid: String::new(), prompt: String::new(), topic: String::new(), dev: dev.clone(), dir: dir.into(), command: command.into(), kind, gen: 0, resume: None, effort: None }), command, &args)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return vec![] };
@@ -1172,6 +1325,39 @@ mod read_tests {
     }
 
     /// What the user would read as the answer: the text pieces and the final texts.
+    fn feed_agy(lines: &[Value]) -> Vec<Ev> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        let spec = Spec { tid: "tgbot:1".into(), prompt: String::new(), topic: String::new(), dev: Value::Null, dir: String::new(), command: String::new(),
+                          kind: Kind::Agy, gen: 1, resume: None, effort: None };
+        read_agy(std::io::Cursor::new(input.into_bytes()), spec, tx, "tgbot:1".into(), 1, Arc::default(), Arc::default(), Arc::default(), Arc::default());
+        rx.try_iter().collect()
+    }
+    #[test]
+    fn agy_turn() {
+        // as agy 1.5.15 printed it (tool list cut short)
+        let c = "2f42";
+        let evs = feed_agy(&[
+            json!({"event":"init","conversation_id":c,"init":{"cwd":"/tmp","tools":["run_command"]}}),
+            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":0,"state":"DONE","step_type":"user_input"}}),
+            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":1,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":8655,"output_tokens":83,"thinking_tokens":36,"cache_read_tokens":0}}}),
+            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"}}}}),
+            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"},"output":"hi\n"}}}),
+            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"ban"}}),
+            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":3,"state":"DONE","step_type":"agent_response","text_delta":"ana\n","usage":{"input_tokens":2238,"output_tokens":10,"thinking_tokens":8,"cache_read_tokens":6598}}}),
+            json!({"event":"result","result":{"conversation_id":c,"status":"SUCCESS","response":"banana\n","num_turns":1,"usage":{"input_tokens":10893}}}),
+        ]);
+        let text: String = evs.iter().filter_map(|e| match e { Ev::Text { delta, .. } => Some(delta.as_str()), _ => None }).collect();
+        assert_eq!(text.trim(), "banana");
+        assert!(matches!(&evs.iter().find(|e| matches!(e, Ev::Done { .. })), Some(Ev::Done { text: Some(t), error: None, stopped: false, .. }) if t == "banana"));
+        assert!(evs.iter().any(|e| matches!(e, Ev::Session { id, .. } if id == c)));
+        assert!(steps(&evs).iter().any(|(_, b)| b.contains("echo hi") && b.contains("hi")));
+        let u = evs.iter().find_map(|e| match e { Ev::Usage { uses, .. } => Some(uses.clone()), _ => None }).unwrap();
+        assert_eq!((u[0].input, u[0].output, u[0].cache_read), (8655 + 2238, 83 + 36 + 10 + 8, 6598));
+        // a failed turn says why
+        let evs = feed_agy(&[json!({"event":"result","result":{"conversation_id":c,"status":"ERROR","error":{"message":"quota"}}})]);
+        assert!(matches!(&evs.iter().find(|e| matches!(e, Ev::Done { .. })), Some(Ev::Done { error: Some(e), .. }) if e == "quota"));
+    }
     fn answers(evs: &[Ev]) -> Vec<String> {
         evs.iter().filter_map(|e| match e { Ev::Text { delta, .. } => Some(delta.trim().to_string()), Ev::Done { text, .. } => text.clone(), _ => None })
             .filter(|t| !t.is_empty()).collect()
