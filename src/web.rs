@@ -135,11 +135,18 @@ pre{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,mo
 @keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{50%{opacity:.35}}@keyframes fade{from{opacity:0;transform:translateY(-4px)}to{opacity:1}}button{transition:background .15s,opacity .15s,transform .05s}button:active{transform:scale(.97)}button:hover{filter:brightness(1.06)}button.busy{opacity:.7;pointer-events:none}button.busy::before{content:"";display:inline-block;width:11px;height:11px;margin-right:6px;vertical-align:-1px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite}.badge.run{color:var(--warn);animation:pulse 1.2s ease-in-out infinite}.badge.run::before{content:"";display:inline-block;width:9px;height:9px;margin-right:5px;vertical-align:-1px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite}main{animation:fade .2s ease-out}@keyframes flash{from{background:color-mix(in srgb,var(--accent) 22%,transparent)}to{background:transparent}}.flash{animation:flash 1.2s ease-out}.swap{transition:opacity .18s}.swap.out{opacity:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
 "#;
 
+const FAVICON: &[u8] = include_bytes!("../assets/favicon.ico");
+const TOUCH_ICON: &[u8] = include_bytes!("../assets/favicon-180.png");
+
+fn icon(data: &'static [u8], mime: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    Response::from_data(data).with_header(Header::from_bytes("Content-Type", mime).unwrap()).with_header(Header::from_bytes("Cache-Control", "max-age=86400").unwrap())
+}
+
 fn page(active: &str, title: &str, body: &str, refresh: bool) -> String {
     let tabs = [("/", "会话"), ("/devices", "设备"), ("/memory", "记忆"), ("/messages", "消息记录"), ("/prompt", "启动说明"), ("/usage", "用量"), ("/settings", "设置"), ("/log", "日志")];
     let nav: String = tabs.iter().map(|(h, t)| format!("<a href=\"{h}\"{}>{t}</a>", if *h == active { " class=\"on\"" } else { "" })).collect();
     let meta = if refresh { "<meta name=\"live\" content=\"fast\">" } else { "" };
-    format!("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{meta}<title>{} · exterior</title><style>{CSS}</style></head><body><header><b>exterior</b>{nav}</header><main>{body}</main>{JS}</body></html>", esc(title))
+    format!("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{meta}<title>{} · exterior</title><link rel=\"icon\" href=\"/favicon.ico\"><link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\"><style>{CSS}</style></head><body><header><b>exterior</b>{nav}</header><main>{body}</main>{JS}</body></html>", esc(title))
 }
 
 // ---- pages ----
@@ -538,6 +545,9 @@ fn respond(mut req: Request) {
         "/usage" => usage_page(&query),
         "/log" => log_page(),
         "/healthz" => { let _ = req.respond(Response::from_string("ok")); return; }
+        // the app's icon, for the browser tab and the home screen
+        "/favicon.ico" => { let _ = req.respond(icon(FAVICON, "image/x-icon")); return; }
+        "/apple-touch-icon.png" => { let _ = req.respond(icon(TOUCH_ICON, "image/png")); return; }
         _ => { let _ = req.respond(Response::from_string("页面不存在").with_status_code(404)); return; }
     };
     let _ = req.respond(Response::from_string(out).with_header(html));
