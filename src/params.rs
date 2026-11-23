@@ -5,12 +5,12 @@ pub struct Param { pub key: &'static str, pub label: &'static str, pub default: 
 
 pub const PARAMS: &[Param] = &[
     Param { key: "user_name", label: "用户称呼（启动说明和文件提示中使用）", default: "Yao" },
-    Param { key: "global_topic", label: "全局话题的名称", default: "全局" },
+    Param { key: "global_topic", label: "全局话题的名称（exterior 启动时确保它存在并置顶；它的说明由 topic_roles 决定）", default: "全局" },
     Param { key: "topic_aliases", label: "话题别名：改名后旧名仍可用（exterior send、定时消息），格式「旧名=新名」，多条用；隔开", default: "" },
     Param { key: "global_dir", label: "全局话题的文件夹名", default: "overview" },
     Param { key: "knowledge_dir", label: "knowledge 文件夹名（设备未单独指定时使用）", default: "knowledge" },
     Param { key: "session_prompt", label: "启动说明文件（相对 knowledge）", default: "exterior-session.md" },
-    Param { key: "global_prompt", label: "全局话题追加说明文件（相对 knowledge）", default: "exterior-global.md" },
+    Param { key: "topic_roles", label: "话题角色：「话题名=角色」，多条用；隔开（如 Polaris=global）。启动该话题时在启动说明后追加 knowledge/exterior-<角色>.md；话题别名同样适用", default: "全局=global" },
     Param { key: "test_prompt", label: "测试 agent 时发送的问题所在文件（相对 knowledge）", default: "exterior-test.md" },
     Param { key: "self_url", label: "设备访问 exterior 的地址（`exterior send` 使用；留空时，作为懒猫应用运行则用应用域名，直接运行则本机设备用 http://127.0.0.1:端口，远程设备无法使用）", default: "" },
     Param { key: "schedules", label: "定时消息：每条「HH:MM|话题名|内容」，多条用 || 隔开；按 exterior 所在机器的时区（懒猫应用为旧金山时间），每天一次，exterior 到点把内容交给该话题的 agent", default: "" },

@@ -568,8 +568,7 @@ fn start_agent(s: &mut Session, tx: &Sender<Ev>) -> Result<(), String> {
     // cc0 picked cc6 last time: the session lives in cc6, so resume through cc6
     let run_row = n["resolved"].as_str().and_then(|r| store::agent(&dev, r)).unwrap_or(row.clone());
     s.gen += 1;
-    let global = s.dir == crate::prompt::global_dir(&dev);
-    let prompt = crate::prompt::session_text(&dev, &s.name, &s.tid, &s.dir, global)?;
+    let prompt = crate::prompt::session_text(&dev, &s.name, &s.tid, &s.dir)?;
     let spec = Spec { tid: s.tid.clone(), prompt, topic: s.name.clone(), dev: dev.clone(), dir: s.dir.clone(),
                       command: run_row["command"].as_str().unwrap_or("").to_string(), kind, gen: s.gen, resume: resume.clone(),
                       effort: n["effort"].as_str().map(String::from) };
@@ -1048,7 +1047,7 @@ fn switch_account(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, d
 const SCHEDULE_LATE: i64 = 120;
 
 /// A topic's old name, kept as an alias after it was renamed (topic_aliases "old=new；old2=new2"), as its new name.
-fn alias(name: &str) -> String { alias_in(&params::get("topic_aliases"), name) }
+pub fn alias(name: &str) -> String { alias_in(&params::get("topic_aliases"), name) }
 
 fn alias_in(spec: &str, name: &str) -> String {
     spec.split(['；', ';', '\n']).filter_map(|p| p.split_once('=')).find(|(old, _)| old.trim() == name.trim())

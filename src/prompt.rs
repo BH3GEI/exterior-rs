@@ -1,7 +1,8 @@
 //! What exterior tells an agent when it starts it. Passed on the command line (claude and pi:
 //! --append-system-prompt; codex: developerInstructions), so nothing is written into the topic folders.
-//! The text is not in this program: it is a file in knowledge on the device (see the session_prompt and
-//! global_prompt settings), read at every start. exterior only fills in the placeholders.
+//! The text is not in this program: it is a file in knowledge on the device (the session_prompt setting), plus, for a
+//! topic that has a role in the topic_roles setting, knowledge/exterior-<role>.md; read at every start. exterior only
+//! fills in the placeholders.
 use crate::agents::Kind;
 use crate::{host, params, text};
 use serde_json::Value;
@@ -17,12 +18,33 @@ pub fn root(dev: &Value) -> String { dev["root"].as_str().unwrap_or("").trim_end
 /// The folder of the global topic on a device.
 pub fn global_dir(dev: &Value) -> String { format!("{}/{}", root(dev), params::get("global_dir")) }
 
-/// The full path of a text file in knowledge named by a setting ("session_prompt", "global_prompt", "test_prompt").
+/// The full path of a text file in knowledge named by a setting ("session_prompt", "test_prompt").
 pub fn file(dev: &Value, which: &str) -> String { format!("{}/{}", infra(dev), params::get(which).trim_start_matches('/')) }
 
 /// Read a template from the device, without its <!-- --> comments.
-pub fn read(dev: &Value, which: &str) -> Result<String, String> {
-    let path = file(dev, which);
+pub fn read(dev: &Value, which: &str) -> Result<String, String> { read_path(dev, &file(dev, which)) }
+
+/// The role file of a role named in topic_roles: knowledge/exterior-<role>.md.
+pub fn role_file(dev: &Value, role: &str) -> String { format!("{}/exterior-{}.md", infra(dev), role.trim()) }
+
+/// The topic's role from the topic_roles setting ("Polaris=global；Comes=comes"): by its name, or by an old name of it
+/// (topic_aliases).
+pub fn role_of(name: &str) -> Option<String> { role_in(&params::get("topic_roles"), name, &|n| crate::daemon::alias(n)) }
+
+fn role_in(spec: &str, name: &str, alias: &dyn Fn(&str) -> String) -> Option<String> {
+    spec.split(['；', ';', '\n']).filter_map(|p| p.split_once('='))
+        .find(|(t, _)| t.trim() == name.trim() || alias(t.trim()) == name.trim())
+        .map(|(_, r)| r.trim().to_string()).filter(|r| !r.is_empty())
+}
+
+/// The roles in topic_roles, as (topic, role).
+pub fn roles() -> Vec<(String, String)> {
+    params::get("topic_roles").split(['；', ';', '\n']).filter_map(|p| p.split_once('='))
+        .map(|(t, r)| (t.trim().to_string(), r.trim().to_string())).filter(|(t, r)| !t.is_empty() && !r.is_empty()).collect()
+}
+
+fn read_path(dev: &Value, path: &str) -> Result<String, String> {
+    let path = path.to_string();
     let raw = if host::is_local(dev) { host::read_local(&path) } else { host::run(dev, &format!("cat {}", host::quote(&path)), 30) }
         .map_err(|e| text::prompt_unreadable(&path, &e))?;
     let mut out = String::new();
@@ -43,10 +65,15 @@ fn resume_examples(dev: &Value) -> String {
     }).collect::<Vec<_>>().join("、")
 }
 
-pub fn session_text(dev: &Value, name: &str, tid: &str, dir: &str, global: bool) -> Result<String, String> {
+/// What a topic's agent is told at start: exterior-session.md, then the topic's role file if it has one.
+pub fn session_text(dev: &Value, name: &str, tid: &str, dir: &str) -> Result<String, String> {
+    session_text_as(dev, name, tid, dir, role_of(name).as_deref())
+}
+
+pub fn session_text_as(dev: &Value, name: &str, tid: &str, dir: &str, role: Option<&str>) -> Result<String, String> {
     let brief = crate::store::config()["brief"]["url"].as_str().unwrap_or("").trim_end_matches('/').to_string();
     let mut t = read(dev, "session_prompt")?;
-    if global { t = format!("{t}\n\n{}", read(dev, "global_prompt")?); }
+    if let Some(r) = role { t = format!("{t}\n\n{}", read_path(dev, &role_file(dev, r))?); }
     let vars = [("{name}", name.to_string()), ("{tid}", tid.to_string()), ("{dir}", dir.to_string()), ("{brief}", brief),
                 ("{root}", root(dev)), ("{infra}", infra(dev)), ("{user}", params::get("user_name")), ("{mark}", params::get("relay_mark")),
                 ("{global_topic}", params::get("global_topic")), ("{resume_examples}", resume_examples(dev))];
@@ -169,6 +196,16 @@ pub fn install(dev: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn topic_roles() {
+        let alias = |n: &str| if n == "全局" { "Polaris".to_string() } else { n.to_string() };
+        let spec = "Polaris=global；Comes = comes; 全局二号=x;dream=dream";
+        assert_eq!(super::role_in(spec, "Polaris", &alias).as_deref(), Some("global"));
+        assert_eq!(super::role_in(spec, "Comes", &alias).as_deref(), Some("comes"));
+        assert_eq!(super::role_in("全局=global", "Polaris", &alias).as_deref(), Some("global"), "an old name in the table still finds the topic");
+        assert_eq!(super::role_in(spec, "随便", &alias), None);
+    }
+
     use super::url_for;
 
     /// A form body as name → value.

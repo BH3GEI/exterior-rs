@@ -266,15 +266,19 @@ fn messages_page() -> String {
 }
 
 fn prompt_page() -> String {
-    let mut body = String::from("<h2>启动说明</h2><p class=\"mute\">exterior 启动 agent 时，读取 knowledge 中的说明文件，填入话题信息后交给 agent（claude 和 pi 通过 --append-system-prompt，codex 通过 developerInstructions），不在话题文件夹中写入文件。说明文件的位置可在「设置」中修改；修改说明本身请直接编辑这些文件。</p>");
+    let mut body = String::from("<h2>启动说明</h2><p class=\"mute\">exterior 启动 agent 时，读取 knowledge 中的说明文件，填入话题信息后交给 agent（claude 和 pi 通过 --append-system-prompt，codex 通过 developerInstructions，agy 通过 systemPrompt.append），不在话题文件夹中写入文件。设置里的 topic_roles 给某些话题加一个角色：在启动说明之后追加 knowledge/exterior-&lt;角色&gt;.md。修改说明本身请直接编辑这些文件。</p>");
     for d in store::devices() {
         let dn = d["name"].as_str().unwrap_or("").to_string();
         let r = &store::state("tests")[format!("prompt:{dn}")];
         let root = crate::prompt::root(&d);
-        let sample = crate::prompt::session_text(&d, text::SAMPLE_TOPIC, text::SAMPLE_TID, &format!("{root}/{}", text::SAMPLE_TOPIC), false).unwrap_or_else(|e| e);
-        let global = crate::prompt::session_text(&d, &params::get("global_topic"), text::SAMPLE_TID, &crate::prompt::global_dir(&d), true).unwrap_or_else(|e| e);
-        body.push_str(&format!("<h2>{}</h2><div class=\"card\"><div class=\"row mute\">普通话题：{}</div><pre>{}</pre><div class=\"row mute\">「{}」话题（追加 {}）：</div><pre>{}</pre><div class=\"row\"><form method=\"post\" action=\"/prompt/install\"><input type=\"hidden\" name=\"d\" value=\"{}\"><button>重新写入 brief 密钥</button></form>{}</div></div>",
-            esc(&dn), esc(&crate::prompt::file(&d, "session_prompt")), esc(&sample), esc(&params::get("global_topic")), esc(&crate::prompt::file(&d, "global_prompt")), esc(&global), esc(&dn), result_cell(r)));
+        let sample = crate::prompt::session_text_as(&d, text::SAMPLE_TOPIC, text::SAMPLE_TID, &format!("{root}/{}", text::SAMPLE_TOPIC), None).unwrap_or_else(|e| e);
+        body.push_str(&format!("<h2>{}</h2><div class=\"card\"><div class=\"row mute\">普通话题：{}</div><pre>{}</pre>", esc(&dn), esc(&crate::prompt::file(&d, "session_prompt")), esc(&sample)));
+        for (topic, role) in crate::prompt::roles() {
+            let f = crate::prompt::role_file(&d, &role);
+            let t = crate::prompt::session_text_as(&d, &topic, text::SAMPLE_TID, &format!("{root}/{topic}"), Some(&role)).unwrap_or_else(|e| e);
+            body.push_str(&format!("<div class=\"row mute\">「{}」话题，角色 {}（追加 {}）：</div><pre>{}</pre>", esc(&topic), esc(&role), esc(&f), esc(&t)));
+        }
+        body.push_str(&format!("<div class=\"row\"><form method=\"post\" action=\"/prompt/install\"><input type=\"hidden\" name=\"d\" value=\"{}\"><button>重新写入 brief 密钥</button></form>{}</div></div>", esc(&dn), result_cell(r)));
     }
     page("/prompt", "启动说明", &body, false)
 }
