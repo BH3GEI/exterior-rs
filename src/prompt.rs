@@ -134,8 +134,9 @@ printf '%s' "$text" | curl -sS --fail-with-body -H "Authorization: Bearer $(cat 
 # exterior usage [5h|24h|7d]：各订阅当前的额度窗口，以及这段时间各话题、各订阅用了多少。
 # exterior topic open <话题名>：开一个新话题交给另一个 agent（返回 chat）；exterior topic close <话题名或 chat>：任务完成后关闭。
 # exterior draft <会话ID或名字> <内容>：写一条 brief 草稿等 Yao 处理；exterior draft list；exterior draft rm <编号>。
+# exterior schedule list / add <HH:MM> <话题名> <内容> / rm <编号>：每天定时发给某个话题的消息（旧金山时间）。
 # 由 exterior 安装，每次启动时覆盖。
-usage() {{ echo '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID | --all [来源]> | exterior usage [5h|24h|7d]' >&2; exit 2; }}
+usage() {{ echo '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID | --all [来源]> | exterior schedule list|add <HH:MM> <话题> <内容>|rm <编号> | exterior usage [5h|24h|7d]' >&2; exit 2; }}
 case "$1" in
   send) [ $# -ge 3 ] || usage; to=$2; shift 2; cmd=send; text="$*" ;;
   watch) cmd=watch; shift; to="$*"; text= ;;
@@ -143,6 +144,7 @@ case "$1" in
   usage) [ $# -le 2 ] || usage; cmd=usage; to=${{2:-}}; text= ;;
   topic) [ $# -ge 3 ] || usage; cmd=topic; to=$2; shift 2; text="$*" ;;
   draft) [ $# -ge 2 ] || usage; cmd=draft; to=$2; shift 2; text="$*" ;;
+  schedule) [ $# -ge 2 ] || usage; cmd=schedule; to=$2; shift 2; text="$*" ;;
   *) usage ;;
 esac
 {post}
@@ -155,13 +157,13 @@ fn send_ps1(dev: &Value) -> String {
     // with a byte order mark: Windows PowerShell reads a file without one in the local code page
     format!("\u{feff}{}", format!(r#"# exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
 # 由 exterior 安装，每次启动时覆盖。
-$usage = '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID | --all [来源]> | exterior usage [5h|24h|7d]'
+$usage = '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID | --all [来源]> | exterior schedule list|add <HH:MM> <话题> <内容>|rm <编号> | exterior usage [5h|24h|7d]'
 $cmd = [string]$args[0]; $to = ''; $text = ''
 if ($cmd -eq 'send' -and $args.Count -ge 3) {{ $to = [string]$args[1]; $text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }}
 elseif ($cmd -eq 'watch') {{ if ($args.Count -ge 2) {{ $to = ($args[1..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }} }}
 elseif ($cmd -eq 'unwatch' -and $args.Count -ge 2 -and $args.Count -le 3) {{ $to = ($args[1..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }}
 elseif ($cmd -eq 'usage' -and $args.Count -le 2) {{ if ($args.Count -eq 2) {{ $to = [string]$args[1] }} }}
-elseif (($cmd -eq 'topic' -and $args.Count -ge 3) -or ($cmd -eq 'draft' -and $args.Count -ge 2)) {{ $to = [string]$args[1]; if ($args.Count -ge 3) {{ $text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }} }}
+elseif (($cmd -eq 'topic' -and $args.Count -ge 3) -or (($cmd -eq 'draft' -or $cmd -eq 'schedule') -and $args.Count -ge 2)) {{ $to = [string]$args[1]; if ($args.Count -ge 3) {{ $text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }} }}
 else {{ [Console]::Error.WriteLine($usage); exit 2 }}
 $key = (Get-Content -Raw -Encoding UTF8 -LiteralPath {key}).Trim()
 $e = {{ param($s) [Uri]::EscapeDataString([string]$s) }}
@@ -273,11 +275,13 @@ mod tests {
             assert_eq!(run(&["draft", "123@chatroom", "你好", "明天见"]), Some(0));
             assert_eq!(run(&["topic", "open"]), Some(2));
             assert_eq!(run(&["watch", "--flush"]), Some(0));
+            assert_eq!(run(&["schedule", "add", "07:30", "exterior 开发", "看看"]), Some(0));
+            assert_eq!(run(&["schedule"]), Some(2));
             let g: Vec<_> = got.lock().unwrap().iter().map(|b| form(b)).collect();
             let want = |cmd: &str, to: &str, text: &str| [("cmd", cmd), ("from", "tgbot:1"), ("to", to), ("text", text)].map(|(k, v)| (k.to_string(), v.to_string())).into_iter().collect::<std::collections::HashMap<_, _>>();
             assert_eq!(g, vec![want("watch", "wx@chatroom", ""), want("send", "全局", "a b"),
                                want("send", "exterior 开发", "中文 & 符号 = %20 + \"引号\"\n第二行 '单引号'"), want("watch", "", ""), want("usage", "7d", ""),
-                               want("watch", "--all wechat", ""), want("topic", "open", "新任务"), want("draft", "list", ""), want("draft", "123@chatroom", "你好 明天见"), want("watch", "--flush", "")], "windows {windows}");
+                               want("watch", "--all wechat", ""), want("topic", "open", "新任务"), want("draft", "list", ""), want("draft", "123@chatroom", "你好 明天见"), want("watch", "--flush", ""), want("schedule", "add", "07:30 exterior 开发 看看")], "windows {windows}");
             // on Windows nothing but ASCII may reach curl's command line
             let args = std::fs::read_to_string(&log).unwrap();
             assert_eq!(args.is_ascii(), windows, "{args}");

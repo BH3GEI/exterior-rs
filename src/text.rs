@@ -295,6 +295,21 @@ pub fn watching(list: &[String]) -> String {
 }
 pub fn watch_on(c: &str) -> String { format!("开始盯 {}：有新消息时，exterior 会攒一小批交给你", watch_name(c)) }
 pub fn watch_off(c: &str) -> String { format!("不再盯 {}", watch_name(c)) }
+pub const SCHEDULE_USAGE: &str = "用法：exterior schedule list | exterior schedule add <HH:MM> <话题名> <内容> | exterior schedule rm <编号>（时间按 exterior 所在机器的时区，懒猫上是旧金山时间）";
+pub const SCHEDULE_BARS: &str = "内容里不能有「||」（它是定时消息之间的分隔符）";
+pub fn schedule_list(entries: &[String]) -> String {
+    if entries.is_empty() { return "没有定时消息".into(); }
+    let mut t = String::from("定时消息（每天一次，时间按 exterior 所在机器的时区，懒猫上是旧金山时间）：");
+    for (i, e) in entries.iter().enumerate() {
+        let mut f = e.splitn(3, '|');
+        let (at, topic, body) = (f.next().unwrap_or("").trim(), f.next().unwrap_or("").trim(), f.next().unwrap_or("").trim());
+        t.push_str(&format!("\n{}. {at} | {topic} | {body}", i + 1));
+    }
+    t
+}
+pub fn schedule_added(n: usize, e: &str) -> String { format!("已添加第 {n} 条：{}", e.replace('|', " | ")) }
+pub fn schedule_removed(n: usize, e: &str) -> String { format!("已删除第 {n} 条：{}", e.replace('|', " | ")) }
+pub fn schedule_no(arg: &str, n: usize) -> String { format!("没有第「{arg}」条定时消息（现有 {n} 条，编号见 exterior schedule list）") }
 pub const TOPIC_USAGE: &str = "用法：exterior topic open <话题名> | exterior topic close <话题名或 tgbot:编号>";
 pub fn topic_opened(name: &str, chat: &str, link: &str) -> String { format!("已开话题「{name}」：{chat} {link}（exterior 会接管并启动 agent；用 exterior send {name} <任务> 交代任务）") }
 pub fn topic_closed(name: &str, chat: &str) -> String { format!("已关闭话题「{name}」（{chat}）") }

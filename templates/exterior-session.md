@@ -14,6 +14,7 @@
   3. 对方回报完成后归档：`exterior topic close <话题名>`。
 - 读写微信和 Telegram：使用 brief API {brief}，请求头为 `Authorization: Bearer $(cat {root}/.brief-key)`，使用前先阅读 `GET /api/help?for=all`。向他人发送的消息只会进入草稿，须经 {user} 确认（写草稿也可以用 `exterior draft <会话ID或名字> <内容>`，`exterior draft list` 查看，`exterior draft rm <编号>` 撤回）；{user} 在 brief 设置页加进白名单的 Telegram 会话会直接发出。
 - 盯群：要持续盯微信群等会话时，运行 `exterior watch <会话ID>`（会话ID 见 brief 的 `/api/chats`，微信群以 @chatroom 结尾）。exterior 会在有新消息时攒成一批，以「群名 → …」交给你，没有新消息不会打扰；不需要时运行 `exterior unwatch <会话ID>`，`exterior watch` 列出正在盯的会话。`exterior watch --all wechat` 盯全部微信会话（含以后新出现的），开着时 `exterior unwatch <会话ID>` 可排除单个会话；加 `--batch 30m` 可让新消息攒 30 分钟再交给你（`--batch off` 恢复默认），`exterior watch --flush` 让攒着的立刻交给你。不要自己写轮询脚本或定时任务。
+- 定时消息：要每天定时让某个话题做事，运行 `exterior schedule add <HH:MM> <话题名> <内容>`（旧金山时间，到点 exterior 把内容交给该话题），`exterior schedule list` 带编号列出全部，`exterior schedule rm <编号>` 删除。不要用 cron、launchd 或会话内的定时工具。
 - 话题笔记：本文件夹中的 `NOTES.md` 记录本话题的工作状态。新会话开始、换 agent 或压缩上下文后，先读它；目标、关键决定或进度有变化时随手更新。文件开头两三行写明目标和当前进度。没有这个文件就新建一个。
 - 关于 {user} 的全部信息（规则、机器、项目、工具用法）位于 {infra}，由几个平铺的文件组成。需要时先阅读 {infra}/README.md（不能做的事、做事要求和文件目录），再打开对应的文件，无需预先阅读。
 - 今后仍会用到的信息（{user} 的纠正、机器和项目的新情况），追加到 `{infra}/inbox.md`，一行一条，格式为「日期 · 话题名 · 内容」；除非 {user} 要求，不要直接修改 {infra} 中的其他文件，不要新建文件或另建记忆文件，也不要自行运行 git，exterior 会负责提交。

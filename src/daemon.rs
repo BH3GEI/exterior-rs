@@ -1070,6 +1070,60 @@ fn alias_in(spec: &str, name: &str) -> String {
         .map(|(_, new)| new.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| name.trim().to_string())
 }
 
+/// `exterior schedule list | add <HH:MM> <话题名> <内容> | rm <编号>`: the schedules setting, read and written directly
+/// (nothing else in the settings changes). Times are exterior's local time (旧金山 on Lazycat).
+pub fn schedule_cmd(what: &str, rest: &str) -> Result<String, String> {
+    let mut c = store::config();
+    let spec = c["params"]["schedules"].as_str().unwrap_or("").to_string();
+    let mut entries: Vec<String> = spec.split("||").map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect();
+    let save = |c: &mut Value, entries: &[String]| {
+        if !c["params"].is_object() { c["params"] = json!({}); }
+        if entries.is_empty() { c["params"].as_object_mut().unwrap().remove("schedules"); } else { c["params"]["schedules"] = json!(entries.join(" || ")); }
+        store::set_config(c);
+    };
+    match what.trim() {
+        "list" | "" => Ok(text::schedule_list(&entries)),
+        "add" => {
+            let names: Vec<String> = LIVE.lock().unwrap().clone().map(|s| s.lock().unwrap().values().filter(|t| !t.deleted).map(|t| t.name.clone()).collect()).unwrap_or_default();
+            let (at, topic, body) = schedule_parse(rest, &names, &|n| alias(n)).ok_or(text::SCHEDULE_USAGE)?;
+            if body.contains("||") { return Err(text::SCHEDULE_BARS.into()); }
+            let e = format!("{at}|{topic}|{body}");
+            if schedules(&e).is_empty() { return Err(text::SCHEDULE_USAGE.into()); }
+            entries.push(e.clone());
+            save(&mut c, &entries);
+            store::log(&format!("schedule add: {}", e.chars().take(80).collect::<String>()));
+            Ok(text::schedule_added(entries.len(), &e))
+        }
+        "rm" => {
+            let n: usize = rest.trim().trim_start_matches('#').parse().ok().filter(|n| *n >= 1 && *n <= entries.len()).ok_or_else(|| text::schedule_no(rest.trim(), entries.len()))?;
+            let gone = entries.remove(n - 1);
+            save(&mut c, &entries);
+            store::log(&format!("schedule rm: {}", gone.chars().take(80).collect::<String>()));
+            Ok(text::schedule_removed(n, &gone))
+        }
+        _ => Err(text::SCHEDULE_USAGE.into()),
+    }
+}
+
+/// "07:30 exterior 开发 内容…" → ("07:30", topic, content). The topic is the longest known topic name (or old name)
+/// the rest starts with, since names may have spaces; else the first word. Old names become the current name.
+fn schedule_parse(s: &str, names: &[String], alias: &dyn Fn(&str) -> String) -> Option<(String, String, String)> {
+    let s = s.trim();
+    let (at, rest) = s.split_once(char::is_whitespace)?;
+    let (h, m) = at.split_once(':')?;
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    if h > 23 || m > 59 { return None; }
+    let rest = rest.trim_start();
+    let mut known: Vec<String> = names.to_vec();
+    known.extend(params::get("topic_aliases").split(['；', ';', '\n']).filter_map(|p| p.split_once('=')).map(|(o, _)| o.trim().to_string()));
+    known.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let (topic, body) = known.iter().filter(|n| !n.is_empty())
+        .find_map(|n| rest.strip_prefix(n.as_str()).filter(|b| b.starts_with(char::is_whitespace)).map(|b| (n.clone(), b.trim().to_string())))
+        .or_else(|| rest.split_once(char::is_whitespace).map(|(t, b)| (t.to_string(), b.trim().to_string())))?;
+    if body.is_empty() { return None; }
+    Some((format!("{h:02}:{m:02}"), alias(&topic), body))
+}
+
 fn schedules(spec: &str) -> Vec<(i64, String, String)> {
     spec.split("||").filter_map(|e| {
         let mut f = e.trim().splitn(3, '|');
@@ -1528,6 +1582,17 @@ mod tests {
         assert_eq!(split_batch("1@chatroom").unwrap(), ("1@chatroom".into(), None));
         assert!(split_batch("--batch x").is_err());
         assert_eq!(crate::text::watch_batch_note(1800), "（攒批时长 30 分钟）");
+    }
+    #[test]
+    fn schedule_args() {
+        let names = vec!["exterior 开发".to_string(), "exterior".to_string(), "Polaris".to_string()];
+        let alias = |n: &str| if n == "全局" { "Polaris".to_string() } else { n.to_string() };
+        assert_eq!(schedule_parse("7:30 exterior 开发 看一眼 | 进度", &names, &alias), Some(("07:30".into(), "exterior 开发".into(), "看一眼 | 进度".into())));
+        assert_eq!(schedule_parse("22:00 新话题 做点事", &names, &alias), Some(("22:00".into(), "新话题".into(), "做点事".into())));
+        assert_eq!(schedule_parse("08:00 全局 早报", &names, &alias).map(|x| x.1), Some("Polaris".into()));
+        assert_eq!(schedule_parse("25:00 Polaris x", &names, &alias), None);
+        assert_eq!(schedule_parse("08:00 Polaris", &names, &alias), None);
+        assert!(crate::text::schedule_list(&["07:30|dream|整理".into()]).contains("1. 07:30 | dream | 整理"));
     }
     #[test]
     fn watch_all() {
