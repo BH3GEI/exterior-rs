@@ -250,8 +250,11 @@ impl Agent {
                 "--include-partial-messages"].map(String::from).to_vec();
         args.extend(params::args("claude_args"));
         if let Some(e) = self.spec.effort.as_ref().filter(|e| *e != "auto") { args.push("--effort".into()); args.push(e.clone()); }
-        // the model picked with /model in this topic (claude forgets it when its process ends)
-        if let Some(m) = crate::store::note(&self.spec.tid)["model"].as_str().filter(|m| !m.is_empty() && !self.spec.tid.is_empty()) { args.push("--model".into()); args.push(m.to_string()); }
+        // the model picked with /model in this topic (claude forgets it when its process ends). None picked: on a
+        // resume say "default" all the same, or claude goes on with the model the conversation last used
+        // ("default" is the one the settings give, project settings included)
+        let picked = crate::store::note(&self.spec.tid)["model"].as_str().filter(|m| !m.is_empty() && !self.spec.tid.is_empty()).map(String::from);
+        if let Some(m) = picked.or_else(|| self.spec.resume.as_ref().map(|_| "default".to_string())) { args.push("--model".into()); args.push(m); }
         // claude leaves its thinking out unless asked; the summaries Anthropic's API gives are shown as steps
         args.extend(params::args("claude_fixed_args"));
         let td = params::get("claude_thinking");
