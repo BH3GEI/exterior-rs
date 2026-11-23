@@ -550,6 +550,8 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
             Ev::Done { tid, gen, text: answer, stopped, error } => {
                 let mut o = outs.remove(&tid).filter(|o| o.gen == gen).unwrap_or_else(|| fresh(gen));
                 let streamed = !o.buf.trim().is_empty() || !o.said.is_empty();
+                // claude's answer to a bare /model ("Usage: /model <name>. Available: …"): buttons to pick one
+                let model_choice = answer.as_deref().and_then(text::claude_model_usage);
                 settle(&mut o);
                 // the final text came only as a whole (no deltas): send it
                 if !streamed { if let Some(a) = answer.filter(|t| !t.trim().is_empty()) { o.said.push(a.trim().to_string()); } }
@@ -561,6 +563,16 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                 // handed over before the turn is marked over, so the topic counts as running until they are sent
                 { let (own, sessions, t) = (own.clone(), sessions.clone(), tid.clone());
                   lanes.push(&tid, move || for m in &msgs { if deliver(&own, &sessions, &t, m).is_none() { store::log(&format!("answer for {t} could not be delivered")); } }); }
+                if let Some(listed) = model_choice {
+                    let (own, sessions, t) = (own.clone(), sessions.clone(), tid.clone());
+                    lanes.push(&tid, move || {
+                        // claude's own list from its initialize answer (with names); else the one in its reply
+                        let ctl = sessions.lock().unwrap().get(&t).and_then(|s| s.agent.as_ref().filter(|a| a.kind == Kind::Claude).map(|a| a.ctl()));
+                        let mut items: Vec<(String, String)> = ctl.and_then(|c| c.models().ok()).unwrap_or_default().into_iter().map(|m| (m.label, m.value)).collect();
+                        if items.is_empty() { items = listed.into_iter().map(|n| (n.clone(), n)).collect(); }
+                        if !items.is_empty() { send_with(&own, &sessions, &t, &text::sys(text::CHOOSE_MODEL), Some(choice_buttons(&t, "model", items, 2))); }
+                    });
+                }
                 // the bookkeeping is done now, not after the sends: a message the user sends meanwhile starts a new
                 // turn, which must not be marked over by this one
                 let who = {
@@ -1163,6 +1175,8 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             // the agent's own command (claude's; pi's extensions, templates, skills), under the agent's own name.
             // claude's effort is remembered so a restarted process keeps it
             if cur_kind == Some(Kind::Claude) && orig == "effort" && agents::CLAUDE_EFFORTS.contains(&arg.as_str()) { store::note_set(chat, "effort", json!(arg)); }
+            // a button whose value was too long to fit says "/model 3": the value is looked up
+            let arg = chosen(chat, orig, &arg).unwrap_or(arg.clone());
             say = Some(format!("/{orig}{}{arg}", if arg.is_empty() { "" } else { " " }));
         } else {
             say = Some(msg.to_string());
@@ -1386,6 +1400,12 @@ mod tests {
 
 #[cfg(test)]
 mod text_tests {
+    #[test]
+    fn claude_model_answer() {
+        let a = "Current model: `Opus 5.5`\nUsage: /model <name>. Available: sonnet, opus, haiku, fable, best, sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.";
+        assert_eq!(crate::text::claude_model_usage(a).unwrap(), vec!["sonnet", "opus", "haiku", "fable", "best", "sonnet[1m]", "opus[1m]", "fable[1m]", "opusplan", "default"]);
+        assert_eq!(crate::text::claude_model_usage("Set model to opus"), None);
+    }
     #[test]
     fn status() {
         assert_eq!(crate::text::window(Some(300)), "5 小时");

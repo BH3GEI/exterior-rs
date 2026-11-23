@@ -220,6 +220,16 @@ pub const DONE_EMPTY: &str = "本回合已完成，没有文字输出。";
 pub const NOTHING_RUNNING: &str = "当前没有正在执行的任务。";
 pub const CHOOSE_MODEL: &str = "请选择模型：";
 pub const NO_MODELS: &str = "该 agent 没有可选的模型。";
+
+/// claude's answer to a bare /model: "Current model: … Usage: /model <name>. Available: sonnet, opus, …, or a full
+/// model ID." → the names it lists (Some even when none can be read: it is that answer).
+pub fn claude_model_usage(answer: &str) -> Option<Vec<String>> {
+    if !answer.contains("/model <name>") { return None; }
+    let list = answer.split_once("Available:").map(|x| x.1).unwrap_or("");
+    let list = list.lines().next().unwrap_or("").trim().trim_end_matches('.');
+    Some(list.split(',').map(|n| n.trim().trim_start_matches("or ").trim().to_string())
+        .filter(|n| !n.is_empty() && !n.contains(' ')).collect())
+}
 pub const CHOOSE_THINKING: &str = "请选择思考强度：";
 pub const RESTART_CUT: &str = "exterior 重启时本回合尚未完成，请重新发送该消息。";
 pub const RESTART_RESEND: &str = "exterior 重启打断了本回合，已自动重新发送上一条消息。";
