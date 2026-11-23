@@ -324,7 +324,8 @@ fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
 
 pub fn relay(from: &str, to: &str, body: &str) -> Result<String, String> {
     let sessions = LIVE.lock().unwrap().clone().ok_or(text::NOT_READY)?;
-    let to = to.trim();
+    let to = alias(to.trim());
+    let to = to.as_str();
     // a topic opened a moment ago (an agent handing off a task) is not in the list until the next refresh: do it now
     if !sessions.lock().unwrap().values().any(|t| !t.deleted && (t.name == to || t.tid == to)) { refresh(&sessions); }
     let (name, dev, dir, target, names) = {
@@ -484,15 +485,19 @@ pub fn build_menu() -> Result<usize, String> {
     let mut map = serde_json::Map::new();
     let mut desc: HashMap<String, String> = HashMap::new();
     let root = crate::prompt::root(&dev);
+    // agy's command-line commands (/usage…): not ACP commands, each is run on its own (agents::agy_cli)
+    let mut agy_cli: Vec<String> = vec![];
     for kind in Kind::ALL {
         let Some(row) = dev["agents"].as_array().into_iter().flatten().find(|a| a["kind"] == kind.name()) else { continue };
-        let table = agents::BUILTINS.iter().filter(|(k, _)| *k == kind).map(|(_, n)| (n.to_string(), text::builtin_desc(n)));
-        let own = agents::commands(&dev, &root, row["command"].as_str().unwrap_or(""), kind);
-        for (orig, d) in table.chain(own) {
+        let cmd = row["command"].as_str().unwrap_or("");
+        let table = agents::BUILTINS.iter().filter(|(k, _)| *k == kind).map(|(_, n)| (n.to_string(), text::builtin_desc(n), false));
+        let own = agents::commands(&dev, &root, cmd, kind).into_iter().map(|(n, d)| (n, d, false));
+        let cli = if kind == Kind::Agy { agents::agy_cli_commands(&dev, &root, cmd) } else { vec![] }.into_iter().map(|(n, d)| (n, d, true));
+        for (orig, d, is_cli) in table.chain(own).chain(cli) {
             let tg = menu_name(&orig);
             if tg.is_empty() || tg.starts_with(OWN) { continue; }
             let e = map.entry(tg.clone()).or_insert_with(|| { order.push(tg.clone()); json!({}) });
-            if e[kind.name()].is_null() { e[kind.name()] = json!(orig); }
+            if e[kind.name()].is_null() { e[kind.name()] = json!(orig); if is_cli { agy_cli.push(tg.clone()); } }
             let d = d.trim().replace('\n', " ");
             if !d.is_empty() { desc.entry(tg).or_insert(d); }
         }
@@ -509,6 +514,7 @@ pub fn build_menu() -> Result<usize, String> {
     let n = cmds.len();
     brief::post("/api/bots/commands", json!({"commands": cmds})).map_err(|(c, v)| format!("{c} {v}"))?;
     store::set_state("menu", Value::Object(map));
+    store::set_state("agy_cli", json!(agy_cli));
     store::set_state("menu_time", json!(store::now()));
     Ok(n)
 }
@@ -885,6 +891,14 @@ fn switch_account(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, d
 /// passes it on.
 const SCHEDULE_LATE: i64 = 120;
 
+/// A topic's old name, kept as an alias after it was renamed (topic_aliases "old=new；old2=new2"), as its new name.
+fn alias(name: &str) -> String { alias_in(&params::get("topic_aliases"), name) }
+
+fn alias_in(spec: &str, name: &str) -> String {
+    spec.split(['；', ';', '\n']).filter_map(|p| p.split_once('=')).find(|(old, _)| old.trim() == name.trim())
+        .map(|(_, new)| new.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| name.trim().to_string())
+}
+
 fn schedules(spec: &str) -> Vec<(i64, String, String)> {
     spec.split("||").filter_map(|e| {
         let mut f = e.trim().splitn(3, '|');
@@ -912,6 +926,7 @@ fn scheduled(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
     for (key, topic, content) in due(&list, local % 86400 / 60, local / 86400, &fired) {
         fired[&key] = json!(local / 86400);
         store::set_state("schedules", fired.clone());
+        let topic = alias(&topic);
         let tid = sessions.lock().unwrap().values().find(|s| !s.deleted && s.name == topic).map(|s| s.tid.clone());
         let Some(tid) = tid else { store::log(&format!("schedule: no topic named {topic}")); continue };
         store::log(&format!("schedule -> {topic}: {}", content.chars().take(60).collect::<String>()));
@@ -1052,6 +1067,9 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             _ => None,
         };
         let builtin = match (&agent_cmd, cur_kind) { (Some(o), Some(k)) => agents::builtin(k, o).map(|n| (k, n)), _ => None };
+        // one of agy's command-line commands: run on its own, its output goes to the topic as it is
+        let agy_cli = cur_kind == Some(Kind::Agy) && agent_cmd.is_some()
+            && head.strip_prefix('/').is_some_and(|h| store::state("agy_cli").as_array().is_some_and(|l| l.iter().any(|x| x == h)));
         if own_cmd == Some("exit") {
             if let Some(a) = s.agent.as_mut() { a.stop(); a.kill(); }
             s.agent = None; s.gen += 1; s.pending = false;
@@ -1128,6 +1146,19 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             }
         } else if let Some(c) = own_cmd {
             reply = Some(text::no_such_command(&format!("{OWN}{c}")));
+        } else if agy_cli && builtin.is_none() {
+            let row = dev.as_ref().and_then(|d| store::agent(d, n["resolved"].as_str().unwrap_or(&cur)));
+            let command = row.map(|r| r["command"].as_str().unwrap_or("").to_string()).unwrap_or_default();
+            let (own, sessions, chat, d, dir, orig, arg) = (own.clone(), sessions.clone(), chat.to_string(), dev.clone(), s.dir.clone(), agent_cmd.clone().unwrap_or_default(), arg.clone());
+            std::thread::spawn(move || {
+                let r = d.ok_or_else(|| text::NO_DEVICE.to_string()).and_then(|d| agents::agy_cli(&d, &dir, &command, &orig, &arg));
+                let t = match r {
+                    Ok(o) if o.trim().is_empty() => text::sys(&text::no_output(Kind::Agy.label(), &orig)),
+                    Ok(o) => format!("```\n{}\n```", o.trim()),
+                    Err(e) => text::sys_warn(&e),
+                };
+                send(&own, &sessions, &chat, &t);
+            });
         } else if let Some(orig) = &agent_cmd {
             // the agent's own command (claude's; pi's extensions, templates, skills), under the agent's own name.
             // claude's effort is remembered so a restarted process keeps it
@@ -1304,6 +1335,15 @@ mod tests {
         assert!(!due_compact(&json!({"turn_end": 5000, "context": 150000, "status": "idle", "idle_compacted": 1000, "idle_compact_wait": true}), 99999, true, 50, 100000));
     }
 
+    #[test]
+    fn aliases() {
+        let a = "全局=Polaris；全局二号=Comes; x = y";
+        assert_eq!(alias_in(a, "全局"), "Polaris");
+        assert_eq!(alias_in(a, "全局二号"), "Comes");
+        assert_eq!(alias_in(a, " x "), "y");
+        assert_eq!(alias_in(a, "Polaris"), "Polaris");
+        assert_eq!(alias_in("", "全局"), "全局");
+    }
     #[test]
     fn schedule_times() {
         let l = schedules(" 07:30|dream|整理 inbox || bad || 25:00|x|y || 8:05|全局|a|b ");

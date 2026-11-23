@@ -65,11 +65,11 @@ pub fn from_codex(last: &Value, model: &str) -> Option<Use> {
     (one.tokens() > 0).then_some(one)
 }
 
-/// One agy step's usage (input_tokens leaves out the cached part; thinking counts as output).
-pub fn from_agy(u: &Value, model: &str) -> Option<Use> {
+/// What one agy turn used (ACP session/prompt result; inputTokens leaves out the cached part, thinking counts as output).
+pub fn from_agy_acp(u: &Value, model: &str) -> Option<Use> {
     let g = |k: &str| u[k].as_u64().unwrap_or(0);
-    let one = Use { model: if model.is_empty() { "agy".into() } else { model.into() }, input: g("input_tokens"),
-                    output: g("output_tokens") + g("thinking_tokens"), cache_read: g("cache_read_tokens"), cache_write: 0, usd: None };
+    let one = Use { model: if model.is_empty() { "agy".into() } else { model.into() }, input: g("inputTokens"),
+                    output: g("outputTokens") + g("thoughtTokens"), cache_read: g("cachedReadTokens"), cache_write: g("cachedWriteTokens"), usd: None };
     (one.tokens() > 0).then_some(one)
 }
 
@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(w[0].used, Some(0.25));
         assert_eq!(w[0].resets, Some(1796025177));
         assert_eq!(w[1].status, "rejected");
-        let u = from_agy(&serde_json::json!({"input_tokens": 2238, "output_tokens": 10, "thinking_tokens": 8, "cache_read_tokens": 6598}), "").unwrap();
+        let u = from_agy_acp(&serde_json::json!({"inputTokens": 2238, "outputTokens": 10, "thoughtTokens": 8, "cachedReadTokens": 6598, "cachedWriteTokens": 0}), "").unwrap();
         assert_eq!((u.model.as_str(), u.input, u.output, u.cache_read), ("agy", 2238, 18, 6598));
     }
 

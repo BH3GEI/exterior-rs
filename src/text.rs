@@ -362,6 +362,12 @@ pub fn device_missing(d: &str) -> String { format!("设备「{d}」不存在") }
 pub fn agent_missing(d: &str, a: &str) -> String { format!("设备「{d}」上没有名为「{a}」的 agent") }
 pub fn no_response(secs: u64) -> String { format!("agent 在 {secs} 秒内没有响应") }
 pub fn codex_start_failed(e: &str) -> String { format!("codex 启动失败：{e}") }
+pub fn agy_start_failed(e: &str) -> String { format!("agy 启动失败：{e}") }
+pub fn agy_resume_failed(id: &str, e: &str) -> String { format!("agy 无法续接对话 {id}（{e}），已开新对话") }
+pub fn agy_model_set(v: &str) -> String { format!("已切换到 {v}，本话题之后都用它") }
+pub fn agy_stopped_by(why: &str) -> String { format!("agy 结束了这一轮：{why}") }
+pub const AGY_NO_SESSION: &str = "agy 未返回会话编号";
+pub const AGY_NOT_READY: &str = "agy 尚未就绪";
 pub fn model_unknown(agent: &str, v: &str) -> String { format!("{agent} 的模型列表中没有「{v}」") }
 /// Whose request failed, for retry notices.
 pub enum Source { Model, Api, Codex, Compaction }

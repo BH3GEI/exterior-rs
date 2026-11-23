@@ -6,6 +6,7 @@ pub struct Param { pub key: &'static str, pub label: &'static str, pub default: 
 pub const PARAMS: &[Param] = &[
     Param { key: "user_name", label: "用户称呼（启动说明和文件提示中使用）", default: "Yao" },
     Param { key: "global_topic", label: "全局话题的名称", default: "全局" },
+    Param { key: "topic_aliases", label: "话题别名：改名后旧名仍可用（exterior send、定时消息），格式「旧名=新名」，多条用；隔开", default: "" },
     Param { key: "global_dir", label: "全局话题的文件夹名", default: "overview" },
     Param { key: "knowledge_dir", label: "knowledge 文件夹名（设备未单独指定时使用）", default: "knowledge" },
     Param { key: "session_prompt", label: "启动说明文件（相对 knowledge）", default: "exterior-session.md" },

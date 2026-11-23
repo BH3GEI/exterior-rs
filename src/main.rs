@@ -65,5 +65,22 @@ fn probe(a: &[String]) {
             }
         }
     }
+    if kind == agents::Kind::Agy {
+        let dev = serde_json::json!({"name": "local", "host": "local", "root": a[2]});
+        let acp = agents::commands(&dev, &a[2], &a[1], kind);
+        let cli = agents::agy_cli_commands(&dev, &a[2], &a[1]);
+        println!("acp commands: {}", acp.iter().map(|c| c.0.as_str()).collect::<Vec<_>>().join(" "));
+        println!("cli commands: {}", cli.iter().map(|c| c.0.as_str()).collect::<Vec<_>>().join(" "));
+        // a long turn, stopped as soon as it starts answering
+        ag.say("Write a 600-word essay about rivers.").expect("say");
+        for ev in rx.iter() {
+            match ev {
+                agents::Ev::Text { .. } => { println!("text came: stopping"); ag.stop(); }
+                agents::Ev::Done { stopped, error, .. } => { println!("done: stopped={stopped} error={error:?}"); break; }
+                agents::Ev::Exited { why, .. } => { println!("exited: {why}"); break; }
+                _ => {}
+            }
+        }
+    }
     ag.kill();
 }

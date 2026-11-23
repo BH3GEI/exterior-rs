@@ -32,6 +32,7 @@ pub const BUILTINS: &[(Kind, &str)] = &[
     (Kind::Codex, "fork"), (Kind::Codex, "archive"), (Kind::Codex, "goal"), (Kind::Codex, "mcp"), (Kind::Codex, "apps"),
     (Kind::Codex, "plugins"), (Kind::Codex, "skills"), (Kind::Codex, "hooks"), (Kind::Codex, "copy"), (Kind::Codex, "logout"),
     (Kind::Codex, "quit"), (Kind::Codex, "exit"),
+    (Kind::Agy, "model"), (Kind::Agy, "resume"),
 ];
 
 /// Built-ins that end the agent's process (the session is kept, so the next message resumes it).
@@ -109,8 +110,6 @@ pub struct Agent {
     thread: Arc<Mutex<Option<String>>>,
     turn: Arc<Mutex<Option<String>>>,
     model: Arc<Mutex<Option<String>>>,
-    /// agy: what exterior tells it, put in front of the first message of a new conversation (agy has no flag for it)
-    first: Arc<Mutex<Option<String>>>,
 }
 
 fn env(spec: &Spec) -> Vec<(&'static str, String)> {
@@ -181,6 +180,7 @@ pub struct Ctl {
     model: Arc<Mutex<Option<String>>>,
     dir: String,
     prompt: String,
+    tid: String,
 }
 
 impl Agent {
@@ -188,7 +188,7 @@ impl Agent {
         let mut a = Agent { kind: spec.kind, stdin: Arc::new(Mutex::new(None)), child: Arc::new(Mutex::new(None)), spec, tx,
                             busy: Arc::new(Mutex::new(false)), interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)), queue: Arc::new(Mutex::new(vec![])), pending: Arc::new(Mutex::new(HashMap::new())),
                             next: Arc::new(std::sync::atomic::AtomicU64::new(0)), info: Arc::new(Mutex::new(Value::Null)), thread: Arc::new(Mutex::new(None)),
-                            turn: Arc::new(Mutex::new(None)), model: Arc::new(Mutex::new(None)), first: Arc::new(Mutex::new(None)) };
+                            turn: Arc::new(Mutex::new(None)), model: Arc::new(Mutex::new(None)) };
         match a.kind {
             Kind::Claude => a.start_claude()?,
             Kind::Pi => a.start_pi()?,
@@ -211,7 +211,7 @@ impl Agent {
 
     pub fn ctl(&self) -> Ctl {
         Ctl { kind: self.kind, stdin: self.stdin.clone(), pending: self.pending.clone(), next: self.next.clone(), info: self.info.clone(),
-              thread: self.thread.clone(), model: self.model.clone(), dir: self.spec.dir.clone(), prompt: self.spec.prompt.clone() }
+              thread: self.thread.clone(), model: self.model.clone(), dir: self.spec.dir.clone(), prompt: self.spec.prompt.clone(), tid: self.spec.tid.clone() }
     }
 
 
@@ -419,22 +419,57 @@ impl Agent {
         Ok(())
     }
 
-    /// agy (Antigravity CLI): one process per session, prompts as stream-json lines on stdin, one result per prompt.
+    /// agy (Antigravity CLI): one `agy acp` (Agent Client Protocol) per session, kept running; each message is a
+    /// session/prompt on the same session. Like codex: the handshake runs in the background, messages wait in the queue.
     fn start_agy(&mut self) -> Result<(), String> {
-        let mut args: Vec<String> = ["--input-format", "stream-json", "--output-format", "stream-json"].map(String::from).to_vec();
+        let mut args = vec!["acp".to_string()];
         args.extend(params::args("agy_args"));
-        match &self.spec.resume {
-            Some(id) => { args.push("--conversation".into()); args.push(id.clone()); }
-            None => if !self.spec.prompt.is_empty() { *self.first.lock().unwrap() = Some(self.spec.prompt.clone()); },
-        }
         let (out, last) = self.spawn(args)?;
-        let (tx, tid, gen, child, busy) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone());
-        let (stdin, queue, first, spec) = (self.stdin.clone(), self.queue.clone(), self.first.clone(), self.spec.clone());
+        let (tx, tid, gen, child, busy, pending) = (self.tx.clone(), self.spec.tid.clone(), self.spec.gen, self.child.clone(), self.busy.clone(), self.pending.clone());
+        let (stdin, queue, thread, model, info, spec) = (self.stdin.clone(), self.queue.clone(), self.thread.clone(), self.model.clone(), self.info.clone(), self.spec.clone());
         std::thread::spawn(move || {
-            read_agy(out, spec, tx.clone(), tid.clone(), gen, busy, stdin, queue, first);
+            read_agy(out, &spec, &tx, gen, &busy, &pending, &stdin, &queue, &thread, &model, &info);
             if let Some(mut c) = child.lock().unwrap().take() { let _ = c.wait(); }
             let why = last.lock().unwrap().clone();
             let _ = tx.send(Ev::Exited { tid, gen, why });
+        });
+        let (c, tx, spec, thread, queue, busy, model, stdin, info) = (self.ctl(), self.tx.clone(), self.spec.clone(), self.thread.clone(), self.queue.clone(), self.busy.clone(), self.model.clone(), self.stdin.clone(), self.info.clone());
+        std::thread::spawn(move || {
+            let r = (|| -> Result<String, String> {
+                c.ask(|id| rpc(id, "initialize", json!({"protocolVersion": 1, "clientCapabilities": {}})))?;
+                let mut r = Value::Null;
+                if let Some(id) = &spec.resume {
+                    r = c.ask(|i| rpc(i, "session/resume", agy_session(&spec.dir, &spec.prompt, Some(id))))?;
+                    if let Some(e) = r["error"]["message"].as_str() { let _ = tx.send(Ev::Note { tid: spec.tid.clone(), gen: spec.gen, text: text::agy_resume_failed(id, e) }); }
+                }
+                if r.is_null() || r["error"].is_object() { r = c.ask(|i| rpc(i, "session/new", agy_session(&spec.dir, &spec.prompt, None)))?; }
+                if let Some(e) = r["error"]["message"].as_str() { return Err(e.to_string()); }
+                let res = &r["result"];
+                let sid = res["sessionId"].as_str().map(String::from).or(spec.resume.clone()).ok_or(text::AGY_NO_SESSION)?;
+                agy_keep(&info, &model, res);
+                // the model picked with /model in this topic outlives the process
+                let want = crate::store::note(&spec.tid)["model"].as_str().map(String::from);
+                if let Some(m) = want.filter(|m| model.lock().unwrap().as_deref() != Some(m.as_str())) {
+                    let r = c.ask(|i| rpc(i, "session/set_model", json!({"sessionId": sid, "modelId": m})))?;
+                    if r["error"].is_null() { *model.lock().unwrap() = Some(m); }
+                }
+                Ok(sid)
+            })();
+            match r {
+                Ok(t) => {
+                    let mut q = queue.lock().unwrap();
+                    *thread.lock().unwrap() = Some(t.clone());
+                    let _ = tx.send(Ev::Session { tid: spec.tid.clone(), gen: spec.gen, id: t.clone() });
+                    let next = if q.is_empty() { None } else { Some(q.remove(0)) };
+                    drop(q);
+                    match next { Some(m) => { let _ = put(&stdin, &agy_turn(&t, &m)); } None => *busy.lock().unwrap() = false }
+                }
+                Err(e) => {
+                    queue.lock().unwrap().clear();
+                    *busy.lock().unwrap() = false;
+                    let _ = tx.send(Ev::Done { tid: spec.tid.clone(), gen: spec.gen, text: None, stopped: false, error: Some(text::agy_start_failed(&e)) });
+                }
+            }
         });
         Ok(())
     }
@@ -459,11 +494,13 @@ impl Agent {
                 put(&self.stdin, &codex_turn(&th, text, self.model.lock().unwrap().clone()))
             }
             Kind::Agy => {
-                // agy takes the next prompt only after the last one's result: wait in the queue until then
-                let mut q = self.queue.lock().unwrap();
-                if was_busy { q.push(text.to_string()); return Ok(()); }
-                drop(q);
-                put(&self.stdin, &agy_prompt(&self.first, text))
+                // one prompt at a time, and only once the session is there: otherwise it waits in the queue
+                let th = {
+                    let mut q = self.queue.lock().unwrap();
+                    let th = self.thread.lock().unwrap().clone();
+                    match th.filter(|_| !was_busy) { Some(th) => th, None => { q.push(text.to_string()); return Ok(()); } }
+                };
+                put(&self.stdin, &agy_turn(&th, text))
             }
         }
     }
@@ -482,12 +519,9 @@ impl Agent {
                 if let (Some(th), Some(tu)) = (th, tu) { let _ = put(&self.stdin, &json!({"jsonrpc": "2.0", "id": "stop", "method": "turn/interrupt", "params": {"threadId": th, "turnId": tu}})); }
             }
             Kind::Agy => {
-                // agy has no way to stop a turn but ending the process; the conversation is kept, the next message resumes it
                 self.queue.lock().unwrap().clear();
-                if std::mem::replace(&mut *self.busy.lock().unwrap(), false) {
-                    let _ = self.tx.send(Ev::Done { tid: self.spec.tid.clone(), gen: self.spec.gen, text: None, stopped: true, error: None });
-                }
-                self.kill();
+                let th = self.thread.lock().unwrap().clone();
+                if let Some(th) = th { let _ = put(&self.stdin, &json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": th}})); }
             }
         }
     }
@@ -500,9 +534,9 @@ impl Agent {
 }
 
 impl Ctl {
-    /// codex: wait until the background handshake is done.
+    /// codex, agy: wait until the background handshake is done.
     fn ready(&self) -> Result<(), String> {
-        if self.kind != Kind::Codex { return Ok(()); }
+        if !matches!(self.kind, Kind::Codex | Kind::Agy) { return Ok(()); }
         let until = std::time::Instant::now() + params::secs("codex_ready_s");
         while std::time::Instant::now() < until {
             if self.thread.lock().unwrap().is_some() { return Ok(()); }
@@ -547,7 +581,13 @@ impl Ctl {
                     Some(Choice { value: v.into(), label: m["displayName"].as_str().unwrap_or(v).into(), provider: None, id: v.into() })
                 }).collect())
             }
-            Kind::Agy => Err(text::NOT_SUPPORTED.into()),
+            Kind::Agy => {
+                let info = self.info.lock().unwrap().clone();
+                Ok(info["models"]["availableModels"].as_array().into_iter().flatten().filter_map(|m| {
+                    let v = m["modelId"].as_str()?;
+                    Some(Choice { value: v.into(), label: m["name"].as_str().unwrap_or(v).into(), provider: None, id: v.into() })
+                }).collect())
+            }
         }
     }
 
@@ -565,7 +605,14 @@ impl Ctl {
                 self.ask(|id| json!({"type": "set_model", "id": id, "provider": p, "modelId": m}))?
             }
             Kind::Codex => { *self.model.lock().unwrap() = Some(value.to_string()); return Ok(Value::Null); }
-            Kind::Agy => return Err(text::NOT_SUPPORTED.into()),
+            Kind::Agy => {
+                let th = self.thread.lock().unwrap().clone().ok_or(text::AGY_NOT_READY)?;
+                let r = self.ask(|id| rpc(id, "session/set_model", json!({"sessionId": th, "modelId": value})))?;
+                if let Some(e) = r["error"]["message"].as_str() { return Err(e.to_string()); }
+                *self.model.lock().unwrap() = Some(value.to_string());
+                crate::store::note_set(&self.tid, "model", json!(value));
+                return Ok(json!(text::agy_model_set(value)));
+            }
         };
         if r["success"] == false { return Err(r["error"].as_str().unwrap_or(text::SET_MODEL_FAILED).to_string()); }
         Ok(r["data"].clone())
@@ -633,6 +680,25 @@ impl Ctl {
             (Kind::Codex, "skills") => codex("skills/list", json!({"cwds": [self.dir]}))?,
             (Kind::Codex, "hooks") => codex("hooks/list", json!({"cwds": [self.dir]}))?,
             (Kind::Codex, "logout") => codex("account/logout", json!({}))?,
+            (Kind::Agy, "resume") if arg.is_empty() => {
+                let r = self.ask(|id| rpc(id, "session/list", json!({"cwd": self.dir})))?;
+                // in the shape the resume buttons read (codex's thread/list)
+                let items: Vec<Value> = r["result"]["sessions"].as_array().into_iter().flatten().take(10)
+                    .map(|t| json!({"id": t["sessionId"], "name": t["title"]})).collect();
+                json!({"result": {"data": items}})
+            }
+            (Kind::Agy, "resume") => {
+                let r = self.ask(|id| rpc(id, "session/resume", agy_session(&self.dir, &self.prompt, Some(arg))))?;
+                if r["error"].is_null() {
+                    *self.thread.lock().unwrap() = Some(arg.to_string());
+                    agy_keep(&self.info, &self.model, &r["result"]);
+                    if let Some(m) = crate::store::note(&self.tid)["model"].as_str() {
+                        let m = m.to_string();
+                        if self.ask(|id| rpc(id, "session/set_model", json!({"sessionId": arg, "modelId": m})))?["error"].is_null() { *self.model.lock().unwrap() = Some(m); }
+                    }
+                    json!({"result": {"_session": arg, "resumed": arg}})
+                } else { r }
+            }
             (Kind::Pi, "name") => self.ask(|id| json!({"type": "set_session_name", "id": id, "name": arg}))?,
             (Kind::Pi, "session") => self.ask(|id| json!({"type": "get_session_stats", "id": id}))?,
             (Kind::Pi, "export") if arg.is_empty() => self.ask(|id| json!({"type": "export_html", "id": id}))?,
@@ -662,7 +728,7 @@ impl Ctl {
         if r["success"] == false || !r["error"].is_null() || r["subtype"] == "error" {
             return Err(r["error"]["message"].as_str().or(r["error"].as_str()).unwrap_or(text::BUILTIN_FAILED).to_string());
         }
-        let mut data = match self.kind { Kind::Codex => r["result"].clone(), Kind::Claude => r["response"].clone(), Kind::Pi | Kind::Agy => r["data"].clone() };
+        let mut data = match self.kind { Kind::Codex => r["result"].clone(), Kind::Claude => r["response"].clone(), Kind::Pi => r["data"].clone(), Kind::Agy => r["result"].clone() };
         if self.kind == Kind::Codex && matches!(name, "new" | "clear" | "resume" | "fork" | "archive") {
             if let Some(t) = data["thread"]["id"].as_str() { *self.thread.lock().unwrap() = Some(t.to_string()); data["_session"] = json!(t); }
         }
@@ -817,12 +883,6 @@ fn read_claude(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, b
     }
 }
 
-/// One prompt line for agy; the first of a new conversation carries exterior's instructions.
-fn agy_prompt(first: &Arc<Mutex<Option<String>>>, text: &str) -> Value {
-    let t = match first.lock().unwrap().take() { Some(p) => format!("{p}\n\n---\n\n{text}"), None => text.to_string() };
-    json!({"event": "user", "message": {"content": t}})
-}
-
 /// agy reports no quota while it works: after a turn, ask `agy -p /usage` in the background, at most every agy_quota_min
 /// minutes per command (one command is one Google account).
 fn agy_quota(spec: &Spec, tx: &Sender<Ev>) {
@@ -847,84 +907,122 @@ fn agy_quota(spec: &Spec, tx: &Sender<Ev>) {
     });
 }
 
-/// agy's output (stream-json: init, step_update, result), one JSON line after another, as events.
+/// A JSON-RPC request.
+fn rpc(id: &str, method: &str, params: Value) -> Value { json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}) }
+
+/// The parameters of agy's session/new and session/resume: where it works, and exterior's instructions appended to
+/// its system prompt (agy's own extension, advertised as _meta.antigravity.systemPrompt.append).
+fn agy_session(dir: &str, prompt: &str, id: Option<&str>) -> Value {
+    let mut p = json!({"cwd": dir, "mcpServers": []});
+    if !prompt.is_empty() { p["_meta"] = json!({"antigravity": {"systemPrompt": {"append": prompt}}}); }
+    if let Some(id) = id { p["sessionId"] = json!(id); }
+    p
+}
+
+/// One message as an ACP prompt. Its answer (the turn's end) comes back under the id "turn".
+fn agy_turn(session: &str, text: &str) -> Value { rpc("turn", "session/prompt", json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]})) }
+
+/// Keep what session/new or session/resume said: the models offered and the one in use.
+fn agy_keep(info: &Arc<Mutex<Value>>, model: &Arc<Mutex<Option<String>>>, res: &Value) {
+    let mut i = info.lock().unwrap();
+    if !i.is_object() { *i = json!({}); }
+    if res["models"].is_object() { i["models"] = res["models"].clone(); }
+    if let Some(m) = res["models"]["currentModelId"].as_str() { *model.lock().unwrap() = Some(m.to_string()); }
+}
+
+/// agy's output (ACP: answers to our requests, its own requests, session/update notifications) as events.
 #[allow(clippy::too_many_arguments)]
-fn read_agy(out: impl std::io::Read, spec: Spec, tx: Sender<Ev>, tid: String, gen: u64, busy: Arc<Mutex<bool>>, stdin: Arc<Mutex<Option<ChildStdin>>>,
-            queue: Arc<Mutex<Vec<String>>>, first: Arc<Mutex<Option<String>>>) {
-    let mut known = String::new();
-    let mut model = String::new();
-    // what this turn used, from each step's own usage (result.usage adds up over the whole conversation)
-    let mut uses: Vec<crate::usage::Use> = vec![];
-    // steps already shown (by index): agy may send a step again
-    let mut shown: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    let mut streamed: HashMap<i64, usize> = HashMap::new();
+fn read_agy(out: impl std::io::Read, spec: &Spec, tx: &Sender<Ev>, gen: u64, busy: &Arc<Mutex<bool>>, pending: &Pending, stdin: &Arc<Mutex<Option<ChildStdin>>>,
+            queue: &Arc<Mutex<Vec<String>>>, thread: &Arc<Mutex<Option<String>>>, model: &Arc<Mutex<Option<String>>>, info: &Arc<Mutex<Value>>) {
+    let tid = spec.tid.clone();
+    let (mut reply, mut thought) = (String::new(), String::new());
+    // a tool call or a new message since the last words: the next words start a new paragraph
+    let mut gap = false;
+    let mut last_msg: Option<String> = None;
+    let mut tools: HashMap<String, Value> = HashMap::new();
+    let step = |title: String, body: String| { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title, body }); };
+    let flush = |thought: &mut String| { let t = std::mem::take(thought); if !t.trim().is_empty() { step(text::THINKING.into(), t.trim().to_string()); } };
     for line in BufReader::new(out).lines().map_while(Result::ok) {
         let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-        let step = |title: String, body: String| { let _ = tx.send(Ev::Step { tid: tid.clone(), gen, title, body }); };
-        // the conversation: from init and result (a step's may be a subagent's)
-        let cid = if v["event"] == "step_update" { None } else { v["conversation_id"].as_str().or(v["result"]["conversation_id"].as_str()) };
-        if let Some(s) = cid.filter(|s| !s.is_empty() && *s != known) { known = s.to_string(); let _ = tx.send(Ev::Session { tid: tid.clone(), gen, id: known.clone() }); }
-        match v["event"].as_str() {
-            Some("init") => {
-                if let Some(m) = v["init"]["model"].as_str() { model = m.to_string(); }
-                step(text::event_title("init"), pretty(&v["init"]));
+        if v.is_null() { if !line.trim().is_empty() { step(text::STDOUT.into(), line.clone()); } continue; }
+        let method = v["method"].as_str().unwrap_or("");
+        if method.is_empty() && v["id"] == "turn" {
+            // the turn is over
+            flush(&mut thought);
+            let r = &v["result"];
+            let m = model.lock().unwrap().clone().unwrap_or_default();
+            if let Some(u) = crate::usage::from_agy_acp(&r["usage"], &m) { let _ = tx.send(Ev::Usage { tid: tid.clone(), uses: vec![u] }); }
+            agy_quota(spec, tx);
+            let why = r["stopReason"].as_str().unwrap_or("");
+            let error = v["error"]["message"].as_str().map(String::from);
+            if !matches!(why, "" | "end_turn" | "cancelled") { let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::agy_stopped_by(why) }); }
+            step(text::event_title("session/prompt"), pretty(if r.is_null() { &v } else { r }));
+            let t = reply.trim().to_string();
+            let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: (!t.is_empty()).then_some(t), stopped: why == "cancelled", error });
+            reply.clear(); gap = false; last_msg = None;
+            let next = { let mut q = queue.lock().unwrap(); if q.is_empty() { None } else { Some(q.remove(0)) } };
+            match (next, thread.lock().unwrap().clone()) {
+                (Some(t), Some(th)) => { let _ = put(stdin, &agy_turn(&th, &t)); }
+                _ => { *busy.lock().unwrap() = false; }
             }
-            Some("step_update") => {
-                let u = &v["step_update"];
-                // a subagent's steps carry its own conversation: shown and counted, never taken as the answer
-                if u["conversation_id"].as_str().is_some_and(|c| !known.is_empty() && c != known) {
-                    if u["state"] == "DONE" {
-                        if let Some(x) = crate::usage::from_agy(&u["usage"], &model) { crate::usage::merge(&mut uses, x); }
-                        step(text::SUBAGENT.into(), pretty(u));
-                    }
-                    continue;
+            continue;
+        }
+        if method.is_empty() { route(pending, v["id"].as_str().map(String::from).or(v["id"].as_u64().map(|n| n.to_string())), &v); continue; }
+        if !v["id"].is_null() {
+            // agy asks: permissions are said yes to (as with codex; agy_args normally skips them anyway), the rest declined
+            let res = if method == "session/request_permission" {
+                let opts = v["params"]["options"].as_array().cloned().unwrap_or_default();
+                let pick = opts.iter().find(|o| o["kind"] == "allow_always").or(opts.iter().find(|o| o["kind"] == "allow_once")).or(opts.first());
+                match pick { Some(o) => json!({"jsonrpc": "2.0", "id": v["id"], "result": {"outcome": {"outcome": "selected", "optionId": o["optionId"]}}}),
+                             None => json!({"jsonrpc": "2.0", "id": v["id"], "result": {"outcome": {"outcome": "cancelled"}}}) }
+            } else {
+                let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::codex_request_declined(method) });
+                json!({"jsonrpc": "2.0", "id": v["id"], "error": {"code": -32601, "message": text::CODEX_UNHANDLED}})
+            };
+            let _ = put(stdin, &res);
+            continue;
+        }
+        if method != "session/update" { step(text::event_title(method), pretty(&v["params"])); continue; }
+        let u = &v["params"]["update"];
+        let kind = u["sessionUpdate"].as_str().unwrap_or("");
+        if kind != "agent_thought_chunk" { flush(&mut thought); }
+        match kind {
+            "agent_message_chunk" => {
+                let d = u["content"]["text"].as_str().unwrap_or("");
+                let mid = u["messageId"].as_str().map(String::from);
+                if mid.is_some() && mid != last_msg { if last_msg.is_some() { gap = true; } last_msg = mid; }
+                let d = if gap && !reply.is_empty() && !reply.ends_with("\n\n") { format!("\n\n{d}") } else { d.to_string() };
+                gap = false;
+                reply.push_str(&d);
+                let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: d });
+            }
+            "agent_thought_chunk" => thought.push_str(u["content"]["text"].as_str().unwrap_or("")),
+            "tool_call" | "tool_call_update" => {
+                gap = true;
+                let id = u["toolCallId"].as_str().unwrap_or("").to_string();
+                let t = tools.entry(id.clone()).or_insert_with(|| json!({}));
+                if let Some(o) = u.as_object() { for (k, x) in o { if !x.is_null() { t[k] = x.clone(); } } }
+                let st = t["status"].as_str().unwrap_or("").to_string();
+                if st == "completed" || st == "failed" {
+                    let t = tools.remove(&id).unwrap_or_default();
+                    let name = t["name"].as_str().or(t["title"].as_str()).unwrap_or("?").to_string();
+                    let input = if t["rawInput"].is_null() { t["args"].clone() } else { t["rawInput"].clone() };
+                    let out = t["rawOutput"]["output"].as_str().map(String::from).unwrap_or_else(|| {
+                        let parts: Vec<&str> = t["content"].as_array().into_iter().flatten().filter_map(|c| c["content"]["text"].as_str()).collect();
+                        if parts.is_empty() && !t["rawOutput"].is_null() { pretty(&t["rawOutput"]) } else { parts.join("\n") }
+                    });
+                    step(tool_title(&name, &input, st == "failed"), tool_body(&input, Some(out.trim())));
                 }
-                if u["state"] == "DONE" { if let Some(x) = crate::usage::from_agy(&u["usage"], &model) { crate::usage::merge(&mut uses, x); } }
-                let i = u["step_index"].as_i64().unwrap_or(-1);
-                match u["step_type"].as_str().unwrap_or("") {
-                    "agent_response" => {
-                        // the text so far, or a piece of it: only what was not shown yet goes out
-                        if let Some(d) = u["text_delta"].as_str() {
-                            let sent = streamed.entry(i).or_insert(0);
-                            let _ = tx.send(Ev::Text { tid: tid.clone(), gen, delta: if *sent == 0 && i > 0 { format!("\n\n{d}") } else { d.to_string() } });
-                            *sent += d.len();
-                        }
-                    }
-                    "user_input" | "checkpoint" => {}
-                    _ if u["state"] == "DONE" && shown.insert(i) => {
-                        let ti = &u["tool_info"];
-                        if ti.is_object() {
-                            let name = ti["name"].as_str().or(u["tool_name"].as_str()).unwrap_or("?");
-                            let failed = !ti["error"].is_null();
-                            let out = if failed { format!("{}\n{}", ti["output"].as_str().unwrap_or(""), ti["error"]["message"].as_str().unwrap_or("")) } else { ti["output"].as_str().unwrap_or("").to_string() };
-                            step(tool_title(name, &ti["parameters"], failed), tool_body(&ti["parameters"], Some(out.trim())));
-                        } else {
-                            step(text::event_title(&format!("step · {}", u["step_type"].as_str().unwrap_or("?"))), pretty(u));
-                        }
-                    }
-                    _ => {}
-                }
             }
-            Some("result") => {
-                let r = &v["result"];
-                if !uses.is_empty() { let _ = tx.send(Ev::Usage { tid: tid.clone(), uses: std::mem::take(&mut uses) }); }
-                agy_quota(&spec, &tx);
-                step(text::event_title("result"), pretty(r));
-                let st = r["status"].as_str().unwrap_or("");
-                let error = (st != "SUCCESS").then(|| {
-                    let e = &r["error"];
-                    e["message"].as_str().or(e.as_str()).map(String::from).unwrap_or_else(|| text::result_error(st))
-                });
-                let answer = r["response"].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && error.is_none());
-                let _ = tx.send(Ev::Done { tid: tid.clone(), gen, text: answer, stopped: st == "CANCELED" || st == "INTERRUPTED", error });
-                streamed.clear();
-                // the next waiting message, if any
-                let next = { let mut q = queue.lock().unwrap(); if q.is_empty() { None } else { Some(q.remove(0)) } };
-                match next { Some(t) => { let _ = put(&stdin, &agy_prompt(&first, &t)); } None => *busy.lock().unwrap() = false }
+            "usage_update" => if let Some(n) = u["used"].as_u64() { let _ = tx.send(Ev::Context { tid: tid.clone(), gen, tokens: n }); },
+            "available_commands_update" => {
+                let mut i = info.lock().unwrap();
+                if !i.is_object() { *i = json!({}); }
+                i["commands"] = u["availableCommands"].clone();
             }
-            Some(e) => step(text::event_title(e), pretty(&v)),
-            None if !line.trim().is_empty() => step(text::STDOUT.into(), line.clone()),
-            None => {}
+            // replayed history, the title agy gave the session, settings it repeats back: nothing new
+            "user_message_chunk" | "session_info_update" | "current_mode_update" | "config_option_update" => {}
+            k => step(text::event_title(&format!("update · {k}")), pretty(u)),
         }
     }
 }
@@ -1065,12 +1163,15 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
         Kind::Claude => ([["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"].map(String::from).to_vec(), params::args("claude_args")].concat(),
                          json!({"type": "control_request", "request_id": "init", "request": {"subtype": "initialize"}})),
         Kind::Pi => (vec!["--mode".into(), "rpc".into(), "--no-session".into()], json!({"type": "get_commands"})),
-        Kind::Codex | Kind::Agy => return vec![],
+        // agy lists its commands once a session is open (available_commands_update); nothing is sent to the model
+        Kind::Agy => ([vec!["acp".to_string()], params::args("agy_args")].concat(),
+                      json!([rpc("1", "initialize", json!({"protocolVersion": 1, "clientCapabilities": {}})), rpc("2", "session/new", agy_session(dir, "", None))])),
+        Kind::Codex => return vec![],
     };
     let Ok(mut child) = crate::host::agent(dev, dir, &env(&Spec { tid: String::new(), prompt: String::new(), topic: String::new(), dev: dev.clone(), dir: dir.into(), command: command.into(), kind, gen: 0, resume: None, effort: None }), command, &args)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return vec![] };
     let mut stdin = child.stdin.take().unwrap();
-    let _ = writeln!(stdin, "{ask}");
+    match ask.as_array() { Some(l) => for a in l { let _ = writeln!(stdin, "{a}"); }, None => { let _ = writeln!(stdin, "{ask}"); } }
     let _ = stdin.flush();
     // never wait forever: if the agent does not answer in time, close it
     let stdout = child.stdout.take().unwrap();
@@ -1082,6 +1183,7 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
         let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
         let list = if v["type"] == "control_response" { v["response"]["response"]["commands"].clone() }
                    else if v["command"] == "get_commands" { if v["data"]["commands"].is_array() { v["data"]["commands"].clone() } else { v["data"].clone() } }
+                   else if v["params"]["update"]["sessionUpdate"] == "available_commands_update" { v["params"]["update"]["availableCommands"].clone() }
                    else { continue };
         for c in list.as_array().into_iter().flatten() {
             if let Some(n) = c["name"].as_str() { out.push((n.to_string(), c["description"].as_str().unwrap_or("").to_string())); }
@@ -1091,6 +1193,28 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
     drop(stdin);
     crate::host::kill(&mut child.lock().unwrap());
     out
+}
+
+/// The commands agy's command line answers itself (/usage, /help…): `agy -p /help` lists them, name (alias) and
+/// description separated by a tab. Over ACP they are not commands; exterior runs each on its own (cli below).
+pub fn agy_cli_commands(dev: &Value, dir: &str, command: &str) -> Vec<(String, String)> {
+    let c = crate::host::agent(dev, dir, &[], command, &["-p".into(), "/help".into()]);
+    crate::host::exec(c, params::num("test_timeout_s")).map(|o| parse_agy_help(&o)).unwrap_or_default()
+}
+
+fn parse_agy_help(out: &str) -> Vec<(String, String)> {
+    out.lines().filter_map(|l| {
+        let (name, desc) = l.split_once('\t')?;
+        let name = name.trim().strip_prefix('/')?.split_whitespace().next()?;
+        Some((name.to_string(), desc.trim().to_string()))
+    }).collect()
+}
+
+/// One of agy's command-line commands, run on its own (`agy -p "/usage"`): what it printed, or why it failed.
+pub fn agy_cli(dev: &Value, dir: &str, command: &str, name: &str, arg: &str) -> Result<String, String> {
+    let line = if arg.is_empty() { format!("/{name}") } else { format!("/{name} {arg}") };
+    let c = crate::host::agent(dev, dir, &[], command, &["-p".into(), line]);
+    crate::host::exec(c, params::num("test_timeout_s"))
 }
 
 /// codex's error object: its message, with the extra details and the error kind when given.
@@ -1330,33 +1454,42 @@ mod read_tests {
         let input = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
         let spec = Spec { tid: "tgbot:1".into(), prompt: String::new(), topic: String::new(), dev: Value::Null, dir: String::new(), command: String::new(),
                           kind: Kind::Agy, gen: 1, resume: None, effort: None };
-        read_agy(std::io::Cursor::new(input.into_bytes()), spec, tx, "tgbot:1".into(), 1, Arc::default(), Arc::default(), Arc::default(), Arc::default());
+        let model = Arc::new(Mutex::new(Some("gemini-4-neon-high".to_string())));
+        read_agy(std::io::Cursor::new(input.into_bytes()), &spec, &tx, 1, &Arc::default(), &Arc::default(), &Arc::default(), &Arc::default(), &Arc::default(), &model, &Arc::default());
         rx.try_iter().collect()
     }
     #[test]
     fn agy_turn() {
-        // as agy 1.5.15 printed it (tool list cut short)
-        let c = "2f42";
+        // as agy 1.5.15 (ACP) sent it, shortened
+        let up = |u: Value| json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s", "update": u}});
         let evs = feed_agy(&[
-            json!({"event":"init","conversation_id":c,"init":{"cwd":"/tmp","tools":["run_command"]}}),
-            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":0,"state":"DONE","step_type":"user_input"}}),
-            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":1,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":8655,"output_tokens":83,"thinking_tokens":36,"cache_read_tokens":0}}}),
-            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"}}}}),
-            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"},"output":"hi\n"}}}),
-            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"ban"}}),
-            json!({"event":"step_update","step_update":{"conversation_id":c,"step_index":3,"state":"DONE","step_type":"agent_response","text_delta":"ana\n","usage":{"input_tokens":2238,"output_tokens":10,"thinking_tokens":8,"cache_read_tokens":6598}}}),
-            json!({"event":"result","result":{"conversation_id":c,"status":"SUCCESS","response":"banana\n","num_turns":1,"usage":{"input_tokens":10893}}}),
+            up(json!({"sessionUpdate": "usage_update", "used": 8780, "size": 1048576})),
+            up(json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "I should run "}})),
+            up(json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "it."}})),
+            up(json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "name": "run_command", "status": "in_progress", "kind": "execute", "title": "echo hi", "rawInput": {"CommandLine": "echo hi"}})),
+            up(json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed", "rawOutput": {"output": "Command output:\nhi_out\n", "exit_code": 0}})),
+            up(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "The output "}})),
+            up(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "is hi."}})),
+            json!({"jsonrpc": "2.0", "id": "turn", "result": {"stopReason": "end_turn", "usage": {"inputTokens": 10925, "outputTokens": 177, "cachedReadTokens": 6617, "cachedWriteTokens": 0, "thoughtTokens": 90}}}),
         ]);
         let text: String = evs.iter().filter_map(|e| match e { Ev::Text { delta, .. } => Some(delta.as_str()), _ => None }).collect();
-        assert_eq!(text.trim(), "banana");
-        assert!(matches!(&evs.iter().find(|e| matches!(e, Ev::Done { .. })), Some(Ev::Done { text: Some(t), error: None, stopped: false, .. }) if t == "banana"));
-        assert!(evs.iter().any(|e| matches!(e, Ev::Session { id, .. } if id == c)));
-        assert!(steps(&evs).iter().any(|(_, b)| b.contains("echo hi") && b.contains("hi")));
+        assert_eq!(text, "The output is hi.");
+        assert!(matches!(evs.iter().find(|e| matches!(e, Ev::Done { .. })), Some(Ev::Done { text: Some(t), error: None, stopped: false, .. }) if t == "The output is hi."));
+        let st = steps(&evs);
+        assert!(st.iter().any(|(t, b)| t == text::THINKING && b == "I should run it."));
+        assert!(st.iter().any(|(_, b)| b.contains("echo hi") && b.contains("hi_out")));
+        assert!(evs.iter().any(|e| matches!(e, Ev::Context { tokens: 8780, .. })));
         let u = evs.iter().find_map(|e| match e { Ev::Usage { uses, .. } => Some(uses.clone()), _ => None }).unwrap();
-        assert_eq!((u[0].input, u[0].output, u[0].cache_read), (8655 + 2238, 83 + 36 + 10 + 8, 6598));
-        // a failed turn says why
-        let evs = feed_agy(&[json!({"event":"result","result":{"conversation_id":c,"status":"ERROR","error":{"message":"quota"}}})]);
-        assert!(matches!(&evs.iter().find(|e| matches!(e, Ev::Done { .. })), Some(Ev::Done { error: Some(e), .. }) if e == "quota"));
+        assert_eq!((u[0].model.as_str(), u[0].input, u[0].output, u[0].cache_read), ("gemini-4-neon-high", 10925, 267, 6617));
+        // stopped with session/cancel
+        let evs = feed_agy(&[json!({"jsonrpc": "2.0", "id": "turn", "result": {"stopReason": "cancelled"}})]);
+        assert!(matches!(evs.iter().find(|e| matches!(e, Ev::Done { .. })), Some(Ev::Done { stopped: true, error: None, .. })));
+        // a failed prompt says why
+        let evs = feed_agy(&[json!({"jsonrpc": "2.0", "id": "turn", "error": {"code": -32603, "message": "quota"}})]);
+        assert!(matches!(evs.iter().find(|e| matches!(e, Ev::Done { .. })), Some(Ev::Done { error: Some(e), .. }) if e == "quota"));
+        // the command line's own commands, from `agy -p /help`
+        assert_eq!(parse_agy_help("/config (settings)\tOpen settings panel\n/usage (quota)\tView model quota usage\nnoise\n"),
+                   vec![("config".to_string(), "Open settings panel".to_string()), ("usage".to_string(), "View model quota usage".to_string())]);
     }
     fn answers(evs: &[Ev]) -> Vec<String> {
         evs.iter().filter_map(|e| match e { Ev::Text { delta, .. } => Some(delta.trim().to_string()), Ev::Done { text, .. } => text.clone(), _ => None })
