@@ -267,6 +267,16 @@ pub fn watch(from: &str, chat: &str, on: bool) -> Result<String, String> {
         said = text::watch_batch_set(b);
     }
     let batch_now = store::note(from)["watch_batch"].as_u64().unwrap_or(0);
+    // "--flush [topic]": what that topic's batch has gathered goes to it now, without waiting for --batch
+    if let Some(rest) = chat.trim().strip_prefix("--flush") {
+        let want = alias(rest.trim());
+        let tid = if want.is_empty() { from.to_string() } else {
+            sessions.lock().unwrap().values().find(|t| !t.deleted && (t.name == want || t.tid == want)).map(|t| t.tid.clone()).ok_or_else(|| text::relay_to_unknown(&want, ""))?
+        };
+        FLUSH.lock().unwrap().get_or_insert_with(HashSet::new).insert(tid.clone());
+        store::log(&format!("{from}: watch flush {tid}"));
+        return Ok(text::watch_flushed(if want.is_empty() { None } else { Some(want.as_str()) }));
+    }
     let chat = watch_entry(&chat);
     let chat = chat.as_str();
     if chat.is_empty() || chat == "--list" {
@@ -317,6 +327,10 @@ fn watch_covers(entry: &str, chat: &str, source: &str) -> bool {
     if chat.starts_with(brief::TOPIC_PREFIX) { return false; }
     entry == chat || entry == "all" || entry.strip_prefix("all:").is_some_and(|s| s == source)
 }
+
+/// Topics whose gathered batch should go out now (`exterior watch --flush`).
+static FLUSH: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+fn flush_take() -> HashSet<String> { FLUSH.lock().unwrap().take().unwrap_or_default() }
 
 /// A watched chat's new messages wait this long for more before going to the agent, and at most WATCH_MAX.
 const WATCH_QUIET: Duration = Duration::from_secs(20);
@@ -375,8 +389,10 @@ fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
             Err(_) => std::thread::sleep(params::secs("reconnect_s")),
         }
         store::set_state("watch_after", json!(last));
-        // default: once the chat is quiet for a moment (at most WATCH_MAX); with --batch: everything that came within it
-        let ready: Vec<String> = pend.iter().filter(|(t, (_, first, at))| match batch.get(*t) {
+        // default: once the chat is quiet for a moment (at most WATCH_MAX); with --batch: everything that came within it;
+        // and at once for a topic that asked (--flush)
+        let flush = flush_take();
+        let ready: Vec<String> = pend.iter().filter(|(t, (_, first, at))| flush.contains(*t) || match batch.get(*t) {
             Some(b) => first.elapsed() >= *b,
             None => at.elapsed() >= WATCH_QUIET || first.elapsed() >= WATCH_MAX,
         }).map(|(t, _)| t.clone()).collect();

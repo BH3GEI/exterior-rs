@@ -308,6 +308,9 @@ pub const WATCH_BATCH_USAGE: &str = "用法：exterior watch [会话ID | --all �
 pub fn watch_batch_set(secs: u64) -> String {
     if secs == 0 { "攒批恢复默认：会话静下来 20 秒（最长 2 分钟）就交给你".into() } else { format!("攒批时长设为 {}：这段时间内的新消息攒成一批交给你", dur(secs)) }
 }
+pub fn watch_flushed(topic: Option<&str>) -> String {
+    match topic { None => "已让 exterior 把攒着的新消息立刻交给你（十几秒内到；没有攒着的就不会来）".into(), Some(t) => format!("已让 exterior 把「{t}」攒着的新消息立刻交给它（十几秒内到）") }
+}
 pub fn watch_batch_note(secs: u64) -> String { if secs == 0 { String::new() } else { format!("（攒批时长 {}）", dur(secs)) } }
 fn dur(s: u64) -> String { if s % 3600 == 0 { format!("{} 小时", s / 3600) } else if s % 60 == 0 { format!("{} 分钟", s / 60) } else { format!("{s} 秒") } }
 pub const WATCH_TOPIC: &str = "Telegram 话题之间请用 exterior send";
