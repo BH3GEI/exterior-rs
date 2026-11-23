@@ -294,9 +294,14 @@ fn settings_page() -> String {
         badge(Some(tg["ok"] == true), tg["msg"].as_str().unwrap_or("未知")), ago(tg["time"].as_u64().unwrap_or(0)),
         badge(Some(store::state("global")["ok"] == true), store::state("global")["msg"].as_str().unwrap_or("—")), ago(store::state("global")["time"].as_u64().unwrap_or(0)),
         menu_n, ago(store::state("menu_time").as_u64().unwrap_or(0)), result_cell(r));
-    let fields: String = params::PARAMS.iter().map(|p| format!("<div><label class=\"mute\">{}</label><br><input name=\"p_{}\" value=\"{}\" placeholder=\"{}\"></div>",
-        esc(p.label), p.key, esc(&params::get(p.key)), esc(p.default))).collect();
-    let body = format!("{body}<h2>参数</h2><div class=\"card\"><form method=\"post\" action=\"/settings/params\"><div class=\"grid\">{fields}</div><div class=\"row\"><button class=\"primary\">保存</button><span class=\"mute\">清空某一项即恢复默认值。</span></div></form></div>");
+    let field = |p: &params::Param| format!("<div><label class=\"mute\">{} <code>{}</code></label><br><input name=\"p_{}\" value=\"{}\" placeholder=\"{}\"></div>",
+        esc(p.label), p.key, p.key, esc(&params::get(p.key)), esc(p.default));
+    let card = |title: &str, note: &str, ps: Vec<&params::Param>| format!("<h2>{title}</h2><div class=\"card\"><form method=\"post\" action=\"/settings/params\">{note}<div class=\"grid\">{}</div><div class=\"row\"><button class=\"primary\">保存</button><span class=\"mute\">清空某一项即恢复默认值。</span></div></form></div>",
+        ps.into_iter().map(field).collect::<String>());
+    let unattended = card("无人值守的默认参数", "<div class=\"row mute\">agent 在没人看着的情况下运行，所以默认跳过权限确认、自动同意审批。这里列出所有相关参数，改后对新启动的 agent 生效。</div>",
+        params::PARAMS.iter().filter(|p| params::UNATTENDED.contains(&p.key)).collect());
+    let rest = card("参数", "", params::PARAMS.iter().filter(|p| !params::UNATTENDED.contains(&p.key)).collect());
+    let body = format!("{body}{unattended}{rest}");
     page("/settings", "设置", &body, r["running"] == true)
 }
 
@@ -461,7 +466,8 @@ fn act(path: &str, f: std::collections::HashMap<String, String>) -> String {
         }
         "/settings/params" => {
             if !c["params"].is_object() { c["params"] = json!({}); }
-            for p in params::PARAMS {
+            // the page has more than one form: only the fields this one sent
+            for p in params::PARAMS.iter().filter(|p| f.contains_key(&format!("p_{}", p.key))) {
                 let v = g(&format!("p_{}", p.key));
                 if v.is_empty() || v == p.default { c["params"].as_object_mut().unwrap().remove(p.key); } else { c["params"][p.key] = json!(v); }
             }

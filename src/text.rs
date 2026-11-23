@@ -38,6 +38,13 @@ pub mod status {
 pub const MENU_STOP: &str = "exterior · 停止当前回合";
 pub const MENU_EXIT: &str = "exterior · 结束当前会话，下一条消息将开启新会话";
 pub const MENU_AGENT: &str = "exterior · 切换 agent";
+pub const MENU_COMMANDS: &str = "列出本话题当前 agent 的全部命令（按钮）";
+pub const PAGE_PREV: &str = "◀ 上一页";
+pub const PAGE_NEXT: &str = "下一页 ▶";
+pub fn commands_head(agent: &str, kind: &str, n: usize, page: usize, pages: usize) -> String {
+    let p = if pages > 1 { format!("，第 {page}/{pages} 页") } else { String::new() };
+    format!("{agent}（{kind}）的命令，共 {n} 条{p}。点按钮即原样发出；不在列表里的命令手动输入也照样转发。")
+}
 pub const MENU_ACCOUNT: &str = "exterior · 换一个 claude 账号继续当前会话";
 pub fn exhausted(acct: &str, why: &str) -> String { format!("{acct} 的额度已用完：{why}。可以换一个账号继续当前会话，上一条消息会自动重发；也可以等额度重置。") }
 pub fn choose_account(cur: &str, age_min: u64) -> String { format!("当前账号 {cur}。选择要换到的账号（用量是 {age_min} 分钟前的数据）：") }

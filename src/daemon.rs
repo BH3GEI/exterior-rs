@@ -22,10 +22,8 @@ pub struct Session {
 
 /// Telegram's limit on a button's data.
 const BUTTON_DATA_MAX: usize = 64;
-/// Telegram's limits on the command menu.
-const MENU_MAX: usize = 100;
+/// Telegram's limit on a command's name.
 const COMMAND_NAME_MAX: usize = 32;
-const COMMAND_DESC_MAX: usize = 60;
 
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 type Own = Arc<Mutex<HashSet<u64>>>;
@@ -454,69 +452,78 @@ fn menu_name(orig: &str) -> String {
     n
 }
 
-/// Telegram refuses a menu whose names and descriptions together are longer than about 5200 characters
-/// (BOT_COMMANDS_TOO_MUCH; measured 11-19 with 100 commands). Shorten every description alike until it fits.
-const MENU_CHARS: usize = 5000;
-
-fn fit_menu(cmds: &mut [Value]) {
-    let len = |v: &Value, k: &str| v[k].as_str().unwrap_or("").chars().count();
-    let mut cap = COMMAND_DESC_MAX;
-    while cap > 8 && cmds.iter().map(|c| len(c, "command") + len(c, "description").min(cap)).sum::<usize>() > MENU_CHARS { cap -= 1; }
-    for c in cmds.iter_mut() {
-        let d = c["description"].as_str().unwrap_or("").to_string();
-        if d.chars().count() > cap { c["description"] = json!(format!("{}…", d.chars().take(cap - 1).collect::<String>())); }
-    }
-}
-
-/// The "/" menu: exterior's own commands, then the agents' commands without any prefix: claude's as claude lists
-/// them, pi's as pi lists them plus the table (agents::BUILTINS), codex's from the table. One entry per name; its
-/// grey description says which agents have it. The topic's current agent decides what a command does.
+/// The "/" menu and the agents' command lists. Every agent's commands are read as it lists them: claude's from
+/// initialize, pi's from get_commands plus the table (agents::BUILTINS), codex's from the table, agy's from
+/// available_commands_update plus `agy -p /help`. The group's menu shows only the few they all have, plus exterior's
+/// own; /commands shows the topic's agent's full list. The topic's current agent decides what a command does.
 pub fn build_menu() -> Result<usize, String> {
     let dev = store::default_device().ok_or(text::NO_DEVICE)?;
     let has = |k: Kind| dev["agents"].as_array().into_iter().flatten().any(|a| a["kind"] == k.name());
-    let mut cmds = vec![
-        json!({"command": format!("{OWN}stop"), "description": text::MENU_STOP}),
-        json!({"command": format!("{OWN}exit"), "description": text::MENU_EXIT}),
-        json!({"command": format!("{OWN}agent"), "description": text::MENU_AGENT}),
-    ];
-    if has(Kind::Claude) { cmds.push(json!({"command": format!("{OWN}account"), "description": text::MENU_ACCOUNT})); }
-    // menu name → (agent kind → the agent's own name for it), and the first description found
-    let mut order: Vec<String> = Vec::new();
+    // menu name → (agent kind → the agent's own name for it): how a typed command reaches the topic's agent
     let mut map = serde_json::Map::new();
-    let mut desc: HashMap<String, String> = HashMap::new();
+    // each agent's full list, in its own words, for /commands: kind → [[menu name, description]]
+    let mut lists = serde_json::Map::new();
     let root = crate::prompt::root(&dev);
     // agy's command-line commands (/usage…): not ACP commands, each is run on its own (agents::agy_cli)
     let mut agy_cli: Vec<String> = vec![];
     for kind in Kind::ALL {
         let Some(row) = dev["agents"].as_array().into_iter().flatten().find(|a| a["kind"] == kind.name()) else { continue };
         let cmd = row["command"].as_str().unwrap_or("");
-        let table = agents::BUILTINS.iter().filter(|(k, _)| *k == kind).map(|(_, n)| (n.to_string(), text::builtin_desc(n), false));
+        let table = agents::BUILTINS.iter().filter(|(k, _)| *k == kind).map(|(_, n)| (n.to_string(), agents::builtin_desc(kind, n), false));
         let own = agents::commands(&dev, &root, cmd, kind).into_iter().map(|(n, d)| (n, d, false));
         let cli = if kind == Kind::Agy { agents::agy_cli_commands(&dev, &root, cmd) } else { vec![] }.into_iter().map(|(n, d)| (n, d, true));
+        let mut list: Vec<Value> = vec![];
         for (orig, d, is_cli) in table.chain(own).chain(cli) {
             let tg = menu_name(&orig);
             if tg.is_empty() || tg.starts_with(OWN) { continue; }
-            let e = map.entry(tg.clone()).or_insert_with(|| { order.push(tg.clone()); json!({}) });
-            if e[kind.name()].is_null() { e[kind.name()] = json!(orig); if is_cli { agy_cli.push(tg.clone()); } }
-            let d = d.trim().replace('\n', " ");
-            if !d.is_empty() { desc.entry(tg).or_insert(d); }
+            let e = map.entry(tg.clone()).or_insert_with(|| json!({}));
+            if !e[kind.name()].is_null() { continue; }
+            e[kind.name()] = json!(orig);
+            if is_cli { agy_cli.push(tg.clone()); }
+            list.push(json!([tg, d.trim().replace('\n', " ")]));
         }
+        lists.insert(kind.name().into(), Value::Array(list));
     }
     if map.is_empty() { return Err(text::NO_COMMANDS.into()); }
-    for tg in &order {
-        // Telegram shows at most MENU_MAX commands; the rest still work when typed
-        if cmds.len() >= MENU_MAX { break; }
-        let who: Vec<&str> = Kind::ALL.iter().filter(|k| !map[tg][k.name()].is_null()).map(|k| k.label()).collect();
-        let full = format!("{} · {}", who.join(" / "), desc.get(tg).cloned().unwrap_or_else(|| format!("/{tg}")));
-        cmds.push(json!({"command": tg, "description": full}));
-    }
-    fit_menu(&mut cmds);
+    // Telegram has one menu for the whole group: only what every agent has (and is used often), plus exterior's own.
+    // Everything else works when typed, and /commands lists the topic's agent's full set.
+    let mut cmds = vec![json!({"command": "commands", "description": text::MENU_COMMANDS})];
+    for n in MENU_COMMON { if map.contains_key(*n) { cmds.push(json!({"command": n, "description": text::builtin_desc(n)})); } }
+    cmds.push(json!({"command": format!("{OWN}stop"), "description": text::MENU_STOP}));
+    cmds.push(json!({"command": format!("{OWN}exit"), "description": text::MENU_EXIT}));
+    cmds.push(json!({"command": format!("{OWN}agent"), "description": text::MENU_AGENT}));
+    if has(Kind::Claude) { cmds.push(json!({"command": format!("{OWN}account"), "description": text::MENU_ACCOUNT})); }
     let n = cmds.len();
     brief::post("/api/bots/commands", json!({"commands": cmds})).map_err(|(c, v)| format!("{c} {v}"))?;
     store::set_state("menu", Value::Object(map));
+    store::set_state("commands", Value::Object(lists));
     store::set_state("agy_cli", json!(agy_cli));
     store::set_state("menu_time", json!(store::now()));
     Ok(n)
+}
+
+/// The agents' commands that go into the group's menu: the ones they all have and that are used most.
+const MENU_COMMON: &[&str] = &["model", "compact", "new", "clear", "resume", "usage"];
+/// /commands shows this many to a page.
+const COMMANDS_PAGE: usize = 20;
+
+/// /commands [page]: the topic's agent's full list, in its own words, as buttons that send the command as it is.
+fn commands_page(kind: Kind, agent: &str, page: usize) -> (String, Value) {
+    let all = store::state("commands")[kind.name()].as_array().cloned().unwrap_or_default();
+    let pages = all.len().div_ceil(COMMANDS_PAGE).max(1);
+    let page = page.clamp(1, pages);
+    let shown: Vec<&Value> = all.iter().skip((page - 1) * COMMANDS_PAGE).take(COMMANDS_PAGE).collect();
+    let mut t = text::commands_head(agent, kind.label(), all.len(), page, pages);
+    for c in &shown {
+        let (n, d) = (c[0].as_str().unwrap_or(""), c[1].as_str().unwrap_or(""));
+        t.push_str(&format!("\n/{n}{}", if d.is_empty() { String::new() } else { format!(" — {d}") }));
+    }
+    let mut rows = in_rows(shown.iter().map(|c| { let n = c[0].as_str().unwrap_or(""); (format!("/{n}"), format!("/{n}")) }).collect(), 3);
+    let mut nav = vec![];
+    if page > 1 { nav.push((text::PAGE_PREV.to_string(), format!("/commands {}", page - 1))); }
+    if page < pages { nav.push((text::PAGE_NEXT.to_string(), format!("/commands {}", page + 1))); }
+    if !nav.is_empty() { rows.push(nav); }
+    (t, buttons(rows))
 }
 
 /// Agent output → Telegram. No live editing: what the agent says is sent as it is said. A paragraph is done when the
@@ -1082,7 +1089,12 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
         // one of agy's command-line commands: run on its own, its output goes to the topic as it is
         let agy_cli = cur_kind == Some(Kind::Agy) && agent_cmd.is_some()
             && head.strip_prefix('/').is_some_and(|h| store::state("agy_cli").as_array().is_some_and(|l| l.iter().any(|x| x == h)));
-        if own_cmd == Some("exit") {
+        if head == "/commands" || own_cmd == Some("commands") {
+            match cur_kind {
+                Some(k) => { let (t, b) = commands_page(k, &cur, arg.parse().unwrap_or(1)); reply = Some(t); reply_buttons = Some(b); }
+                None => reply = Some(text::NO_COMMANDS.into()),
+            }
+        } else if own_cmd == Some("exit") {
             if let Some(a) = s.agent.as_mut() { a.stop(); a.kill(); }
             s.agent = None; s.gen += 1; s.pending = false;
             store::note_set(chat, "session", Value::Null);
@@ -1385,10 +1397,6 @@ mod tests {
         assert_eq!(agents::builtin(Kind::Claude, "model"), None);
         assert_eq!(agents::builtin(Kind::Codex, "thinking"), None);
         assert_eq!(menu_name("design-sync"), "design_sync");
-        let mut m: Vec<Value> = (0..100).map(|i| json!({"command": format!("command_{i}"), "description": "说".repeat(100)})).collect();
-        fit_menu(&mut m);
-        assert!(m.iter().map(|c| c["command"].as_str().unwrap().chars().count() + c["description"].as_str().unwrap().chars().count()).sum::<usize>() <= MENU_CHARS);
-        assert!(m[0]["description"].as_str().unwrap().ends_with('…'));
         assert_eq!(menu_name("skill:Foo.Bar"), "skill_foo_bar");
         assert_eq!(agents::review_target("")["type"], "uncommittedChanges");
         assert_eq!(agents::review_target("abc1234")["type"], "commit");
@@ -1584,6 +1592,21 @@ mod lane_tests {
         wait(&|| running("tgbot:slow") == Some((false, false)));
         assert_eq!(running("tgbot:slow"), Some((false, false)));
         assert_eq!(running("tgbot:fast"), Some((false, false)));
+    }
+
+    #[test]
+    fn commands_list() {
+        let _g = store::TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let _dir = test_dir();
+        let list: Vec<Value> = (0..45).map(|i| json!([format!("c{i}"), format!("does {i}")])).collect();
+        store::set_state("commands", json!({"agy": list}));
+        let (t, b) = commands_page(Kind::Agy, "agy-claude", 1);
+        assert!(t.contains("共 45 条") && t.contains("1/3") && t.contains("/c0 — does 0") && !t.contains("/c20 "), "{t}");
+        let rows = b["inline_keyboard"].as_array().or(b.as_array()).cloned().unwrap_or_default();
+        let flat: Vec<String> = rows.iter().flat_map(|r| r.as_array().cloned().unwrap_or_default()).map(|x| x.to_string()).collect();
+        assert!(flat.iter().any(|x| x.contains("/c19")) && flat.iter().any(|x| x.contains("/commands 2")) && !flat.iter().any(|x| x.contains("上一页")), "{flat:?}");
+        let (t, b) = commands_page(Kind::Agy, "agy-claude", 9);
+        assert!(t.contains("3/3") && t.contains("/c44") && b.to_string().contains("/commands 2"), "{t}");
     }
 
     #[test]

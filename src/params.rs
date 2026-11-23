@@ -19,6 +19,10 @@ pub const PARAMS: &[Param] = &[
     Param { key: "relay_mark", label: "会话之间转发消息的分隔符", default: "→" },
     Param { key: "pick_mark", label: "启动命令选定账号时输出的前缀", default: "→" },
     Param { key: "claude_args", label: "claude 的额外启动参数", default: "--dangerously-skip-permissions" },
+    Param { key: "claude_fixed_args", label: "claude 的固定启动参数（让子 agent 的话也转发出来，exterior 折叠显示）", default: "--forward-subagent-text" },
+    Param { key: "agent_env", label: "给所有 agent 的环境变量（KEY=值，空格隔开；默认关掉 claude 的自动记忆）", default: "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1" },
+    Param { key: "codex_auto_approve", label: "codex 发来审批请求时自动同意（1 同意，0 拒绝）", default: "1" },
+    Param { key: "agy_auto_allow", label: "agy 发来权限请求时自动允许（1 允许，0 拒绝；agy_args 带 --dangerously-skip-permissions 时一般不会发）", default: "1" },
     Param { key: "agy_args", label: "agy（Antigravity CLI）的额外启动参数", default: "--dangerously-skip-permissions" },
     Param { key: "agy_quota_min", label: "agy 一轮结束后查一次额度（agy -p /usage），同一账号最多每多少分钟一次（0 为不查）", default: "10" },
     Param { key: "codex_approval", label: "codex 的审批策略（approvalPolicy）", default: "never" },
@@ -60,6 +64,11 @@ pub fn num(key: &str) -> u64 {
 }
 
 /// A setting that is a list of command-line arguments, split at spaces.
+/// The settings that let the agents run unattended (permissions, approvals, sandbox, fixed arguments, environment):
+/// shown together on the settings page.
+pub const UNATTENDED: &[&str] = &["claude_args", "claude_fixed_args", "claude_thinking", "agent_env", "codex_approval", "codex_sandbox",
+                                  "codex_auto_approve", "agy_args", "agy_auto_allow"];
+
 pub fn args(key: &str) -> Vec<String> { get(key).split_whitespace().map(String::from).collect() }
 
 pub fn secs(key: &str) -> std::time::Duration { std::time::Duration::from_secs(num(key)) }

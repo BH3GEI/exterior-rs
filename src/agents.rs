@@ -35,6 +35,27 @@ pub const BUILTINS: &[(Kind, &str)] = &[
     (Kind::Agy, "model"), (Kind::Agy, "resume"),
 ];
 
+/// What a table command does, for /commands: codex's in codex's own words (codex-rs/tui/src/slash_command.rs,
+/// codex-cli 0.171), the others as exterior describes them.
+pub fn builtin_desc(kind: Kind, name: &str) -> String {
+    if kind == Kind::Codex {
+        let d = match name {
+            "model" => "choose what model and reasoning effort to use", "compact" => "summarize conversation to prevent hitting the context limit",
+            "new" => "start a new chat during a conversation", "clear" => "clear the terminal and start a new chat",
+            "status" => "show current session configuration and token usage", "usage" => "view account usage or use a usage limit reset",
+            "review" => "review my current changes and find issues", "diff" => "show git diff (including untracked files)",
+            "rename" => "rename the current thread", "resume" => "resume a saved chat", "fork" => "fork the current chat",
+            "archive" => "archive this session", "goal" => "set or view the goal for a long-running task",
+            "mcp" => "list MCP tools; /mcp verbose or /mcp login <name> [--environment <id>]", "apps" => "manage apps",
+            "plugins" => "browse plugins", "skills" => "use skills to improve how Codex performs specific tasks",
+            "hooks" => "view and manage lifecycle hooks", "copy" => "copy the last response or part of it", "logout" => "log out of Codex",
+            "quit" | "exit" => "exit Codex", _ => "",
+        };
+        if !d.is_empty() { return d.to_string(); }
+    }
+    text::builtin_desc(name)
+}
+
 /// Built-ins that end the agent's process (the session is kept, so the next message resumes it).
 pub fn is_quit(name: &str) -> bool { matches!(name, "exit" | "quit") }
 
@@ -112,11 +133,20 @@ pub struct Agent {
     model: Arc<Mutex<Option<String>>>,
 }
 
-fn env(spec: &Spec) -> Vec<(&'static str, String)> {
+fn env(spec: &Spec) -> Vec<(String, String)> {
     // EXTERIOR_TOPIC: who is speaking when the agent runs `exterior send`; PATH: where that command is
-    vec![("EXTERIOR_SESSION", spec.topic.clone()), ("EXTERIOR_TOPIC", spec.tid.clone()), ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1".into()),
-         ("PATH", crate::prompt::bin_dir(&spec.dev))]
+    let mut e = vec![("EXTERIOR_SESSION".to_string(), spec.topic.clone()), ("EXTERIOR_TOPIC".to_string(), spec.tid.clone()),
+                     ("PATH".to_string(), crate::prompt::bin_dir(&spec.dev))];
+    e.extend(agent_env());
+    e
 }
+
+/// The agent_env setting ("KEY=value KEY2=value"), given to every agent exterior starts.
+fn agent_env() -> Vec<(String, String)> {
+    params::args("agent_env").iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+fn refs(e: &[(String, String)]) -> Vec<(&str, String)> { e.iter().map(|(k, v)| (k.as_str(), v.clone())).collect() }
 
 /// stderr: remember the last lines (for error messages) and notice "→ cc6" style picks.
 fn watch_stderr(err: std::process::ChildStderr, tx: Sender<Ev>, tid: String, gen: u64, last: Arc<Mutex<String>>) {
@@ -199,7 +229,7 @@ impl Agent {
     }
 
     fn spawn(&mut self, args: Vec<String>) -> Result<(std::process::ChildStdout, Arc<Mutex<String>>), String> {
-        let mut c = crate::host::agent(&self.spec.dev, &self.spec.dir, &env(&self.spec), &self.spec.command, &args);
+        let mut c = crate::host::agent(&self.spec.dev, &self.spec.dir, &refs(&env(&self.spec)), &self.spec.command, &args);
         let mut child = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
         *self.stdin.lock().unwrap() = child.stdin.take();
         let out = child.stdout.take().unwrap();
@@ -221,7 +251,7 @@ impl Agent {
         args.extend(params::args("claude_args"));
         if let Some(e) = self.spec.effort.as_ref().filter(|e| *e != "auto") { args.push("--effort".into()); args.push(e.clone()); }
         // claude leaves its thinking out unless asked; the summaries Anthropic's API gives are shown as steps
-        args.push("--forward-subagent-text".into());
+        args.extend(params::args("claude_fixed_args"));
         let td = params::get("claude_thinking");
         if !td.is_empty() { args.push("--thinking-display".into()); args.push(td); }
         if let Some(id) = &self.spec.resume { args.push("--resume".into()); args.push(id.clone()); }
@@ -284,9 +314,10 @@ impl Agent {
                     continue;
                 }
                 if !v["id"].is_null() {
-                    // a request from codex (approvals): we run without approvals, so say yes; anything else, decline and say so
-                    let res = if method.ends_with("requestApproval") { json!({"id": v["id"], "result": {"decision": "accept"}}) }
-                              else if method == "execCommandApproval" || method == "applyPatchApproval" { json!({"id": v["id"], "result": {"decision": "approved"}}) }
+                    // a request from codex (approvals): unattended, so yes (codex_auto_approve); anything else, decline and say so
+                    let yes = params::get("codex_auto_approve") == "1";
+                    let res = if method.ends_with("requestApproval") { json!({"id": v["id"], "result": {"decision": if yes { "accept" } else { "decline" }}}) }
+                              else if method == "execCommandApproval" || method == "applyPatchApproval" { json!({"id": v["id"], "result": {"decision": if yes { "approved" } else { "denied" }}}) }
                               else {
                                   let _ = tx.send(Ev::Note { tid: tid.clone(), gen, text: text::codex_request_declined(method) });
                                   json!({"id": v["id"], "error": {"code": -32601, "message": text::CODEX_UNHANDLED}})
@@ -899,7 +930,7 @@ fn agy_quota(spec: &Spec, tx: &Sender<Ev>) {
     }
     let (spec, tx) = (spec.clone(), tx.clone());
     std::thread::spawn(move || {
-        let c = crate::host::agent(&spec.dev, &spec.dir, &env(&spec), &spec.command, &["-p".into(), "/usage".into()]);
+        let c = crate::host::agent(&spec.dev, &spec.dir, &refs(&env(&spec)), &spec.command, &["-p".into(), "/usage".into()]);
         if let Ok(out) = crate::host::exec(c, params::num("test_timeout_s")) {
             let w = crate::usage::agy_windows(&out);
             if !w.is_empty() { let _ = tx.send(Ev::Quota { tid: spec.tid.clone(), windows: w }); }
@@ -972,7 +1003,8 @@ fn read_agy(out: impl std::io::Read, spec: &Spec, tx: &Sender<Ev>, gen: u64, bus
             // agy asks: permissions are said yes to (as with codex; agy_args normally skips them anyway), the rest declined
             let res = if method == "session/request_permission" {
                 let opts = v["params"]["options"].as_array().cloned().unwrap_or_default();
-                let pick = opts.iter().find(|o| o["kind"] == "allow_always").or(opts.iter().find(|o| o["kind"] == "allow_once")).or(opts.first());
+                let want = if params::get("agy_auto_allow") == "1" { ["allow_always", "allow_once"] } else { ["reject_once", "reject_always"] };
+                let pick = opts.iter().find(|o| o["kind"] == want[0]).or(opts.iter().find(|o| o["kind"] == want[1])).or(opts.first());
                 match pick { Some(o) => json!({"jsonrpc": "2.0", "id": v["id"], "result": {"outcome": {"outcome": "selected", "optionId": o["optionId"]}}}),
                              None => json!({"jsonrpc": "2.0", "id": v["id"], "result": {"outcome": {"outcome": "cancelled"}}}) }
             } else {
@@ -1141,7 +1173,7 @@ pub fn test(dev: &Value, dir: &str, command: &str, kind: Kind) -> Result<String,
         Kind::Codex => vec!["exec".into(), "--skip-git-repo-check".into(), q.into()],
         Kind::Agy => [vec!["-p".into(), q.into()], params::args("agy_args")].concat(),
     };
-    let mut c = crate::host::agent(dev, dir, &[("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1".into())], command, &args);
+    let mut c = crate::host::agent(dev, dir, &refs(&agent_env()), command, &args);
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = c.spawn().map_err(|e| e.to_string())?;
     let out = crate::host::wait(child, params::num("test_timeout_s"))?;
@@ -1168,7 +1200,7 @@ pub fn commands(dev: &Value, dir: &str, command: &str, kind: Kind) -> Vec<(Strin
                       json!([rpc("1", "initialize", json!({"protocolVersion": 1, "clientCapabilities": {}})), rpc("2", "session/new", agy_session(dir, "", None))])),
         Kind::Codex => return vec![],
     };
-    let Ok(mut child) = crate::host::agent(dev, dir, &env(&Spec { tid: String::new(), prompt: String::new(), topic: String::new(), dev: dev.clone(), dir: dir.into(), command: command.into(), kind, gen: 0, resume: None, effort: None }), command, &args)
+    let Ok(mut child) = crate::host::agent(dev, dir, &refs(&env(&Spec { tid: String::new(), prompt: String::new(), topic: String::new(), dev: dev.clone(), dir: dir.into(), command: command.into(), kind, gen: 0, resume: None, effort: None })), command, &args)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return vec![] };
     let mut stdin = child.stdin.take().unwrap();
     match ask.as_array() { Some(l) => for a in l { let _ = writeln!(stdin, "{a}"); }, None => { let _ = writeln!(stdin, "{ask}"); } }
