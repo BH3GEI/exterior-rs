@@ -19,7 +19,7 @@ pub const PARAMS: &[Param] = &[
     Param { key: "relay_mark", label: "会话之间转发消息的分隔符", default: "→" },
     Param { key: "pick_mark", label: "启动命令选定账号时输出的前缀", default: "→" },
     Param { key: "claude_args", label: "claude 的额外启动参数", default: "--dangerously-skip-permissions" },
-    Param { key: "claude_fixed_args", label: "claude 的固定启动参数（让子 agent 的话也转发出来，exterior 折叠显示）", default: "--forward-subagent-text" },
+    Param { key: "claude_fixed_args", label: "claude 的固定启动参数（让子 agent 的话也转发出来，exterior 折叠显示；--system-prompt-snapshot off：续接会话时用当前的启动说明，claude 默认沿用会话第一次请求时记下的系统提示）", default: "--forward-subagent-text --system-prompt-snapshot off" },
     Param { key: "agent_env", label: "给所有 agent 的环境变量（KEY=值，空格隔开；默认关掉 claude 的自动记忆）", default: "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1" },
     Param { key: "codex_auto_approve", label: "codex 发来审批请求时自动同意（1 同意，0 拒绝）", default: "1" },
     Param { key: "agy_auto_allow", label: "agy 发来权限请求时自动允许（1 允许，0 拒绝；agy_args 带 --dangerously-skip-permissions 时一般不会发）", default: "1" },
