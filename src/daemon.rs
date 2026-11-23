@@ -258,9 +258,20 @@ pub fn watch(from: &str, chat: &str, on: bool) -> Result<String, String> {
     let sessions = LIVE.lock().unwrap().clone().ok_or(text::NOT_READY)?;
     if !sessions.lock().unwrap().get(from).map(|s| !s.deleted).unwrap_or(false) { return Err(text::relay_from_unknown(from)); }
     let mut list: Vec<String> = store::note(from)["watch"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
-    let chat = watch_entry(chat);
+    // "--batch 30m": how long this topic's batches gather (off: the default); may come with a chat or alone
+    let (chat, batch) = split_batch(chat)?;
+    let mut said = String::new();
+    if let Some(b) = batch {
+        store::note_set(from, "watch_batch", if b == 0 { Value::Null } else { json!(b) });
+        store::log(&format!("{from}: watch batch {b}s"));
+        said = text::watch_batch_set(b);
+    }
+    let batch_now = store::note(from)["watch_batch"].as_u64().unwrap_or(0);
+    let chat = watch_entry(&chat);
     let chat = chat.as_str();
-    if chat.is_empty() || chat == "--list" { return Ok(text::watching(&list)); }
+    if chat.is_empty() || chat == "--list" {
+        return Ok(if batch.is_some() && chat.is_empty() { said } else { format!("{}{}", text::watching(&list), text::watch_batch_note(batch_now)) });
+    }
     if chat.starts_with(brief::TOPIC_PREFIX) { return Err(text::WATCH_TOPIC.into()); }
     // with "all" on, unwatching one chat keeps it out ("-<chat>"); watching it again takes it back in
     let excluded = format!("-{chat}");
@@ -269,7 +280,25 @@ pub fn watch(from: &str, chat: &str, on: bool) -> Result<String, String> {
     if on { list.push(chat.to_string()); } else if covered_by_all && !chat.starts_with("all") { list.push(excluded); }
     store::note_set(from, "watch", json!(list));
     store::log(&format!("{from}: {} {chat}", if on { "watch" } else { "unwatch" }));
-    Ok(if on { text::watch_on(chat) } else { text::watch_off(chat) })
+    let done = if on { text::watch_on(chat) } else { text::watch_off(chat) };
+    Ok(if said.is_empty() { done } else { format!("{done}；{said}") })
+}
+
+/// "<chat or --all …> --batch 30m" → the rest and the batch time in seconds (0 for off/default).
+fn split_batch(arg: &str) -> Result<(String, Option<u64>), String> {
+    let words: Vec<&str> = arg.split_whitespace().collect();
+    let Some(i) = words.iter().position(|w| *w == "--batch") else { return Ok((arg.trim().to_string(), None)) };
+    let v = words.get(i + 1).copied().unwrap_or("");
+    let secs = match v {
+        "off" | "0" | "default" => 0,
+        _ => {
+            let (n, unit) = v.split_at(v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len()));
+            let n: u64 = n.parse().ok().filter(|n| *n > 0).ok_or_else(|| text::WATCH_BATCH_USAGE.to_string())?;
+            n * match unit { "s" => 1, "m" | "" => 60, "h" => 3600, _ => return Err(text::WATCH_BATCH_USAGE.into()) }
+        }
+    };
+    let rest: Vec<&str> = words.iter().enumerate().filter(|(j, _)| *j != i && *j != i + 1).map(|(_, w)| *w).collect();
+    Ok((rest.join(" "), Some(secs)))
 }
 
 /// What `exterior watch` was given, as kept in the list: a chat id; or "--all [source]" → "all" (every chat, of every
@@ -300,17 +329,29 @@ fn watch_line(m: &Value) -> String {
     format!("[{t}] {}：{kind}{}", m["sender"].as_str().unwrap_or("?"), m["text"].as_str().unwrap_or("").trim())
 }
 
+/// One batch as the agent reads it: "群名 → [新消息]" and its lines; several chats one after another, each with its
+/// own heading, in the order they first spoke.
+fn watch_batch(lines: &[(String, String)]) -> String {
+    let mut order: Vec<&str> = vec![];
+    for (n, _) in lines { if !order.contains(&n.as_str()) { order.push(n); } }
+    order.iter().map(|n| format!("{n} {} {}\n{}", params::get("relay_mark"), text::WATCH_HEADER,
+        lines.iter().filter(|(c, _)| c == n).map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n"))).collect::<Vec<_>>().join("\n\n")
+}
+
 fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
-    // topic → (chat name, lines, first, last arrival)
-    let mut pend: HashMap<String, (String, Vec<String>, Instant, Instant)> = HashMap::new();
+    // topic → ((chat name, line) in arrival order, first, last arrival)
+    let mut pend: HashMap<String, (Vec<(String, String)>, Instant, Instant)> = HashMap::new();
     let latest = || brief::get("/api/messages?limit=1").and_then(|v| v.as_array().and_then(|a| a.iter().filter_map(|m| m["id"].as_u64()).max()));
     let mut last = store::state("watch_after").as_u64().filter(|l| *l > 0).or_else(latest).unwrap_or(0);
     loop {
-        // topic → its watch entries (chat ids, "all", "all:<source>")
+        // topic → its watch entries (chat ids, "all", "all:<source>"); and how long its batches gather, if set
         let mut watched: Vec<(String, Vec<String>)> = vec![];
+        let mut batch: HashMap<String, Duration> = HashMap::new();
         for n in store::notes().iter().filter(|n| n["deleted"] != true) {
             let l: Vec<String> = n["watch"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
-            if !l.is_empty() { watched.push((n["topic"].as_str().unwrap_or("").to_string(), l)); }
+            let tid = n["topic"].as_str().unwrap_or("").to_string();
+            if let Some(b) = n["watch_batch"].as_u64().filter(|b| *b > 0) { batch.insert(tid.clone(), Duration::from_secs(b)); }
+            if !l.is_empty() { watched.push((tid, l)); }
         }
         if watched.is_empty() && pend.is_empty() {
             // nothing followed: keep the mark current, so a new watch starts from now, not from old messages
@@ -326,19 +367,23 @@ fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
                 let out = format!("-{chat}");
                 for (tid, _) in watched.iter().filter(|(_, l)| !l.contains(&out) && l.iter().any(|e| watch_covers(e, chat, source))) {
                     let name = m["chat_name"].as_str().filter(|n| !n.is_empty()).unwrap_or(chat).to_string();
-                    let e = pend.entry(tid.clone()).or_insert_with(|| (name, Vec::new(), Instant::now(), Instant::now()));
-                    e.1.push(watch_line(m));
-                    e.3 = Instant::now();
+                    let e = pend.entry(tid.clone()).or_insert_with(|| (Vec::new(), Instant::now(), Instant::now()));
+                    e.0.push((name, watch_line(m)));
+                    e.2 = Instant::now();
                 }
             },
             Err(_) => std::thread::sleep(params::secs("reconnect_s")),
         }
         store::set_state("watch_after", json!(last));
-        let ready: Vec<String> = pend.iter().filter(|(_, (_, _, first, at))| at.elapsed() >= WATCH_QUIET || first.elapsed() >= WATCH_MAX).map(|(t, _)| t.clone()).collect();
+        // default: once the chat is quiet for a moment (at most WATCH_MAX); with --batch: everything that came within it
+        let ready: Vec<String> = pend.iter().filter(|(t, (_, first, at))| match batch.get(*t) {
+            Some(b) => first.elapsed() >= *b,
+            None => at.elapsed() >= WATCH_QUIET || first.elapsed() >= WATCH_MAX,
+        }).map(|(t, _)| t.clone()).collect();
         for tid in ready {
-            let Some((name, lines, _, _)) = pend.remove(&tid) else { continue };
-            store::log(&format!("watch -> {tid}: {} messages from {name}", lines.len()));
-            handle(&sessions, &own, &tx, &tid, &format!("{name} {} {}\n{}", params::get("relay_mark"), text::WATCH_HEADER, lines.join("\n")));
+            let Some((lines, _, _)) = pend.remove(&tid) else { continue };
+            store::log(&format!("watch -> {tid}: {} messages", lines.len()));
+            handle(&sessions, &own, &tx, &tid, &watch_batch(&lines));
         }
     }
 }
@@ -1453,6 +1498,22 @@ mod tests {
         assert!(!due_compact(&json!({"turn_end": 5000, "context": 150000, "status": "idle", "idle_compacted": 1000, "idle_compact_wait": true}), 99999, true, 50, 100000));
     }
 
+    #[test]
+    fn watch_batches_by_chat() {
+        let l = vec![("A".to_string(), "[1] x：a1".to_string()), ("B".into(), "[2] y：b1".into()), ("A".into(), "[3] x：a2".into())];
+        let t = watch_batch(&l);
+        assert!(t.starts_with("A → ") && t.contains("[1] x：a1\n[3] x：a2\n\nB → ") && t.ends_with("[2] y：b1"), "{t}");
+    }
+    #[test]
+    fn watch_batch_option() {
+        assert_eq!(split_batch("--batch 30m").unwrap(), (String::new(), Some(1800)));
+        assert_eq!(split_batch("--all wechat --batch 2h").unwrap(), ("--all wechat".into(), Some(7200)));
+        assert_eq!(split_batch("1@chatroom --batch 90s").unwrap(), ("1@chatroom".into(), Some(90)));
+        assert_eq!(split_batch("--batch off").unwrap(), (String::new(), Some(0)));
+        assert_eq!(split_batch("1@chatroom").unwrap(), ("1@chatroom".into(), None));
+        assert!(split_batch("--batch x").is_err());
+        assert_eq!(crate::text::watch_batch_note(1800), "（攒批时长 30 分钟）");
+    }
     #[test]
     fn watch_all() {
         assert_eq!(watch_entry("--all"), "all");

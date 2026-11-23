@@ -304,6 +304,12 @@ pub fn draft_saved(chat: &str, id: &str) -> String { format!("已写入草稿 #{
 pub fn draft_removed(id: &str) -> String { format!("已忽略草稿 #{id}") }
 pub fn draft_no_chat(c: &str) -> String { format!("brief 里没有名为「{c}」的会话；请用会话 ID（GET /api/chats 可查）") }
 pub fn draft_many_chats(c: &str, ids: &str) -> String { format!("名为「{c}」的会话不止一个：{ids}；请用会话 ID") }
+pub const WATCH_BATCH_USAGE: &str = "用法：exterior watch [会话ID | --all 来源] --batch 30m（单位 s、m、h；off 恢复默认）";
+pub fn watch_batch_set(secs: u64) -> String {
+    if secs == 0 { "攒批恢复默认：会话静下来 20 秒（最长 2 分钟）就交给你".into() } else { format!("攒批时长设为 {}：这段时间内的新消息攒成一批交给你", dur(secs)) }
+}
+pub fn watch_batch_note(secs: u64) -> String { if secs == 0 { String::new() } else { format!("（攒批时长 {}）", dur(secs)) } }
+fn dur(s: u64) -> String { if s % 3600 == 0 { format!("{} 小时", s / 3600) } else if s % 60 == 0 { format!("{} 分钟", s / 60) } else { format!("{s} 秒") } }
 pub const WATCH_TOPIC: &str = "Telegram 话题之间请用 exterior send";
 pub const WATCH_HEADER: &str = "（exterior watch 收到的新消息）";
 pub fn idle_compact(min: u64, ctx: u64) -> String { format!("exterior 闲置压缩：本话题已闲置 {min} 分钟，上下文约 {} 万 token，在缓存过期前发送 /compact（设置项 idle_compact_min、idle_compact_tokens）", ctx / 10000) }

@@ -103,15 +103,15 @@ printf '%s' "$text" | curl -sS --fail-with-body -H "Authorization: Bearer $(cat 
     format!(r#"#!/bin/sh
 # exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
 # exterior watch <会话ID> / exterior unwatch <会话ID>：让 exterior 盯住一个会话（如微信群），新消息自动交给你。
-# exterior watch --all [来源]：盯某个来源（如 wechat）的全部会话，含以后新出现的；不写来源就是全部来源。exterior watch 或 --list：列出在盯什么。
+# exterior watch --all [来源]：盯某个来源（如 wechat）的全部会话，含以后新出现的；不写来源就是全部来源。exterior watch 或 --list：列出在盯什么。加 --batch 30m：本话题的新消息攒 30 分钟再交给你（off 恢复默认）。
 # exterior usage [5h|24h|7d]：各订阅当前的额度窗口，以及这段时间各话题、各订阅用了多少。
 # exterior topic open <话题名>：开一个新话题交给另一个 agent（返回 chat）；exterior topic close <话题名或 chat>：任务完成后关闭。
 # exterior draft <会话ID或名字> <内容>：写一条 brief 草稿等 Yao 处理；exterior draft list；exterior draft rm <编号>。
 # 由 exterior 安装，每次启动时覆盖。
-usage() {{ echo '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID | --all [来源] | --list] | exterior unwatch <会话ID | --all [来源]> | exterior usage [5h|24h|7d]' >&2; exit 2; }}
+usage() {{ echo '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID | --all [来源] | --list] [--batch 30m] | exterior unwatch <会话ID | --all [来源]> | exterior usage [5h|24h|7d]' >&2; exit 2; }}
 case "$1" in
   send) [ $# -ge 3 ] || usage; to=$2; shift 2; cmd=send; text="$*" ;;
-  watch) [ $# -le 3 ] || usage; cmd=watch; shift; to="$*"; text= ;;
+  watch) cmd=watch; shift; to="$*"; text= ;;
   unwatch) [ $# -ge 2 ] && [ $# -le 3 ] || usage; cmd=unwatch; shift; to="$*"; text= ;;
   usage) [ $# -le 2 ] || usage; cmd=usage; to=${{2:-}}; text= ;;
   topic) [ $# -ge 3 ] || usage; cmd=topic; to=$2; shift 2; text="$*" ;;
@@ -128,10 +128,10 @@ fn send_ps1(dev: &Value) -> String {
     // with a byte order mark: Windows PowerShell reads a file without one in the local code page
     format!("\u{feff}{}", format!(r#"# exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
 # 由 exterior 安装，每次启动时覆盖。
-$usage = '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID | --all [来源] | --list] | exterior unwatch <会话ID | --all [来源]> | exterior usage [5h|24h|7d]'
+$usage = '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID | --all [来源] | --list] [--batch 30m] | exterior unwatch <会话ID | --all [来源]> | exterior usage [5h|24h|7d]'
 $cmd = [string]$args[0]; $to = ''; $text = ''
 if ($cmd -eq 'send' -and $args.Count -ge 3) {{ $to = [string]$args[1]; $text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }}
-elseif ($cmd -eq 'watch' -and $args.Count -le 3) {{ if ($args.Count -ge 2) {{ $to = ($args[1..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }} }}
+elseif ($cmd -eq 'watch') {{ if ($args.Count -ge 2) {{ $to = ($args[1..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }} }}
 elseif ($cmd -eq 'unwatch' -and $args.Count -ge 2 -and $args.Count -le 3) {{ $to = ($args[1..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }}
 elseif ($cmd -eq 'usage' -and $args.Count -le 2) {{ if ($args.Count -eq 2) {{ $to = [string]$args[1] }} }}
 elseif (($cmd -eq 'topic' -and $args.Count -ge 3) -or ($cmd -eq 'draft' -and $args.Count -ge 2)) {{ $to = [string]$args[1]; if ($args.Count -ge 3) {{ $text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }} }}
