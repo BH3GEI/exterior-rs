@@ -136,7 +136,7 @@ printf '%s' "$text" | curl -sS --fail-with-body -H "Authorization: Bearer $(cat 
 # exterior draft <会话ID或名字> <内容>：写一条 brief 草稿等 Yao 处理；exterior draft list；exterior draft rm <编号>。
 # exterior schedule list / add <HH:MM> <话题名> <内容> / rm <编号>：每天定时发给某个话题的消息（旧金山时间）。
 # 由 exterior 安装，每次启动时覆盖。
-usage() {{ echo '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID | --all [来源]> | exterior schedule list|add <HH:MM> <话题> <内容>|rm <编号> | exterior usage [5h|24h|7d]' >&2; exit 2; }}
+usage() {{ echo '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID或名字 | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID或名字 | --all [来源]> | exterior schedule list|add <HH:MM> <话题> <内容>|rm <编号> | exterior usage [5h|24h|7d]' >&2; exit 2; }}
 case "$1" in
   send) [ $# -ge 3 ] || usage; to=$2; shift 2; cmd=send; text="$*" ;;
   watch) cmd=watch; shift; to="$*"; text= ;;
@@ -157,7 +157,7 @@ fn send_ps1(dev: &Value) -> String {
     // with a byte order mark: Windows PowerShell reads a file without one in the local code page
     format!("\u{feff}{}", format!(r#"# exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
 # 由 exterior 安装，每次启动时覆盖。
-$usage = '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID | --all [来源]> | exterior schedule list|add <HH:MM> <话题> <内容>|rm <编号> | exterior usage [5h|24h|7d]'
+$usage = '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID或名字 | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID或名字 | --all [来源]> | exterior schedule list|add <HH:MM> <话题> <内容>|rm <编号> | exterior usage [5h|24h|7d]'
 $cmd = [string]$args[0]; $to = ''; $text = ''
 if ($cmd -eq 'send' -and $args.Count -ge 3) {{ $to = [string]$args[1]; $text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }}
 elseif ($cmd -eq 'watch') {{ if ($args.Count -ge 2) {{ $to = ($args[1..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }} }}

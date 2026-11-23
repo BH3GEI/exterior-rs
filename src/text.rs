@@ -318,7 +318,8 @@ pub const NO_DRAFTS: &str = "没有待处理的草稿";
 pub fn draft_saved(chat: &str, id: &str) -> String { format!("已写入草稿 #{id}（{chat}），等 Yao 在 brief 上处理") }
 pub fn draft_removed(id: &str) -> String { format!("已忽略草稿 #{id}") }
 pub fn draft_no_chat(c: &str) -> String { format!("brief 里没有名为「{c}」的会话；请用会话 ID（GET /api/chats 可查）") }
-pub fn draft_many_chats(c: &str, ids: &str) -> String { format!("名为「{c}」的会话不止一个：{ids}；请用会话 ID") }
+pub fn draft_many_chats(c: &str, ids: &str) -> String { format!("名为「{c}」的会话不止一个：{ids}；请改用其中一个会话 ID") }
+pub fn chat_candidates(c: &str, l: &str) -> String { format!("没有正好叫「{c}」的会话。名字相近的有：{l}；请用完整名字或会话 ID") }
 pub const WATCH_BATCH_USAGE: &str = "用法：exterior watch [会话ID | --all 来源] --batch 30m（单位 s、m、h；off 恢复默认）";
 pub fn watch_batch_set(secs: u64) -> String {
     if secs == 0 { "攒批恢复默认：会话静下来 20 秒（最长 2 分钟）就交给你".into() } else { format!("攒批时长设为 {}：这段时间内的新消息攒成一批交给你", dur(secs)) }

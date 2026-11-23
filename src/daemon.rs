@@ -278,6 +278,8 @@ pub fn watch(from: &str, chat: &str, on: bool) -> Result<String, String> {
         return Ok(text::watch_flushed(if want.is_empty() { None } else { Some(want.as_str()) }));
     }
     let chat = watch_entry(&chat);
+    // a name instead of an id: the one chat with that name, or the candidates to choose from
+    let chat = if chat.is_empty() || chat.starts_with('-') || chat.starts_with("all") || chat.starts_with(brief::TOPIC_PREFIX) { chat } else { resolve_chat(&chat)? };
     let chat = chat.as_str();
     if chat.is_empty() || chat == "--list" {
         return Ok(if batch.is_some() && chat.is_empty() { said } else { format!("{}{}", text::watching(&list), text::watch_batch_note(batch_now)) });
@@ -459,14 +461,34 @@ pub fn draft_cmd(to: &str, body: &str) -> Result<String, String> {
     }
 }
 
-/// A chat id as it is ("…@chatroom", "wxid_…", "tg:…"), or a chat's name looked up in brief (it must be the only one
-/// with that name).
-fn draft_chat(c: &str) -> Result<String, String> {
-    if c.contains('@') || c.contains(':') || c.starts_with("wxid_") { return Ok(c.to_string()); }
+/// A chat by its id, or by its name (a group's name, a contact's remark) looked up in brief. A name must match exactly
+/// one chat; otherwise the candidates are listed for the user to pick, nothing is guessed.
+fn draft_chat(c: &str) -> Result<String, String> { resolve_chat(c) }
+
+fn resolve_chat(c: &str) -> Result<String, String> {
+    let c = c.trim();
     let v = brief::get(&format!("/api/chats?q={}&limit=50", urlenc(c))).unwrap_or(Value::Null);
     let l = v.as_array().cloned().or_else(|| v["chats"].as_array().cloned()).unwrap_or_default();
-    let ids: Vec<String> = l.iter().filter(|x| x["name"].as_str().map(str::trim) == Some(c)).filter_map(|x| x["chat"].as_str().or(x["id"].as_str()).map(String::from)).collect();
-    match ids.len() { 1 => Ok(ids[0].clone()), 0 => Err(text::draft_no_chat(c)), _ => Err(text::draft_many_chats(c, &ids.join("、"))) }
+    let found: Vec<(String, String)> = l.iter().filter_map(|x| Some((x["chat"].as_str().or(x["id"].as_str())?.to_string(), x["name"].as_str().unwrap_or("").trim().to_string()))).collect();
+    pick_chat(c, &found)
+}
+
+/// The choice among brief's search results (id, name) for what the user wrote.
+fn pick_chat(c: &str, found: &[(String, String)]) -> Result<String, String> {
+    if found.iter().any(|(id, _)| id == c) { return Ok(c.to_string()); }
+    let exact: Vec<&(String, String)> = found.iter().filter(|(_, n)| n == c).collect();
+    let list = |l: &[&(String, String)]| l.iter().map(|(id, n)| format!("{n}（{id}）")).collect::<Vec<_>>().join("、");
+    match exact.len() {
+        1 => Ok(exact[0].0.clone()),
+        0 => {
+            // something that looks like an id (ASCII, no spaces) is taken as one; a name nobody has is not guessed at
+            let id_like = !c.is_empty() && c.is_ascii() && !c.contains(char::is_whitespace);
+            if id_like { return Ok(c.to_string()); }
+            let near: Vec<&(String, String)> = found.iter().take(10).collect();
+            Err(if near.is_empty() { text::draft_no_chat(c) } else { text::chat_candidates(c, &list(&near)) })
+        }
+        _ => Err(text::draft_many_chats(c, &list(&exact))),
+    }
 }
 
 fn urlenc(s: &str) -> String {
@@ -1582,6 +1604,17 @@ mod tests {
         assert_eq!(split_batch("1@chatroom").unwrap(), ("1@chatroom".into(), None));
         assert!(split_batch("--batch x").is_err());
         assert_eq!(crate::text::watch_batch_note(1800), "（攒批时长 30 分钟）");
+    }
+    #[test]
+    fn chat_by_name() {
+        let f = vec![("1@chatroom".to_string(), "内存采购".to_string()), ("2@chatroom".into(), "内存采购二群".into()),
+                     ("3@chatroom".into(), "同名".into()), ("4@chatroom".into(), "同名".into())];
+        assert_eq!(pick_chat("内存采购", &f).unwrap(), "1@chatroom");
+        assert_eq!(pick_chat("2@chatroom", &f).unwrap(), "2@chatroom");
+        assert!(pick_chat("同名", &f).unwrap_err().contains("3@chatroom"));
+        assert!(pick_chat("内存", &f).unwrap_err().contains("内存采购（1@chatroom）"), "a partial name lists candidates");
+        assert_eq!(pick_chat("zenghaochen", &[]).unwrap(), "zenghaochen", "an id-like word is an id");
+        assert!(pick_chat("不存在的群", &[]).is_err());
     }
     #[test]
     fn schedule_args() {
