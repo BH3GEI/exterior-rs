@@ -258,14 +258,35 @@ pub fn watch(from: &str, chat: &str, on: bool) -> Result<String, String> {
     let sessions = LIVE.lock().unwrap().clone().ok_or(text::NOT_READY)?;
     if !sessions.lock().unwrap().get(from).map(|s| !s.deleted).unwrap_or(false) { return Err(text::relay_from_unknown(from)); }
     let mut list: Vec<String> = store::note(from)["watch"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
-    let chat = chat.trim();
-    if chat.is_empty() { return Ok(text::watching(&list)); }
+    let chat = watch_entry(chat);
+    let chat = chat.as_str();
+    if chat.is_empty() || chat == "--list" { return Ok(text::watching(&list)); }
     if chat.starts_with(brief::TOPIC_PREFIX) { return Err(text::WATCH_TOPIC.into()); }
-    list.retain(|c| c != chat);
-    if on { list.push(chat.to_string()); }
+    // with "all" on, unwatching one chat keeps it out ("-<chat>"); watching it again takes it back in
+    let excluded = format!("-{chat}");
+    let covered_by_all = list.iter().any(|e| e.starts_with("all"));
+    list.retain(|c| c != chat && *c != excluded);
+    if on { list.push(chat.to_string()); } else if covered_by_all && !chat.starts_with("all") { list.push(excluded); }
     store::note_set(from, "watch", json!(list));
     store::log(&format!("{from}: {} {chat}", if on { "watch" } else { "unwatch" }));
     Ok(if on { text::watch_on(chat) } else { text::watch_off(chat) })
+}
+
+/// What `exterior watch` was given, as kept in the list: a chat id; or "--all [source]" → "all" (every chat, of every
+/// source) or "all:<source>" (every chat of that source, e.g. all:wechat), new chats included.
+fn watch_entry(arg: &str) -> String {
+    let a = arg.trim();
+    match a.strip_prefix("--all") {
+        Some(rest) => { let src = rest.trim().trim_start_matches("source=").trim(); if src.is_empty() { "all".into() } else { format!("all:{src}") } }
+        None => a.to_string(),
+    }
+}
+
+/// Whether a watch entry covers a message (its chat and source). The Telegram topics exterior serves are never
+/// watched: they talk to each other with exterior send.
+fn watch_covers(entry: &str, chat: &str, source: &str) -> bool {
+    if chat.starts_with(brief::TOPIC_PREFIX) { return false; }
+    entry == chat || entry == "all" || entry.strip_prefix("all:").is_some_and(|s| s == source)
 }
 
 /// A watched chat's new messages wait this long for more before going to the agent, and at most WATCH_MAX.
@@ -285,11 +306,11 @@ fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
     let latest = || brief::get("/api/messages?limit=1").and_then(|v| v.as_array().and_then(|a| a.iter().filter_map(|m| m["id"].as_u64()).max()));
     let mut last = store::state("watch_after").as_u64().filter(|l| *l > 0).or_else(latest).unwrap_or(0);
     loop {
-        let mut watched: HashMap<String, Vec<String>> = HashMap::new();
+        // topic → its watch entries (chat ids, "all", "all:<source>")
+        let mut watched: Vec<(String, Vec<String>)> = vec![];
         for n in store::notes().iter().filter(|n| n["deleted"] != true) {
-            for c in n["watch"].as_array().into_iter().flatten().filter_map(|c| c.as_str()) {
-                watched.entry(c.to_string()).or_default().push(n["topic"].as_str().unwrap_or("").to_string());
-            }
+            let l: Vec<String> = n["watch"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
+            if !l.is_empty() { watched.push((n["topic"].as_str().unwrap_or("").to_string(), l)); }
         }
         if watched.is_empty() && pend.is_empty() {
             // nothing followed: keep the mark current, so a new watch starts from now, not from old messages
@@ -300,8 +321,10 @@ fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
         match brief::call("GET", &format!("/api/wait?after_id={last}&timeout=15&limit=500"), None) {
             Ok(v) => for m in v.as_array().into_iter().flatten() {
                 last = last.max(m["id"].as_u64().unwrap_or(0));
-                let chat = m["chat"].as_str().unwrap_or("");
-                for tid in watched.get(chat).into_iter().flatten() {
+                let (chat, source) = (m["chat"].as_str().unwrap_or(""), m["source"].as_str().unwrap_or(""));
+                // each topic once, however many of its entries cover the chat
+                let out = format!("-{chat}");
+                for (tid, _) in watched.iter().filter(|(_, l)| !l.contains(&out) && l.iter().any(|e| watch_covers(e, chat, source))) {
                     let name = m["chat_name"].as_str().filter(|n| !n.is_empty()).unwrap_or(chat).to_string();
                     let e = pend.entry(tid.clone()).or_insert_with(|| (name, Vec::new(), Instant::now(), Instant::now()));
                     e.1.push(watch_line(m));
@@ -318,6 +341,75 @@ fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
             handle(&sessions, &own, &tx, &tid, &format!("{name} {} {}\n{}", params::get("relay_mark"), text::WATCH_HEADER, lines.join("\n")));
         }
     }
+}
+
+/// `exterior topic open <name>` / `exterior topic close <name or chat>`: a topic made as the user (brief user_topic)
+/// for another agent to work in, and closing it when the work is done (brief release).
+pub fn topic_cmd(what: &str, name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() { return Err(text::TOPIC_USAGE.into()); }
+    let err = |(c, v): (u16, Value)| format!("{c} {}", v["error"].as_str().or(v["message"].as_str()).map(String::from).unwrap_or_else(|| v.to_string()));
+    match what {
+        "open" => {
+            let v = brief::post("/api/bots/user_topic", json!({"name": name})).map_err(err)?;
+            if let Some(s) = LIVE.lock().unwrap().clone() { refresh(&s); }
+            Ok(text::topic_opened(name, v["chat"].as_str().unwrap_or("?"), v["link"].as_str().unwrap_or("")))
+        }
+        "close" => {
+            let to = alias(name);
+            let chat = if to.starts_with(brief::TOPIC_PREFIX) { to.clone() } else {
+                let sessions = LIVE.lock().unwrap().clone().ok_or(text::NOT_READY)?;
+                let ss = sessions.lock().unwrap();
+                ss.values().find(|t| !t.deleted && t.name == to).map(|t| t.tid.clone()).ok_or_else(|| text::relay_to_unknown(&to, ""))?
+            };
+            brief::post("/api/bots/release", json!({"chat": chat})).map_err(err)?;
+            Ok(text::topic_closed(&to, &chat))
+        }
+        _ => Err(text::TOPIC_USAGE.into()),
+    }
+}
+
+/// `exterior draft <chat id or name> <text>`, `exterior draft list`, `exterior draft rm <id>`: brief's drafts, the
+/// replies the user reads and sends himself.
+pub fn draft_cmd(to: &str, body: &str) -> Result<String, String> {
+    let err = |(c, v): (u16, Value)| format!("{c} {}", v["error"].as_str().or(v["message"].as_str()).map(String::from).unwrap_or_else(|| v.to_string()));
+    let to = to.trim();
+    match to {
+        "" => Err(text::DRAFT_USAGE.into()),
+        "list" => {
+            let v = brief::call("GET", "/api/drafts", None).map_err(err)?;
+            let l = v.as_array().cloned().or_else(|| v["drafts"].as_array().cloned()).unwrap_or_default();
+            if l.is_empty() { return Ok(text::NO_DRAFTS.into()); }
+            Ok(l.iter().map(|d| format!("#{} {} · {}", d["id"], d["chat_name"].as_str().or(d["chat"].as_str()).unwrap_or("?"),
+                d["body"].as_str().unwrap_or("").replace('\n', " ").chars().take(60).collect::<String>())).collect::<Vec<_>>().join("\n"))
+        }
+        "rm" => {
+            let id = body.trim().trim_start_matches('#');
+            if id.is_empty() { return Err(text::DRAFT_USAGE.into()); }
+            brief::call("DELETE", &format!("/api/drafts/{id}"), None).map_err(err)?;
+            Ok(text::draft_removed(id))
+        }
+        chat => {
+            if body.trim().is_empty() { return Err(text::DRAFT_USAGE.into()); }
+            let id = draft_chat(chat)?;
+            let v = brief::post("/api/drafts", json!({"chat": id, "body": body})).map_err(err)?;
+            Ok(text::draft_saved(&id, &v["id"].to_string()))
+        }
+    }
+}
+
+/// A chat id as it is ("…@chatroom", "wxid_…", "tg:…"), or a chat's name looked up in brief (it must be the only one
+/// with that name).
+fn draft_chat(c: &str) -> Result<String, String> {
+    if c.contains('@') || c.contains(':') || c.starts_with("wxid_") { return Ok(c.to_string()); }
+    let v = brief::get(&format!("/api/chats?q={}&limit=50", urlenc(c))).unwrap_or(Value::Null);
+    let l = v.as_array().cloned().or_else(|| v["chats"].as_array().cloned()).unwrap_or_default();
+    let ids: Vec<String> = l.iter().filter(|x| x["name"].as_str().map(str::trim) == Some(c)).filter_map(|x| x["chat"].as_str().or(x["id"].as_str()).map(String::from)).collect();
+    match ids.len() { 1 => Ok(ids[0].clone()), 0 => Err(text::draft_no_chat(c)), _ => Err(text::draft_many_chats(c, &ids.join("、"))) }
+}
+
+fn urlenc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 pub fn relay(from: &str, to: &str, body: &str) -> Result<String, String> {
@@ -1361,6 +1453,20 @@ mod tests {
         assert!(!due_compact(&json!({"turn_end": 5000, "context": 150000, "status": "idle", "idle_compacted": 1000, "idle_compact_wait": true}), 99999, true, 50, 100000));
     }
 
+    #[test]
+    fn watch_all() {
+        assert_eq!(watch_entry("--all"), "all");
+        assert_eq!(watch_entry("--all wechat"), "all:wechat");
+        assert_eq!(watch_entry("--all source=wechat"), "all:wechat");
+        assert_eq!(watch_entry(" 123@chatroom "), "123@chatroom");
+        assert!(watch_covers("all:wechat", "999@chatroom", "wechat"));
+        assert!(!watch_covers("all:wechat", "tg:u1", "telegram"));
+        assert!(watch_covers("all", "tg:u1", "telegram"));
+        assert!(!watch_covers("all", "tgbot:5", "telegram"), "exterior's own topics are never watched");
+        assert!(watch_covers("1@chatroom", "1@chatroom", "wechat") && !watch_covers("1@chatroom", "2@chatroom", "wechat"));
+        assert!(crate::text::watching(&["all:wechat".into(), "tg:u1".into(), "-2@chatroom".into()]).contains("wechat 的全部会话"));
+        assert!(crate::text::watching(&["all:wechat".into(), "-2@chatroom".into()]).contains("不盯 1 个：2@chatroom"));
+    }
     #[test]
     fn aliases() {
         let a = "全局=Polaris；全局二号=Comes; x = y";

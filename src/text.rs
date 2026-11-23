@@ -274,9 +274,36 @@ pub const NOT_READY: &str = "exterior 尚未就绪";
 /// a scheduled message handed to a topic's agent (the 定时消息 setting)
 pub fn scheduled(content: &str) -> String { format!("定时消息已交给 agent：{content}") }
 pub const SCHEDULE_FROM: &str = "定时";
-pub fn watching(list: &[String]) -> String { if list.is_empty() { "没有在盯的会话".into() } else { format!("正在盯：{}", list.join("、")) } }
-pub fn watch_on(c: &str) -> String { format!("开始盯 {c}：有新消息时，exterior 会攒一小批交给你") }
-pub fn watch_off(c: &str) -> String { format!("不再盯 {c}") }
+/// A watch entry as said to the agent: "all" and "all:wechat" in words.
+fn watch_name(c: &str) -> String {
+    if c == "all" { "所有来源的全部会话（含以后新出现的）".into() }
+    else if let Some(s) = c.strip_prefix("all:") { format!("{s} 的全部会话（含以后新出现的）") } else { c.to_string() }
+}
+pub fn watching(list: &[String]) -> String {
+    if list.is_empty() { return "没有在盯的会话".into(); }
+    let all: Vec<String> = list.iter().filter(|c| c.starts_with("all")).map(|c| watch_name(c)).collect();
+    let one: Vec<&String> = list.iter().filter(|c| !c.starts_with("all") && !c.starts_with('-')).collect();
+    let out: Vec<&str> = list.iter().filter_map(|c| c.strip_prefix('-')).collect();
+    let mut t = String::from("正在盯：");
+    if !all.is_empty() { t.push_str(&all.join("、")); }
+    if !one.is_empty() {
+        if !all.is_empty() { t.push_str("；另外单独挂的 "); }
+        t.push_str(&format!("{} 个会话：{}", one.len(), one.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")));
+    }
+    if !out.is_empty() { t.push_str(&format!("；不盯 {} 个：{}", out.len(), out.join("、"))); }
+    t
+}
+pub fn watch_on(c: &str) -> String { format!("开始盯 {}：有新消息时，exterior 会攒一小批交给你", watch_name(c)) }
+pub fn watch_off(c: &str) -> String { format!("不再盯 {}", watch_name(c)) }
+pub const TOPIC_USAGE: &str = "用法：exterior topic open <话题名> | exterior topic close <话题名或 tgbot:编号>";
+pub fn topic_opened(name: &str, chat: &str, link: &str) -> String { format!("已开话题「{name}」：{chat} {link}（exterior 会接管并启动 agent；用 exterior send {name} <任务> 交代任务）") }
+pub fn topic_closed(name: &str, chat: &str) -> String { format!("已关闭话题「{name}」（{chat}）") }
+pub const DRAFT_USAGE: &str = "用法：exterior draft <会话ID或名字> <内容> | exterior draft list | exterior draft rm <草稿编号>";
+pub const NO_DRAFTS: &str = "没有待处理的草稿";
+pub fn draft_saved(chat: &str, id: &str) -> String { format!("已写入草稿 #{id}（{chat}），等 Yao 在 brief 上处理") }
+pub fn draft_removed(id: &str) -> String { format!("已忽略草稿 #{id}") }
+pub fn draft_no_chat(c: &str) -> String { format!("brief 里没有名为「{c}」的会话；请用会话 ID（GET /api/chats 可查）") }
+pub fn draft_many_chats(c: &str, ids: &str) -> String { format!("名为「{c}」的会话不止一个：{ids}；请用会话 ID") }
 pub const WATCH_TOPIC: &str = "Telegram 话题之间请用 exterior send";
 pub const WATCH_HEADER: &str = "（exterior watch 收到的新消息）";
 pub fn idle_compact(min: u64, ctx: u64) -> String { format!("exterior 闲置压缩：本话题已闲置 {min} 分钟，上下文约 {} 万 token，在缓存过期前发送 /compact（设置项 idle_compact_min、idle_compact_tokens）", ctx / 10000) }

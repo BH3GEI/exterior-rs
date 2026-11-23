@@ -500,6 +500,8 @@ fn respond(mut req: Request) {
                     "watch" => daemon::watch(&g("from"), &g("to"), true),
                     "unwatch" => daemon::watch(&g("from"), &g("to"), false),
                     "usage" => crate::usage::span(&g("to")).map(crate::usage::report).ok_or_else(|| text::USAGE_SPAN.to_string()),
+                    "topic" => daemon::topic_cmd(&g("to"), &g("text")),
+                    "draft" => daemon::draft_cmd(&g("to"), &g("text")),
                     _ => daemon::relay(&g("from"), &g("to"), &g("text")),
                 };
                 match r { Ok(m) => (200, m), Err(e) => (400, e) }
