@@ -121,12 +121,19 @@ fn send_script(dev: &Value) -> String { send_sh(dev, host::is_local(dev) && cfg!
 /// command line: the topic name is percent-encoded byte by byte by the script, and the text goes in through stdin.
 fn send_sh(dev: &Value, windows: bool) -> String {
     let (key, url) = (host::quote(&format!("{}/.exterior-key", root(dev))), host::quote(&format!("{}/api/send", self_url(dev))));
-    let post = if windows {
+    // while exterior restarts the gateway refuses or answers 502/503: wait and try again; an empty answer is no answer
+    let opts = "--connect-timeout 10 --max-time 600 --retry 6 --retry-delay 5 --retry-connrefused";
+    let call = if windows {
         format!(r#"enc() {{ printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g'; }}
-printf '%s' "$text" | curl -sS --fail-with-body -H "Authorization: Bearer $(cat {key})" --data "cmd=$cmd" --data "from=$(enc "$EXTERIOR_TOPIC")" --data "to=$(enc "$to")" --data-urlencode "text@-" {url}"#)
+out=$(printf '%s' "$text" | curl -sS {opts} --fail-with-body -H "Authorization: Bearer $(cat {key})" --data "cmd=$cmd" --data "from=$(enc "$EXTERIOR_TOPIC")" --data "to=$(enc "$to")" --data-urlencode "text@-" {url})"#)
     } else {
-        format!(r#"exec curl -sS --fail-with-body -H "Authorization: Bearer $(cat {key})" --data-urlencode "cmd=$cmd" --data-urlencode "from=$EXTERIOR_TOPIC" --data-urlencode "to=$to" --data-urlencode "text=$text" {url}"#)
+        format!(r#"out=$(curl -sS {opts} --fail-with-body -H "Authorization: Bearer $(cat {key})" --data-urlencode "cmd=$cmd" --data-urlencode "from=$EXTERIOR_TOPIC" --data-urlencode "to=$to" --data-urlencode "text=$text" {url})"#)
     };
+    let post = format!(r#"{call}
+rc=$?
+[ -n "$out" ] && printf '%s\n' "$out"
+if [ $rc -eq 0 ] && [ -z "$out" ]; then echo 'exterior 没有回应（可能正在重启），这次没有生效，请稍后再试一次' >&2; exit 1; fi
+exit $rc"#);
     format!(r#"#!/bin/sh
 # exterior send <话题名> <内容>：经 exterior 给其他话题发消息，自动署名。内容里写 ![说明](路径) 可附图片或文件。
 # exterior watch <会话ID> / exterior unwatch <会话ID>：让 exterior 盯住一个会话（如微信群），新消息自动交给你。
@@ -136,11 +143,16 @@ printf '%s' "$text" | curl -sS --fail-with-body -H "Authorization: Bearer $(cat 
 # exterior draft <会话ID或名字> <内容>：写一条 brief 草稿等 Yao 处理；exterior draft list；exterior draft rm <编号>。
 # exterior schedule list / add <HH:MM> <话题名> <内容> / rm <编号>：每天定时发给某个话题的消息（旧金山时间）。
 # 由 exterior 安装，每次启动时覆盖。
-usage() {{ echo '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID或名字 | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID或名字 | --all [来源]> | exterior schedule list|add <HH:MM> <话题> <内容>|rm <编号> | exterior usage [5h|24h|7d]' >&2; exit 2; }}
+USAGE='用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID或名字 | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID或名字 | --all [来源]> | exterior schedule list|add <HH:MM> <话题> <内容>|rm <编号> | exterior usage [5h|24h|7d]'
+usage() {{ echo "$USAGE" >&2; exit 2; }}
+# --help / -h anywhere: the usage, nothing sent
+# (send: only in place of the topic; what it sends may say --help)
+if [ "$1" = send ]; then set -- "$@"; case "${{2:-}}" in -h|--help) echo "$USAGE"; exit 0 ;; esac
+else for a in "$@"; do case "$a" in -h|--help) echo "$USAGE"; exit 0 ;; esac; done; fi
 case "$1" in
   send) [ $# -ge 3 ] || usage; to=$2; shift 2; cmd=send; text="$*" ;;
   watch) cmd=watch; shift; to="$*"; text= ;;
-  unwatch) [ $# -ge 2 ] && [ $# -le 3 ] || usage; cmd=unwatch; shift; to="$*"; text= ;;
+  unwatch) [ $# -ge 2 ] || usage; cmd=unwatch; shift; to="$*"; text= ;;
   usage) [ $# -le 2 ] || usage; cmd=usage; to=${{2:-}}; text= ;;
   topic) [ $# -ge 3 ] || usage; cmd=topic; to=$2; shift 2; text="$*" ;;
   draft) [ $# -ge 2 ] || usage; cmd=draft; to=$2; shift 2; text="$*" ;;
@@ -159,9 +171,11 @@ fn send_ps1(dev: &Value) -> String {
 # 由 exterior 安装，每次启动时覆盖。
 $usage = '用法：exterior send <话题名> <内容> | exterior topic open|close <话题名> | exterior draft <会话> <内容> | exterior draft list | exterior draft rm <编号> | exterior watch [会话ID或名字 | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID或名字 | --all [来源]> | exterior schedule list|add <HH:MM> <话题> <内容>|rm <编号> | exterior usage [5h|24h|7d]'
 $cmd = [string]$args[0]; $to = ''; $text = ''
+$help = if ($cmd -eq 'send') {{ $args.Count -ge 2 -and ($args[1] -eq '--help' -or $args[1] -eq '-h') }} else {{ [bool]($args | Where-Object {{ $_ -eq '--help' -or $_ -eq '-h' }}) }}
+if ($help) {{ [Console]::Out.WriteLine($usage); exit 0 }}
 if ($cmd -eq 'send' -and $args.Count -ge 3) {{ $to = [string]$args[1]; $text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }}
 elseif ($cmd -eq 'watch') {{ if ($args.Count -ge 2) {{ $to = ($args[1..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }} }}
-elseif ($cmd -eq 'unwatch' -and $args.Count -ge 2 -and $args.Count -le 3) {{ $to = ($args[1..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }}
+elseif ($cmd -eq 'unwatch' -and $args.Count -ge 2) {{ $to = ($args[1..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }}
 elseif ($cmd -eq 'usage' -and $args.Count -le 2) {{ if ($args.Count -eq 2) {{ $to = [string]$args[1] }} }}
 elseif (($cmd -eq 'topic' -and $args.Count -ge 3) -or (($cmd -eq 'draft' -or $cmd -eq 'schedule') -and $args.Count -ge 2)) {{ $to = [string]$args[1]; if ($args.Count -ge 3) {{ $text = ($args[2..($args.Count - 1)] | ForEach-Object {{ [string]$_ }}) -join ' ' }} }}
 else {{ [Console]::Error.WriteLine($usage); exit 2 }}
@@ -254,8 +268,8 @@ mod tests {
             got.lock().unwrap().clear();
             let log = dir.join(format!("args-{windows}"));
             let script = super::send_sh(&dev, windows);
-            let start = script.rfind(" '").unwrap();
-            let script = format!("{} '{url}'\n", &script[..start]);
+            let script = script.replace(&crate::host::quote(&format!("{}/api/send", super::self_url(&dev))), &format!("'{url}'"));
+            assert!(script.contains(&url));
             let f = dir.join("exterior");
             std::fs::write(&f, script).unwrap();
             let path = format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap_or_default());
@@ -275,13 +289,15 @@ mod tests {
             assert_eq!(run(&["draft", "123@chatroom", "你好", "明天见"]), Some(0));
             assert_eq!(run(&["topic", "open"]), Some(2));
             assert_eq!(run(&["watch", "--flush"]), Some(0));
+            assert_eq!(run(&["topic", "open", "--help"]), Some(0), "help, nothing sent");
+            assert_eq!(run(&["send", "Polaris", "用", "--help", "看用法"]), Some(0), "send still sends what says --help");
             assert_eq!(run(&["schedule", "add", "07:30", "exterior 开发", "看看"]), Some(0));
             assert_eq!(run(&["schedule"]), Some(2));
             let g: Vec<_> = got.lock().unwrap().iter().map(|b| form(b)).collect();
             let want = |cmd: &str, to: &str, text: &str| [("cmd", cmd), ("from", "tgbot:1"), ("to", to), ("text", text)].map(|(k, v)| (k.to_string(), v.to_string())).into_iter().collect::<std::collections::HashMap<_, _>>();
             assert_eq!(g, vec![want("watch", "wx@chatroom", ""), want("send", "全局", "a b"),
                                want("send", "exterior 开发", "中文 & 符号 = %20 + \"引号\"\n第二行 '单引号'"), want("watch", "", ""), want("usage", "7d", ""),
-                               want("watch", "--all wechat", ""), want("topic", "open", "新任务"), want("draft", "list", ""), want("draft", "123@chatroom", "你好 明天见"), want("watch", "--flush", ""), want("schedule", "add", "07:30 exterior 开发 看看")], "windows {windows}");
+                               want("watch", "--all wechat", ""), want("topic", "open", "新任务"), want("draft", "list", ""), want("draft", "123@chatroom", "你好 明天见"), want("watch", "--flush", ""), want("send", "Polaris", "用 --help 看用法"), want("schedule", "add", "07:30 exterior 开发 看看")], "windows {windows}");
             // on Windows nothing but ASCII may reach curl's command line
             let args = std::fs::read_to_string(&log).unwrap();
             assert_eq!(args.is_ascii(), windows, "{args}");

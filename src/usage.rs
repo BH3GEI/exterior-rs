@@ -9,12 +9,14 @@ use std::sync::Mutex;
 
 /// One model's use in one turn, as the agent reported it.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Use { pub model: String, pub input: u64, pub output: u64, pub cache_read: u64, pub cache_write: u64, pub usd: Option<f64> }
+pub struct Use { pub model: String, pub input: u64, pub output: u64, pub cache_read: u64, pub cache_write: u64, pub usd: Option<f64>,
+                 /// model calls (requests) in the turn, when the agent says (claude: num_turns)
+                 pub calls: u64 }
 
 impl Use {
     fn tokens(&self) -> u64 { self.input + self.output + self.cache_read + self.cache_write }
     fn add(&mut self, o: &Use) {
-        self.input += o.input; self.output += o.output; self.cache_read += o.cache_read; self.cache_write += o.cache_write;
+        self.input += o.input; self.output += o.output; self.cache_read += o.cache_read; self.cache_write += o.cache_write; self.calls += o.calls;
         if let Some(u) = o.usd { self.usd = Some(self.usd.unwrap_or(0.0) + u); }
     }
 }
@@ -34,13 +36,13 @@ pub fn from_claude_result(v: &Value) -> Vec<Use> {
             model: name.clone(),
             input: u["inputTokens"].as_u64().unwrap_or(0), output: u["outputTokens"].as_u64().unwrap_or(0),
             cache_read: u["cacheReadInputTokens"].as_u64().unwrap_or(0), cache_write: u["cacheCreationInputTokens"].as_u64().unwrap_or(0),
-            usd: u["costUSD"].as_f64(),
+            usd: u["costUSD"].as_f64(), calls: 0,
         }).filter(|u| u.tokens() > 0).collect();
     }
     // older claude: this turn's main-model usage only, model unknown
     let u = &v["usage"];
     let one = Use { model: "?".into(), input: u["input_tokens"].as_u64().unwrap_or(0), output: u["output_tokens"].as_u64().unwrap_or(0),
-                    cache_read: u["cache_read_input_tokens"].as_u64().unwrap_or(0), cache_write: u["cache_creation_input_tokens"].as_u64().unwrap_or(0), usd: None };
+                    cache_read: u["cache_read_input_tokens"].as_u64().unwrap_or(0), cache_write: u["cache_creation_input_tokens"].as_u64().unwrap_or(0), usd: None, calls: 0 };
     if one.tokens() > 0 { vec![one] } else { vec![] }
 }
 
@@ -51,7 +53,7 @@ pub fn from_pi(msg: &Value) -> Option<Use> {
     let one = Use { model: if model.is_empty() { "?".into() } else { model },
                     input: u["input"].as_u64().unwrap_or(0), output: u["output"].as_u64().unwrap_or(0),
                     cache_read: u["cacheRead"].as_u64().unwrap_or(0), cache_write: u["cacheWrite"].as_u64().unwrap_or(0),
-                    usd: u["cost"]["total"].as_f64().filter(|c| *c > 0.0) };
+                    usd: u["cost"]["total"].as_f64().filter(|c| *c > 0.0), calls: 1 };
     (one.tokens() > 0).then_some(one)
 }
 
@@ -61,7 +63,7 @@ pub fn from_codex(last: &Value, model: &str) -> Option<Use> {
     let cached = last["cachedInputTokens"].as_u64().unwrap_or(0);
     let one = Use { model: if model.is_empty() { "?".into() } else { model.into() }, input: input.saturating_sub(cached),
                     output: last["outputTokens"].as_u64().unwrap_or(0), cache_read: cached,
-                    cache_write: last["cacheWriteInputTokens"].as_u64().unwrap_or(0), usd: None };
+                    cache_write: last["cacheWriteInputTokens"].as_u64().unwrap_or(0), usd: None, calls: 1 };
     (one.tokens() > 0).then_some(one)
 }
 
@@ -69,7 +71,7 @@ pub fn from_codex(last: &Value, model: &str) -> Option<Use> {
 pub fn from_agy_acp(u: &Value, model: &str) -> Option<Use> {
     let g = |k: &str| u[k].as_u64().unwrap_or(0);
     let one = Use { model: if model.is_empty() { "agy".into() } else { model.into() }, input: g("inputTokens"),
-                    output: g("outputTokens") + g("thoughtTokens"), cache_read: g("cachedReadTokens"), cache_write: g("cachedWriteTokens"), usd: None };
+                    output: g("outputTokens") + g("thoughtTokens"), cache_read: g("cachedReadTokens"), cache_write: g("cachedWriteTokens"), usd: None, calls: 0 };
     (one.tokens() > 0).then_some(one)
 }
 
@@ -148,6 +150,7 @@ pub fn record(topic: &str, dev: &str, agent: &str, acct: &str, uses: &[Use]) {
             let mut v = json!({"t": now, "topic": topic, "dev": dev, "agent": agent, "acct": acct, "model": u.model,
                                "in": u.input, "out": u.output, "cr": u.cache_read, "cw": u.cache_write});
             if let Some(d) = u.usd { v["usd"] = json!((d * 1e6).round() / 1e6); }
+            if u.calls > 0 { v["req"] = json!(u.calls); }
             let _ = writeln!(f, "{v}");
         }
     }
@@ -206,7 +209,7 @@ fn rank(lines: &[Value], key: &str) -> Vec<Row> {
         let r = m.entry(name.clone()).or_insert_with(|| Row { name, turns: 0, used: Use::default() });
         r.turns += 1;
         r.used.add(&Use { model: String::new(), input: v["in"].as_u64().unwrap_or(0), output: v["out"].as_u64().unwrap_or(0),
-                          cache_read: v["cr"].as_u64().unwrap_or(0), cache_write: v["cw"].as_u64().unwrap_or(0), usd: v["usd"].as_f64() });
+                          cache_read: v["cr"].as_u64().unwrap_or(0), cache_write: v["cw"].as_u64().unwrap_or(0), usd: v["usd"].as_f64(), calls: v["req"].as_u64().unwrap_or(0) });
     }
     let mut rows: Vec<Row> = m.into_values().collect();
     // dollars first where the agent gave them (claude, pi), then tokens
@@ -285,7 +288,7 @@ fn summary(lines: &[Value], quota: &Value, now: u64, secs: u64) -> String {
     };
     let total = |s: u64| {
         let mut u = Use::default();
-        let n = lines.iter().filter(|v| v["t"].as_u64().unwrap_or(0) + s >= now).map(|v| u.add(&Use { model: String::new(), input: v["in"].as_u64().unwrap_or(0), output: v["out"].as_u64().unwrap_or(0), cache_read: v["cr"].as_u64().unwrap_or(0), cache_write: v["cw"].as_u64().unwrap_or(0), usd: v["usd"].as_f64() })).count();
+        let n = lines.iter().filter(|v| v["t"].as_u64().unwrap_or(0) + s >= now).map(|v| u.add(&Use { model: String::new(), input: v["in"].as_u64().unwrap_or(0), output: v["out"].as_u64().unwrap_or(0), cache_read: v["cr"].as_u64().unwrap_or(0), cache_write: v["cw"].as_u64().unwrap_or(0), usd: v["usd"].as_f64(), calls: v["req"].as_u64().unwrap_or(0) })).count();
         (n, u)
     };
     out += "**合计**：";
@@ -295,8 +298,26 @@ fn summary(lines: &[Value], quota: &Value, now: u64, secs: u64) -> String {
     if recent.is_empty() { out += &format!("最近 {} 没有用量记录。\n", span_name(secs)); return out; }
     out += &format!("**最近 {}，按话题**\n\n{}\n", span_name(secs), table(&rank(&recent, "topic"), "话题", 15));
     out += &format!("**最近 {}，按订阅**\n\n{}\n", span_name(secs), table(&rank(&recent, "acct"), "订阅", 15));
-    out += "「折算」是 agent 自报的按标价折算的美元（claude、pi 有，codex 没有），只用来比较谁更费额度；订阅不按它扣费。「轮」按每轮每个模型计。\n";
+    out += &format!("**最近 {}，按模型**\n\n{}\n", span_name(secs), models_table(&recent));
+    out += "「折算」是 agent 自报的按标价折算的美元（claude、pi 有，codex、agy 没有），只用来比较谁更费额度；订阅不按它扣费（经 api-relay 的 Kimi 等包月模型也是）。「轮」按每轮每个模型计；「请求」是模型调用次数（claude 按每轮的 num_turns，codex、pi 每次调用记一次，agy 不报）。agy 的 Gemini 和 Claude/GPT 两组额度在「按模型」里分开看。\n";
     out
+}
+
+/// By model: turns, requests (when known) and tokens, the most tokens first.
+fn models_table(lines: &[Value]) -> String {
+    let mut m: Vec<(String, u64, Use)> = vec![];
+    for v in lines {
+        let name = v["model"].as_str().unwrap_or("?").to_string();
+        let u = Use { model: String::new(), input: v["in"].as_u64().unwrap_or(0), output: v["out"].as_u64().unwrap_or(0), cache_read: v["cr"].as_u64().unwrap_or(0),
+                      cache_write: v["cw"].as_u64().unwrap_or(0), usd: v["usd"].as_f64(), calls: v["req"].as_u64().unwrap_or(0) };
+        match m.iter_mut().find(|x| x.0 == name) { Some(x) => { x.1 += 1; x.2.add(&u); } None => m.push((name, 1, u)) }
+    }
+    m.sort_by(|a, b| b.2.tokens().cmp(&a.2.tokens()));
+    let mut t = String::from("| 模型 | 轮 | 请求 | 新输入 | 缓存读 | 输出 |\n|---|---|---|---|---|---|\n");
+    for (name, n, u) in m.iter().take(15) {
+        t += &format!("| {name} | {n} | {} | {} | {} | {} |\n", if u.calls > 0 { u.calls.to_string() } else { "—".into() }, tok(u.input), tok(u.cache_read), tok(u.output));
+    }
+    t
 }
 
 #[cfg(test)]
@@ -308,11 +329,11 @@ mod tests {
         let r = json!({"type": "result", "modelUsage": {"m": {"inputTokens": 999}}, "model_usage_since_last_result": {
             "claude-opus-5-5": {"inputTokens": 6, "outputTokens": 816, "cacheReadInputTokens": 602955, "cacheCreationInputTokens": 1308, "costUSD": 0.147399},
             "claude-haiku": {"inputTokens": 0, "outputTokens": 0}}});
-        assert_eq!(from_claude_result(&r), vec![Use { model: "claude-opus-5-5".into(), input: 6, output: 816, cache_read: 602955, cache_write: 1308, usd: Some(0.147399) }]);
+        assert_eq!(from_claude_result(&r), vec![Use { model: "claude-opus-5-5".into(), input: 6, output: 816, cache_read: 602955, cache_write: 1308, usd: Some(0.147399), calls: 0 }]);
         let old = json!({"type": "result", "usage": {"input_tokens": 3, "output_tokens": 4}});
         assert_eq!(from_claude_result(&old)[0].tokens(), 7);
         let pi = json!({"provider": "relay", "model": "auto", "usage": {"input": 10, "output": 5, "cacheRead": 100, "cacheWrite": 0, "cost": {"total": 0.01}}});
-        assert_eq!(from_pi(&pi), Some(Use { model: "relay/auto".into(), input: 10, output: 5, cache_read: 100, cache_write: 0, usd: Some(0.01) }));
+        assert_eq!(from_pi(&pi), Some(Use { model: "relay/auto".into(), input: 10, output: 5, cache_read: 100, cache_write: 0, usd: Some(0.01), calls: 1 }));
         let cx = from_codex(&json!({"inputTokens": 1000, "cachedInputTokens": 800, "outputTokens": 50}), "gpt-6").unwrap();
         assert_eq!((cx.input, cx.cache_read, cx.output), (200, 800, 50));
         let mut turn = vec![];
@@ -381,5 +402,8 @@ mod tests {
         assert!(!by_topic.contains("旧"));
         assert!(s.contains("24 小时 4 条、$8.00"), "{s}");
         assert!(summary(&[], &json!({}), now, 3600).contains("最近 1 小时 没有用量记录"));
+        let mut k = line(now - 5, "Scriba", "claude", None, 3000); k["model"] = json!("kimi/kimi-for-coding"); k["req"] = json!(4);
+        let s = summary(&[k.clone(), k], &json!({}), now, 3600);
+        assert!(s.contains("| kimi/kimi-for-coding | 2 | 8 | 6k |"), "{s}");
     }
 }

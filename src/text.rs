@@ -265,7 +265,12 @@ pub fn file_unsure(path: &str) -> String { sys_warn(&format!("文件可能没有
 /// Shown before a remote device's test result when its password cannot be used on this machine.
 pub const NO_SSHPASS: &str = "本机没有 sshpass，无法使用密码，已改用 SSH 密钥登录；";
 pub const ACCOUNT_SWITCH_WINDOWS: &str = "切换 claude 账号需要复制会话记录，目前只支持 Linux 和 macOS 设备";
-pub fn file_too_big(mb: usize) -> String { format!("文件超过 {mb} MB") }
+/// A file over the limit where it goes: how big it is (or "over" when it was not read to the end), the limit, what to do.
+pub fn file_too_big(len: usize, more: bool, max: usize) -> String {
+    let mb = |n: usize| format!("{:.1}MB", n as f64 / 1048576.0);
+    format!("文件{} {} 超过 {}MB 上限，请先压缩或拆分再发（视频可用 ffmpeg 降分辨率或码率，例如 -vf scale=-2:720 -crf 28）",
+        if more { "大于" } else { "" }, if more { mb(len - 1) } else { mb(len) }, max >> 20)
+}
 pub fn relay_from_unknown(from: &str) -> String { format!("exterior 不认识发送方话题「{from}」（`exterior send` 要在 exterior 启动的 agent 中运行）") }
 pub fn relay_to_unknown(to: &str, names: &str) -> String { format!("没有名为「{to}」的话题。现有话题：{names}") }
 pub const RELAY_EMPTY: &str = "内容为空";
@@ -295,6 +300,7 @@ pub fn watching(list: &[String]) -> String {
 }
 pub fn watch_on(c: &str) -> String { format!("开始盯 {}：有新消息时，exterior 会攒一小批交给你", watch_name(c)) }
 pub fn watch_off(c: &str) -> String { format!("不再盯 {}", watch_name(c)) }
+pub fn watch_muted(c: &str) -> String { format!("已排除（静音）{c}：盯全部会话时不再收到它的消息；再 exterior watch 它一次即恢复") }
 pub const SCHEDULE_USAGE: &str = "用法：exterior schedule list | exterior schedule add <HH:MM> <话题名> <内容> | exterior schedule rm <编号>（时间按 exterior 所在机器的时区，懒猫上是旧金山时间）";
 pub const SCHEDULE_BARS: &str = "内容里不能有「||」（它是定时消息之间的分隔符）";
 pub fn schedule_list(entries: &[String]) -> String {
@@ -309,7 +315,23 @@ pub fn schedule_list(entries: &[String]) -> String {
 }
 pub fn schedule_added(n: usize, e: &str) -> String { format!("已添加第 {n} 条：{}", e.replace('|', " | ")) }
 pub fn schedule_removed(n: usize, e: &str) -> String { format!("已删除第 {n} 条：{}", e.replace('|', " | ")) }
+pub fn schedule_no_topic(t: &str, near: &str) -> String {
+    if near.is_empty() { format!("没有叫「{t}」的话题；话题名要和 Telegram 里的一致（含空格）") } else { format!("没有叫「{t}」的话题。名字相近的有：{near}") }
+}
 pub fn schedule_no(arg: &str, n: usize) -> String { format!("没有第「{arg}」条定时消息（现有 {n} 条，编号见 exterior schedule list）") }
+pub fn relay_files_failed(to: &str, why: &str) -> String { format!("文字已发送到「{to}」，但有文件没发出去：{why}") }
+pub fn drained(left: usize) -> String { if left == 0 { "所有话题的输出都已发出".into() } else { format!("等待超时，还有 {left} 个话题的输出没发完") } }
+/// Messages not yet answered, as one text to send again after a restart.
+pub fn turn_msgs(l: &[String]) -> String {
+    if l.len() == 1 { return l[0].clone(); }
+    let mut t = format!("（以下 {} 条是连续发来、重启时还没处理完的消息；其中可能有已经处理过的，请按内容判断，别重复做）", l.len());
+    for (i, m) in l.iter().enumerate() { t.push_str(&format!("\n\n{}) {m}", i + 1)); }
+    t
+}
+pub fn stuck_quiet(name: &str, m: u64) -> String { format!("话题「{name}」的回合已经 {m} 分钟没有任何输出（还在运行中），可能卡住了。可以去看看，或在那个话题里发 /exterior_stop 停下重来。") }
+pub fn stuck_exited(name: &str, m: u64, why: &str) -> String {
+    format!("话题「{name}」的 agent 在回合中途退出，{m} 分钟了还没续上{}。exterior 会在设备恢复后自动重发那条消息；一直不恢复的话需要人看一下。", if why.is_empty() { String::new() } else { format!("（{why}）") })
+}
 pub const TOPIC_USAGE: &str = "用法：exterior topic open <话题名> | exterior topic close <话题名或 tgbot:编号>";
 pub fn topic_opened(name: &str, chat: &str, link: &str) -> String { format!("已开话题「{name}」：{chat} {link}（exterior 会接管并启动 agent；用 exterior send {name} <任务> 交代任务）") }
 pub fn topic_closed(name: &str, chat: &str) -> String { format!("已关闭话题「{name}」（{chat}）") }
@@ -320,12 +342,14 @@ pub fn draft_removed(id: &str) -> String { format!("已忽略草稿 #{id}") }
 pub fn draft_no_chat(c: &str) -> String { format!("brief 里没有名为「{c}」的会话；请用会话 ID（GET /api/chats 可查）") }
 pub fn draft_many_chats(c: &str, ids: &str) -> String { format!("名为「{c}」的会话不止一个：{ids}；请改用其中一个会话 ID") }
 pub fn chat_candidates(c: &str, l: &str) -> String { format!("没有正好叫「{c}」的会话。名字相近的有：{l}；请用完整名字或会话 ID") }
+pub const WATCH_USAGE: &str = "用法：exterior watch [会话ID或名字 | --all [来源] | --list | --flush [话题]] [--batch 30m] | exterior unwatch <会话ID或名字 | --all [来源]>";
 pub const WATCH_BATCH_USAGE: &str = "用法：exterior watch [会话ID | --all 来源] --batch 30m（单位 s、m、h；off 恢复默认）";
 pub fn watch_batch_set(secs: u64) -> String {
     if secs == 0 { "攒批恢复默认：会话静下来 20 秒（最长 2 分钟）就交给你".into() } else { format!("攒批时长设为 {}：这段时间内的新消息攒成一批交给你", dur(secs)) }
 }
-pub fn watch_flushed(topic: Option<&str>) -> String {
-    match topic { None => "已让 exterior 把攒着的新消息立刻交给你（十几秒内到；没有攒着的就不会来）".into(), Some(t) => format!("已让 exterior 把「{t}」攒着的新消息立刻交给它（十几秒内到）") }
+pub fn watch_flushed(topic: Option<&str>, n: usize) -> String {
+    let who = topic.map(|t| format!("「{t}」")).unwrap_or_else(|| "你".into());
+    if n == 0 { format!("{who}当前没有攒着的新消息") } else { format!("已把{who}攒着的 {n} 条新消息交出，几秒内送到") }
 }
 pub fn watch_batch_note(secs: u64) -> String { if secs == 0 { String::new() } else { format!("（攒批时长 {}）", dur(secs)) } }
 fn dur(s: u64) -> String { if s % 3600 == 0 { format!("{} 小时", s / 3600) } else if s % 60 == 0 { format!("{} 分钟", s / 60) } else { format!("{s} 秒") } }

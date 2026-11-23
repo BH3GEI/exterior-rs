@@ -250,6 +250,8 @@ impl Agent {
                 "--include-partial-messages"].map(String::from).to_vec();
         args.extend(params::args("claude_args"));
         if let Some(e) = self.spec.effort.as_ref().filter(|e| *e != "auto") { args.push("--effort".into()); args.push(e.clone()); }
+        // the model picked with /model in this topic (claude forgets it when its process ends)
+        if let Some(m) = crate::store::note(&self.spec.tid)["model"].as_str().filter(|m| !m.is_empty() && !self.spec.tid.is_empty()) { args.push("--model".into()); args.push(m.to_string()); }
         // claude leaves its thinking out unless asked; the summaries Anthropic's API gives are shown as steps
         args.extend(params::args("claude_fixed_args"));
         let td = params::get("claude_thinking");
@@ -577,13 +579,14 @@ impl Ctl {
     }
 
     /// Send a request and wait for its answer. `make` puts the id into the request.
-    pub fn ask(&self, make: impl FnOnce(&str) -> Value) -> Result<Value, String> {
+    pub fn ask(&self, make: impl FnOnce(&str) -> Value) -> Result<Value, String> { self.ask_for(make, params::num("ask_timeout_s")) }
+
+    pub fn ask_for(&self, make: impl FnOnce(&str) -> Value, secs: u64) -> Result<Value, String> {
         let id = format!("x{}", self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1);
         let (w, r) = std::sync::mpsc::channel();
         self.pending.lock().unwrap().insert(id.clone(), w);
         let v = make(&id);
         if let Err(e) = put(&self.stdin, &v) { self.pending.lock().unwrap().remove(&id); return Err(e); }
-        let secs = params::num("ask_timeout_s");
         r.recv_timeout(std::time::Duration::from_secs(secs)).map_err(|_| { self.pending.lock().unwrap().remove(&id); text::no_response(secs) })
     }
 
@@ -682,7 +685,10 @@ impl Ctl {
             (Kind::Pi, "resume") | (Kind::Pi, "import") => self.ask(|id| json!({"type": "switch_session", "id": id, "sessionPath": arg}))?,
             (Kind::Codex, "clear") => codex("thread/start", start_params())?,
             (Kind::Codex, "usage") => codex("account/usage/read", json!({}))?,
-            (Kind::Codex, "diff") => codex("command/exec", json!({"command": ["sh", "-c", "git status --short && git diff"], "cwd": self.dir}))?,
+            // with the topic's own sandbox (codex's default for command/exec is its configured one, which may not let git
+            // write its cache), and time for a big repository
+            (Kind::Codex, "diff") => codex("command/exec", json!({"command": ["sh", "-c", "git status --short && git diff"], "cwd": self.dir,
+                "sandboxPolicy": codex_sandbox_policy(&params::get("codex_sandbox")), "timeoutMs": 60000}))?,
             (Kind::Codex, "rename") => codex("thread/name/set", json!({"threadId": codex_thread()?, "name": arg}))?,
             (Kind::Codex, "resume") if arg.is_empty() => codex("thread/list", json!({"cwd": self.dir, "limit": 10}))?,
             (Kind::Codex, "resume") => {
@@ -706,7 +712,8 @@ impl Ctl {
             (Kind::Codex, "goal") if arg == "clear" => codex("thread/goal/clear", json!({"threadId": codex_thread()?}))?,
             (Kind::Codex, "goal") => codex("thread/goal/set", json!({"threadId": codex_thread()?, "objective": arg}))?,
             (Kind::Codex, "mcp") => codex("mcpServerStatus/list", json!({"threadId": codex_thread()?}))?,
-            (Kind::Codex, "apps") => codex("app/list", json!({"threadId": codex_thread()?}))?,
+            // app/list asks the network and may take a while
+            (Kind::Codex, "apps") => { let th = codex_thread()?; self.ask_for(|id| json!({"jsonrpc": "2.0", "id": id, "method": "app/list", "params": {"threadId": th}}), 120)? }
             (Kind::Codex, "plugins") => codex("plugin/list", json!({"cwds": [self.dir]}))?,
             (Kind::Codex, "skills") => codex("skills/list", json!({"cwds": [self.dir]}))?,
             (Kind::Codex, "hooks") => codex("hooks/list", json!({"cwds": [self.dir]}))?,
@@ -871,7 +878,9 @@ fn read_claude(out: impl std::io::Read, tx: Sender<Ev>, tid: String, gen: u64, b
                 step(text::event_title("rate_limit_event"), pretty(&v))
             }
             Some("result") => {
-                let uses = crate::usage::from_claude_result(&v);
+                let mut uses = crate::usage::from_claude_result(&v);
+                // the model calls of this turn (num_turns), counted on the main model (the most used)
+                if let (Some(n), Some(u)) = (v["num_turns"].as_u64(), uses.iter_mut().max_by_key(|u| u.input + u.output + u.cache_read)) { u.calls = n; }
                 if !uses.is_empty() { let _ = tx.send(Ev::Usage { tid: tid.clone(), uses }); }
                 // calls still without a result (a background subagent's, say): shown now with what they were
                 // asked, and kept, so the result that comes later is shown under the same call
@@ -936,6 +945,11 @@ fn agy_quota(spec: &Spec, tx: &Sender<Ev>) {
             if !w.is_empty() { let _ = tx.send(Ev::Quota { tid: spec.tid.clone(), windows: w }); }
         }
     });
+}
+
+/// codex's sandbox setting (thread/start's "sandbox" mode) as the policy command/exec takes.
+fn codex_sandbox_policy(mode: &str) -> Value {
+    match mode { "read-only" => json!({"type": "readOnly"}), "workspace-write" => json!({"type": "workspaceWrite"}), _ => json!({"type": "dangerFullAccess"}) }
 }
 
 /// A JSON-RPC request.

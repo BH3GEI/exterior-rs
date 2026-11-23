@@ -499,6 +499,12 @@ fn respond(mut req: Request) {
                 let mut body = String::new();
                 let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
                 let f = form(&body);
+                // an exterior send under way keeps a restart waiting (daemon::drain)
+                struct Busy(bool);
+                impl Drop for Busy { fn drop(&mut self) { if self.0 { daemon::INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } } }
+                let counted = f.get("cmd").map(|c| c != "drain").unwrap_or(true);
+                if counted { daemon::INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+                let _busy = Busy(counted);
                 let g = |k: &str| f.get(k).cloned().unwrap_or_default();
                 let r = match g("cmd").as_str() {
                     "watch" => daemon::watch(&g("from"), &g("to"), true),
@@ -507,6 +513,7 @@ fn respond(mut req: Request) {
                     "topic" => daemon::topic_cmd(&g("to"), &g("text")),
                     "draft" => daemon::draft_cmd(&g("to"), &g("text")),
                     "schedule" => daemon::schedule_cmd(&g("to"), &g("text")),
+                    "drain" => { let left = daemon::drain(std::time::Duration::from_secs(params::num("drain_s"))); Ok(text::drained(left)) }
                     _ => daemon::relay(&g("from"), &g("to"), &g("text")),
                 };
                 match r { Ok(m) => (200, m), Err(e) => (400, e) }

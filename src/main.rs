@@ -23,6 +23,8 @@ fn main() {
     let addr = web::listen_addr(store::on_lazycat(), std::env::var("EXTERIOR_ADDR").ok().as_deref(), std::env::var("PORT").ok().as_deref());
     let _ = std::fs::create_dir_all(store::var());
     daemon::start();
+    #[cfg(unix)]
+    term::watch();
     web::serve(&addr);
 }
 
@@ -83,4 +85,23 @@ fn probe(a: &[String]) {
         }
     }
     ag.kill();
+}
+
+/// SIGTERM/SIGINT: send what is still on its way (as long as the stop allows), then exit.
+#[cfg(unix)]
+mod term {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TERM: AtomicBool = AtomicBool::new(false);
+    extern "C" fn on_term(_: i32) { TERM.store(true, Ordering::SeqCst); }
+    extern "C" { fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize; }
+    pub fn watch() {
+        unsafe { signal(15, on_term); signal(2, on_term); }
+        std::thread::spawn(|| {
+            while !TERM.load(Ordering::SeqCst) { std::thread::sleep(std::time::Duration::from_millis(200)); }
+            crate::store::log("stop signal: sending what is left");
+            let left = crate::daemon::drain(std::time::Duration::from_secs(8));
+            crate::store::log(&format!("stopping ({left} topics still had output)"));
+            std::process::exit(0);
+        });
+    }
 }

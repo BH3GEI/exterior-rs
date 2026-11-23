@@ -60,6 +60,21 @@ pub fn running(tid: &str) -> Option<(bool, bool)> {
     ss.get(tid).map(|s| (s.agent.is_some(), s.pending || owed))
 }
 
+/// `exterior …` calls being answered right now (not counting drain itself).
+pub static INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Wait (at most `max`) until no topic has anything left to send; how many still had. Called before exterior is
+/// replaced (the install script asks for it) and when it is told to stop.
+pub fn drain(max: Duration) -> usize {
+    let t = Instant::now();
+    loop {
+        let left = owed(|o| o.handed.values().filter(|n| **n > 0).count() + o.gathering.len())
+            + INFLIGHT.load(std::sync::atomic::Ordering::SeqCst);
+        if left == 0 || t.elapsed() >= max { return left; }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
 /// What each topic still has to send: messages handed to its sender and not yet sent, and topics whose text is still
 /// being gathered (output keeps this up to date). pushed: how many jobs each topic's sender has been given; urgent:
 /// up to which of them the user is waiting for (the rest of a turn that has ended).
@@ -105,6 +120,23 @@ impl Lanes {
         // the thread never ends while its sender is here, so this cannot fail
         let _ = tx.send((n, Box::new(job)));
     }
+}
+
+/// The messages handed to the agent whose turns have not ended yet, oldest first (several when the user writes on
+/// while it works). turn_msg holds them as one text: what a restart sends again, so none is lost.
+fn turn_push(chat: &str, msg: &str) {
+    let mut l: Vec<String> = store::note(chat)["turn_msgs"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(String::from)).collect();
+    l.push(msg.to_string());
+    store::note_set(chat, "turn_msg", json!(text::turn_msgs(&l)));
+    store::note_set(chat, "turn_msgs", json!(l));
+}
+
+/// A turn ended: its message is done (the oldest). What is left stays to be sent again after a restart.
+fn turn_pop(tid: &str) {
+    let mut l: Vec<String> = store::note(tid)["turn_msgs"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(String::from)).collect();
+    if !l.is_empty() { l.remove(0); }
+    store::note_set(tid, "turn_msg", if l.is_empty() { Value::Null } else { json!(text::turn_msgs(&l)) });
+    store::note_set(tid, "turn_msgs", if l.is_empty() { Value::Null } else { json!(l) });
 }
 
 fn set_status(tid: &str, status: &str) { store::note_set(tid, "status", json!(status)); store::note_set(tid, "active", json!(store::now())); }
@@ -215,13 +247,16 @@ fn maybe_sent(path: &str, c: u16, v: &Value) -> bool {
 }
 
 /// Telegram takes files up to 50 MB from a bot.
-const FILE_MAX: usize = 50_000_000;
+const FILE_MAX: usize = 50 * 1024 * 1024;
+/// brief's limit for files the bot sends into a topic (the Bot API's); files to tg:me and the allowlist may be FILE_MAX.
+const TOPIC_FILE_MAX: usize = 20 * 1024 * 1024;
 
 /// A file on the topic's device, sent to `chat` with the agent's caption. A relative path is in the topic's folder.
 fn send_file(own: &Own, sessions: &Sessions, chat: &str, dev: &str, dir: &str, alt: &str, path: &str) -> Result<(), String> {
     let device = store::device(dev).ok_or_else(|| text::device_missing(dev))?;
     let data = crate::host::read_file(&device, path, dir, FILE_MAX)?;
-    if data.len() > FILE_MAX { return Err(text::file_too_big(FILE_MAX / 1_000_000)); }
+    let max = if chat.starts_with(brief::TOPIC_PREFIX) { TOPIC_FILE_MAX } else { FILE_MAX };
+    if data.len() > max { return Err(text::file_too_big(data.len(), data.len() > FILE_MAX, max)); }
     let name = path.rsplit(|c| c == '/' || (cfg!(windows) && c == '\\')).next().unwrap_or(path).to_string();
     let _s = Sending::new(chat);
     let v = post(sessions, chat, "/api/send_file", json!({"chat": chat, "name": name, "data": brief::base64(&data), "text": alt}))?;
@@ -273,9 +308,9 @@ pub fn watch(from: &str, chat: &str, on: bool) -> Result<String, String> {
         let tid = if want.is_empty() { from.to_string() } else {
             sessions.lock().unwrap().values().find(|t| !t.deleted && (t.name == want || t.tid == want)).map(|t| t.tid.clone()).ok_or_else(|| text::relay_to_unknown(&want, ""))?
         };
-        FLUSH.lock().unwrap().get_or_insert_with(HashSet::new).insert(tid.clone());
-        store::log(&format!("{from}: watch flush {tid}"));
-        return Ok(text::watch_flushed(if want.is_empty() { None } else { Some(want.as_str()) }));
+        let n = flush_now(&tid);
+        store::log(&format!("{from}: watch flush {tid}: {n}"));
+        return Ok(text::watch_flushed(if want.is_empty() { None } else { Some(want.as_str()) }, n));
     }
     let chat = watch_entry(&chat);
     // a name instead of an id: the one chat with that name, or the candidates to choose from
@@ -285,16 +320,37 @@ pub fn watch(from: &str, chat: &str, on: bool) -> Result<String, String> {
         return Ok(if batch.is_some() && chat.is_empty() { said } else { format!("{}{}", text::watching(&list), text::watch_batch_note(batch_now)) });
     }
     if chat.starts_with(brief::TOPIC_PREFIX) { return Err(text::WATCH_TOPIC.into()); }
-    // with "all" on, unwatching one chat keeps it out ("-<chat>"); watching it again takes it back in
-    let excluded = format!("-{chat}");
-    let covered_by_all = list.iter().any(|e| e.starts_with("all"));
-    list.retain(|c| c != chat && *c != excluded);
-    if on { list.push(chat.to_string()); } else if covered_by_all && !chat.starts_with("all") { list.push(excluded); }
+    // an option it does not know (--help, a typo): not a chat
+    if chat.starts_with("--") || (chat.starts_with('-') && !on) { return Err(text::WATCH_USAGE.into()); }
+    let muted = watch_update(&mut list, chat, on);
     store::note_set(from, "watch", json!(list));
     store::log(&format!("{from}: {} {chat}", if on { "watch" } else { "unwatch" }));
-    let done = if on { text::watch_on(chat) } else { text::watch_off(chat) };
+    let done = if on { text::watch_on(chat) } else if muted { text::watch_muted(chat) } else { text::watch_off(chat) };
     Ok(if said.is_empty() { done } else { format!("{done}；{said}") })
 }
+
+/// One watch or unwatch on a topic's list; whether it muted a chat. With "all" on, unwatching one chat keeps it out
+/// ("-<chat>") and watching it again takes it back in; once no "all" is left, the exclusions go too.
+fn watch_update(list: &mut Vec<String>, chat: &str, on: bool) -> bool {
+    let excluded = format!("-{chat}");
+    let src = chat_source(chat);
+    let covered_by_all = list.iter().any(|e| e == "all" || e.strip_prefix("all:") == Some(src));
+    list.retain(|c| c != chat && *c != excluded);
+    let muted = !on && covered_by_all && !chat.starts_with("all");
+    if on && chat.starts_with("all") {
+        // the chats it now covers need no entry of their own
+        let s = chat.strip_prefix("all:");
+        list.retain(|c| c.starts_with("all") || c.starts_with('-') || s.is_some_and(|s| s != chat_source(c)));
+    }
+    if on { list.push(chat.to_string()); } else if muted { list.push(excluded); }
+    // exclusions only mean something under an "all" of their source
+    let alls: Vec<String> = list.iter().filter(|e| e.starts_with("all")).cloned().collect();
+    list.retain(|e| match e.strip_prefix('-') { Some(c) => alls.iter().any(|a| a == "all" || a.strip_prefix("all:") == Some(chat_source(c))), None => true });
+    muted
+}
+
+/// Where a chat id comes from, as brief names its sources: tg:… is Telegram, the rest (…@chatroom, wxid_…) WeChat.
+fn chat_source(chat: &str) -> &'static str { if chat.starts_with("tg:") { "telegram" } else { "wechat" } }
 
 /// "<chat or --all …> --batch 30m" → the rest and the batch time in seconds (0 for off/default).
 fn split_batch(arg: &str) -> Result<(String, Option<u64>), String> {
@@ -330,9 +386,6 @@ fn watch_covers(entry: &str, chat: &str, source: &str) -> bool {
     entry == chat || entry == "all" || entry.strip_prefix("all:").is_some_and(|s| s == source)
 }
 
-/// Topics whose gathered batch should go out now (`exterior watch --flush`).
-static FLUSH: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-fn flush_take() -> HashSet<String> { FLUSH.lock().unwrap().take().unwrap_or_default() }
 
 /// A watched chat's new messages wait this long for more before going to the agent, and at most WATCH_MAX.
 const WATCH_QUIET: Duration = Duration::from_secs(20);
@@ -354,55 +407,97 @@ fn watch_batch(lines: &[(String, String)]) -> String {
         lines.iter().filter(|(c, _)| c == n).map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n"))).collect::<Vec<_>>().join("\n\n")
 }
 
+/// What the watched chats said that has not gone to its topic yet, per topic: (chat name, line) in arrival order,
+/// when the first and the last came (unix seconds). Kept on disk too (state watch_pend), written before the read mark
+/// moves on, so a restart in the middle of a long --batch loses nothing.
+#[derive(Clone, Default)]
+struct Pend { lines: Vec<(String, String)>, first: u64, at: u64 }
+static PEND: Mutex<Option<HashMap<String, Pend>>> = Mutex::new(None);
+/// Batches taken out by --flush, for the watcher to hand over.
+static READY: Mutex<Vec<(String, Vec<(String, String)>)>> = Mutex::new(Vec::new());
+
+fn pend<T>(f: impl FnOnce(&mut HashMap<String, Pend>) -> T) -> T {
+    let mut g = PEND.lock().unwrap();
+    let m = g.get_or_insert_with(|| {
+        store::state("watch_pend").as_object().map(|o| o.iter().map(|(t, v)| (t.clone(), Pend {
+            lines: v["lines"].as_array().into_iter().flatten().filter_map(|l| Some((l[0].as_str()?.to_string(), l[1].as_str()?.to_string()))).collect(),
+            first: v["first"].as_u64().unwrap_or(0), at: v["at"].as_u64().unwrap_or(0),
+        })).collect()).unwrap_or_default()
+    });
+    f(m)
+}
+
+fn pend_save() {
+    let v: serde_json::Map<String, Value> = pend(|m| m.iter().map(|(t, p)| (t.clone(), json!({"lines": p.lines.iter().map(|(n, l)| json!([n, l])).collect::<Vec<_>>(), "first": p.first, "at": p.at}))).collect());
+    store::set_state("watch_pend", Value::Object(v));
+}
+
+/// `exterior watch --flush`: the topic's gathered batch, taken out now; how many messages it had.
+fn flush_now(tid: &str) -> usize {
+    let taken = pend(|m| m.remove(tid));
+    let n = taken.as_ref().map(|p| p.lines.len()).unwrap_or(0);
+    if let Some(p) = taken.filter(|p| !p.lines.is_empty()) { READY.lock().unwrap().push((tid.to_string(), p.lines)); pend_save(); }
+    n
+}
+
 fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
-    // topic → ((chat name, line) in arrival order, first, last arrival)
-    let mut pend: HashMap<String, (Vec<(String, String)>, Instant, Instant)> = HashMap::new();
     let latest = || brief::get("/api/messages?limit=1").and_then(|v| v.as_array().and_then(|a| a.iter().filter_map(|m| m["id"].as_u64()).max()));
     let mut last = store::state("watch_after").as_u64().filter(|l| *l > 0).or_else(latest).unwrap_or(0);
+    let deliver = |tid: &str, lines: &[(String, String)]| {
+        store::log(&format!("watch -> {tid}: {} messages", lines.len()));
+        handle(&sessions, &own, &tx, tid, &watch_batch(lines));
+    };
     loop {
+        // --flush: at once
+        let flushed: Vec<(String, Vec<(String, String)>)> = std::mem::take(&mut *READY.lock().unwrap());
+        for (tid, lines) in flushed { deliver(&tid, &lines); }
         // topic → its watch entries (chat ids, "all", "all:<source>"); and how long its batches gather, if set
         let mut watched: Vec<(String, Vec<String>)> = vec![];
-        let mut batch: HashMap<String, Duration> = HashMap::new();
+        let mut batch: HashMap<String, u64> = HashMap::new();
         for n in store::notes().iter().filter(|n| n["deleted"] != true) {
             let l: Vec<String> = n["watch"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
             let tid = n["topic"].as_str().unwrap_or("").to_string();
-            if let Some(b) = n["watch_batch"].as_u64().filter(|b| *b > 0) { batch.insert(tid.clone(), Duration::from_secs(b)); }
+            if let Some(b) = n["watch_batch"].as_u64().filter(|b| *b > 0) { batch.insert(tid.clone(), b); }
             if !l.is_empty() { watched.push((tid, l)); }
         }
-        if watched.is_empty() && pend.is_empty() {
+        if watched.is_empty() && pend(|m| m.is_empty()) {
             // nothing followed: keep the mark current, so a new watch starts from now, not from old messages
-            std::thread::sleep(Duration::from_secs(20));
+            std::thread::sleep(Duration::from_secs(5));
             if let Some(l) = latest() { last = last.max(l); store::set_state("watch_after", json!(last)); }
             continue;
         }
-        match brief::call("GET", &format!("/api/wait?after_id={last}&timeout=15&limit=500"), None) {
-            Ok(v) => for m in v.as_array().into_iter().flatten() {
-                last = last.max(m["id"].as_u64().unwrap_or(0));
-                let (chat, source) = (m["chat"].as_str().unwrap_or(""), m["source"].as_str().unwrap_or(""));
-                // each topic once, however many of its entries cover the chat
-                let out = format!("-{chat}");
-                for (tid, _) in watched.iter().filter(|(_, l)| !l.contains(&out) && l.iter().any(|e| watch_covers(e, chat, source))) {
-                    let name = m["chat_name"].as_str().filter(|n| !n.is_empty()).unwrap_or(chat).to_string();
-                    let e = pend.entry(tid.clone()).or_insert_with(|| (Vec::new(), Instant::now(), Instant::now()));
-                    e.0.push((name, watch_line(m)));
-                    e.2 = Instant::now();
+        match brief::call("GET", &format!("/api/wait?after_id={last}&timeout=5&limit=500"), None) {
+            Ok(v) => {
+                let now = store::now();
+                let mut got = false;
+                for m in v.as_array().into_iter().flatten() {
+                    last = last.max(m["id"].as_u64().unwrap_or(0));
+                    let (chat, source) = (m["chat"].as_str().unwrap_or(""), m["source"].as_str().unwrap_or(""));
+                    // each topic once, however many of its entries cover the chat
+                    let out = format!("-{chat}");
+                    for (tid, _) in watched.iter().filter(|(_, l)| !l.contains(&out) && l.iter().any(|e| watch_covers(e, chat, source))) {
+                        let name = m["chat_name"].as_str().filter(|n| !n.is_empty()).unwrap_or(chat).to_string();
+                        pend(|p| { let e = p.entry(tid.clone()).or_insert_with(|| Pend { lines: vec![], first: now, at: now }); e.lines.push((name, watch_line(m))); e.at = now; });
+                        got = true;
+                    }
                 }
-            },
+                // what was read is kept before the mark moves past it
+                if got { pend_save(); }
+            }
             Err(_) => std::thread::sleep(params::secs("reconnect_s")),
         }
         store::set_state("watch_after", json!(last));
-        // default: once the chat is quiet for a moment (at most WATCH_MAX); with --batch: everything that came within it;
-        // and at once for a topic that asked (--flush)
-        let flush = flush_take();
-        let ready: Vec<String> = pend.iter().filter(|(t, (_, first, at))| flush.contains(*t) || match batch.get(*t) {
-            Some(b) => first.elapsed() >= *b,
-            None => at.elapsed() >= WATCH_QUIET || first.elapsed() >= WATCH_MAX,
-        }).map(|(t, _)| t.clone()).collect();
-        for tid in ready {
-            let Some((lines, _, _)) = pend.remove(&tid) else { continue };
-            store::log(&format!("watch -> {tid}: {} messages", lines.len()));
-            handle(&sessions, &own, &tx, &tid, &watch_batch(&lines));
-        }
+        // default: once the chat is quiet for a moment (at most WATCH_MAX); with --batch: everything that came within it
+        let now = store::now();
+        let ready: Vec<(String, Vec<(String, String)>)> = pend(|p| {
+            let due: Vec<String> = p.iter().filter(|(t, e)| match batch.get(*t) {
+                Some(b) => now >= e.first + b,
+                None => now >= e.at + WATCH_QUIET.as_secs() || now >= e.first + WATCH_MAX.as_secs(),
+            }).map(|(t, _)| t.clone()).collect();
+            due.into_iter().filter_map(|t| p.remove(&t).map(|e| (t, e.lines))).collect()
+        });
+        if !ready.is_empty() { pend_save(); }
+        for (tid, lines) in ready { deliver(&tid, &lines); }
     }
 }
 
@@ -410,7 +505,7 @@ fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
 /// for another agent to work in, and closing it when the work is done (brief release).
 pub fn topic_cmd(what: &str, name: &str) -> Result<String, String> {
     let name = name.trim();
-    if name.is_empty() { return Err(text::TOPIC_USAGE.into()); }
+    if name.is_empty() || name.starts_with('-') { return Err(text::TOPIC_USAGE.into()); }
     let err = |(c, v): (u16, Value)| format!("{c} {}", v["error"].as_str().or(v["message"].as_str()).map(String::from).unwrap_or_else(|| v.to_string()));
     match what {
         "open" => {
@@ -511,14 +606,28 @@ pub fn relay(from: &str, to: &str, body: &str) -> Result<String, String> {
     let target = target.or_else(|| to.contains(':').then(|| to.to_string())).ok_or_else(|| text::relay_to_unknown(to, &names))?;
     if body.trim().is_empty() { return Err(text::RELAY_EMPTY.into()); }
     let own: Own = Arc::new(Mutex::new(HashSet::new()));
+    // a file mark whose file is not there is text (an example of the syntax, say): it goes as it was written. Files
+    // that cannot go are said at the end; the rest of the message still goes
+    let mut pieces: Vec<text::Piece> = vec![];
     for p in text::pieces(&format!("{name} {} {}", params::get("relay_mark"), body.trim())) {
+        let missing = match &p { text::Piece::File { path, .. } => store::device(&dev).map(|d| crate::host::read_file(&d, path, &dir, 0).err() == Some(text::FILE_MISSING.into())).unwrap_or(false), _ => false };
+        match (p, missing, pieces.last_mut()) {
+            (text::Piece::File { alt, path }, true, Some(text::Piece::Text(t))) => t.push_str(&format!("![{alt}]({path})")),
+            (text::Piece::File { alt, path }, true, _) => pieces.push(text::Piece::Text(format!("![{alt}]({path})"))),
+            (text::Piece::Text(s), _, Some(text::Piece::Text(t))) => t.push_str(&s),
+            (p, _, _) => pieces.push(p),
+        }
+    }
+    let mut failed: Vec<String> = vec![];
+    for p in pieces {
         match p {
             // a running agent's message to another topic: nobody is waiting for it, it queues like the agents' steps
             text::Piece::Text(t) => for part in text::pack(vec![t]) { brief::with_urgency(|| false, || post(&sessions, &target, "/api/send", json!({"chat": target, "text": part})))?; },
-            text::Piece::File { alt, path } => brief::with_urgency(|| false, || send_file(&own, &sessions, &target, &dev, &dir, &alt, &path)).map_err(|e| format!("{path}：{e}"))?,
+            text::Piece::File { alt, path } => if let Err(e) = brief::with_urgency(|| false, || send_file(&own, &sessions, &target, &dev, &dir, &alt, &path)) { failed.push(format!("{path}：{e}")); },
         }
     }
     store::log(&format!("relay {name} -> {to}"));
+    if !failed.is_empty() { return Err(text::relay_files_failed(to, &failed.join("；"))); }
     Ok(text::relayed(to))
 }
 
@@ -722,6 +831,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
         while let Ok(e) = rx.try_recv() { batch.push(e); }
         let current = |tid: &str, gen: u64| sessions.lock().unwrap().get(tid).map(|s| s.gen == gen).unwrap_or(false);
         for ev in batch {
+        heard(ev_tid(&ev));
         match ev {
             Ev::Text { tid, gen, delta } => {
                 let o = outs.entry(tid).or_insert_with(|| fresh(gen));
@@ -783,7 +893,7 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                     store::note_set(&tid, "turn_end", json!(store::now()));
                     store::note_set(&tid, "last_error", error.map(Value::String).unwrap_or(Value::Null));
                     store::note_set(&tid, "from", Value::Null);
-                    store::note_set(&tid, "turn_msg", Value::Null);
+                    turn_pop(&tid);
                     store::note_set(&tid, "turn_resent", Value::Null);
                 }
                 hurry(&tid);
@@ -853,6 +963,8 @@ fn output(rx: Receiver<Ev>, sessions: Sessions, own: Own) {
                         let n = store::note(&tid);
                         let says = match n["turn_msg"].as_str().filter(|_| n["turn_resent"] != json!(true)) {
                             Some(m) => {
+                                // sent again as one (turn_msg holds them all): the list starts over then
+                                store::note_set(&tid, "turn_msgs", Value::Null);
                                 store::note_set(&tid, "wait_msg", json!(m));
                                 store::note_set(&tid, "wait_since", json!(store::now()));
                                 text::exited_waiting(&why)
@@ -933,6 +1045,7 @@ fn run(sessions: Sessions) {
         let n = store::note(&tid);
         let last_msg = n["turn_msg"].as_str().map(String::from);
         store::note_set(&tid, "turn_msg", Value::Null);
+        store::note_set(&tid, "turn_msgs", Value::Null);
         store::note_set(&tid, "turn_resent", Value::Null);
         // only once: a turn that itself restarts exterior (say, deploying it) must not loop
         if n["status"].as_str() == Some(st::RUNNING) && last_msg.is_some() && n["turn_resent"] != json!(true) {
@@ -976,6 +1089,7 @@ fn run(sessions: Sessions) {
             retry_waiting(&sessions, &own, &tx);
             scheduled(&sessions, &own, &tx);
             idle_compact(&sessions, &own, &tx);
+            stuck_check(&sessions, &own, &tx);
             let idle = Duration::from_secs(params::num("idle_hours") * 3600);
             for s in sessions.lock().unwrap().values_mut() {
                 if s.agent.is_some() && !s.pending && s.active.elapsed() > idle {
@@ -1108,6 +1222,10 @@ pub fn schedule_cmd(what: &str, rest: &str) -> Result<String, String> {
         "add" => {
             let names: Vec<String> = LIVE.lock().unwrap().clone().map(|s| s.lock().unwrap().values().filter(|t| !t.deleted).map(|t| t.name.clone()).collect()).unwrap_or_default();
             let (at, topic, body) = schedule_parse(rest, &names, &|n| alias(n)).ok_or(text::SCHEDULE_USAGE)?;
+            if !names.contains(&topic) {
+                let near: Vec<&String> = names.iter().filter(|n| n.contains(topic.as_str()) || topic.contains(n.as_str())).take(8).collect();
+                return Err(text::schedule_no_topic(&topic, &near.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")));
+            }
             if body.contains("||") { return Err(text::SCHEDULE_BARS.into()); }
             let e = format!("{at}|{topic}|{body}");
             if schedules(&e).is_empty() { return Err(text::SCHEDULE_USAGE.into()); }
@@ -1181,6 +1299,49 @@ fn scheduled(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
         // a scheduled turn is a turn like any other: an idle compaction may follow it (dream has no other)
         store::note_set(&tid, "idle_compact_wait", Value::Null);
         handle(sessions, own, tx, &tid, &format!("{} {} {content}", text::SCHEDULE_FROM, params::get("relay_mark")));
+    }
+}
+
+/// When each topic's agent last said anything (any event).
+static HEARD: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+fn heard(tid: &str) { HEARD.lock().unwrap().get_or_insert_with(HashMap::new).insert(tid.to_string(), store::now()); }
+fn last_heard(tid: &str) -> Option<u64> { HEARD.lock().unwrap().as_ref()?.get(tid).copied() }
+
+fn ev_tid(ev: &Ev) -> &str {
+    match ev {
+        Ev::Text { tid, .. } | Ev::Done { tid, .. } | Ev::Session { tid, .. } | Ev::Note { tid, .. } | Ev::Resolved { tid, .. } | Ev::Step { tid, .. }
+        | Ev::Exhausted { tid, .. } | Ev::Context { tid, .. } | Ev::Usage { tid, .. } | Ev::Quota { tid, .. } | Ev::Exited { tid, .. } => tid,
+    }
+}
+
+/// A topic that seems stuck: its turn has said nothing for stuck_min minutes, or its agent stopped mid-turn and has
+/// not been taken up again for as long. The global topic is told once (per turn, per stop), with what is known.
+fn stuck_check(sessions: &Sessions, own: &Own, tx: &Sender<Ev>) {
+    let min = params::num("stuck_min");
+    if min == 0 { return; }
+    let (now, limit) = (store::now(), min * 60);
+    let global = alias(&params::get("global_topic"));
+    let mut warn: Vec<(String, String, String)> = vec![];
+    {
+        let ss = sessions.lock().unwrap();
+        let Some(g) = ss.values().find(|s| !s.deleted && s.name == global).map(|s| s.tid.clone()) else { return };
+        for s in ss.values().filter(|s| !s.deleted && s.tid != g) {
+            let n = store::note(&s.tid);
+            let since = last_heard(&s.tid).unwrap_or(0).max(n["active"].as_u64().unwrap_or(0));
+            let (key, why) = if s.pending && now >= since + limit {
+                (format!("quiet:{since}"), text::stuck_quiet(&s.name, (now - since) / 60))
+            } else if n["wait_msg"].is_string() && now >= n["wait_since"].as_u64().unwrap_or(now) + limit {
+                (format!("exited:{}", n["wait_since"]), text::stuck_exited(&s.name, (now - n["wait_since"].as_u64().unwrap_or(now)) / 60, n["last_error"].as_str().unwrap_or("")))
+            } else { continue };
+            if n["stuck_warned"].as_str() == Some(key.as_str()) { continue; }
+            store::note_set(&s.tid, "stuck_warned", json!(key));
+            warn.push((g.clone(), s.name.clone(), why));
+        }
+    }
+    for (g, name, why) in warn {
+        store::log(&format!("stuck: {name}"));
+        send(own, sessions, &g, &text::sys_warn(&why));
+        handle(sessions, own, tx, &g, &format!("exterior {} {why}", params::get("relay_mark")));
     }
 }
 
@@ -1328,6 +1489,8 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             store::note_set(chat, "session", Value::Null);
             store::note_set(chat, "resolved", Value::Null);
             store::note_set(chat, "from", Value::Null);
+            store::note_set(chat, "turn_msg", Value::Null);
+            store::note_set(chat, "turn_msgs", Value::Null);
             set_status(chat, st::NEW);
             reply = Some(text::session_ended(&cur));
         } else if let Some((k, name)) = builtin {
@@ -1361,6 +1524,7 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                     if let Some(a) = s.agent.as_mut() { a.stop(); a.kill(); }
                     s.agent = None; s.gen += 1; s.pending = false;
                     store::note_set(chat, "agent", json!(want));
+                    store::note_set(chat, "model", Value::Null);
                     store::note_set(chat, "session", Value::Null);
                     store::note_set(chat, "resolved", Value::Null);
                     store::note_set(chat, "last_error", Value::Null);
@@ -1417,6 +1581,10 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
             if cur_kind == Some(Kind::Claude) && orig == "effort" && agents::CLAUDE_EFFORTS.contains(&arg.as_str()) { store::note_set(chat, "effort", json!(arg)); }
             // a button whose value was too long to fit says "/model 3": the value is looked up
             let arg = chosen(chat, orig, &arg).unwrap_or(arg.clone());
+            // claude's /model only lasts for its process: kept, so a restart (which resumes) uses it again
+            if cur_kind == Some(Kind::Claude) && orig == "model" && !arg.is_empty() {
+                store::note_set(chat, "model", if arg == "default" { Value::Null } else { json!(arg) });
+            }
             say = Some(format!("/{orig}{}{arg}", if arg.is_empty() { "" } else { " " }));
         } else {
             say = Some(msg.to_string());
@@ -1436,7 +1604,7 @@ fn handle(sessions: &Sessions, own: &Own, tx: &Sender<Ev>, chat: &str, msg: &str
                 else {
                     // the agent may already have been running: the turn starts now either way
                     set_status(chat, st::RUNNING);
-                    store::note_set(chat, "turn_msg", json!(msg));
+                    turn_push(chat, msg);
                 }
             }
         }
@@ -1604,6 +1772,31 @@ mod tests {
         assert_eq!(split_batch("1@chatroom").unwrap(), ("1@chatroom".into(), None));
         assert!(split_batch("--batch x").is_err());
         assert_eq!(crate::text::watch_batch_note(1800), "（攒批时长 30 分钟）");
+    }
+    #[test]
+    fn watch_list_changes() {
+        let mut l: Vec<String> = vec![];
+        assert!(!watch_update(&mut l, "all:wechat", true));
+        assert!(watch_update(&mut l, "1@chatroom", false), "unwatching under all mutes");
+        assert_eq!(l, vec!["all:wechat", "-1@chatroom"]);
+        assert!(!watch_update(&mut l, "1@chatroom", true));
+        assert_eq!(l, vec!["all:wechat", "1@chatroom"]);
+        watch_update(&mut l, "2@chatroom", false);
+        assert!(!watch_update(&mut l, "all:wechat", false));
+        assert_eq!(l, vec!["1@chatroom"], "no all left: exclusions go");
+        // --all wechat takes over the wechat chats watched one by one, not the Telegram ones
+        let mut l: Vec<String> = vec!["1@chatroom".into(), "tg:u1".into(), "wxid_a".into()];
+        watch_update(&mut l, "all:wechat", true);
+        assert_eq!(l, vec!["tg:u1", "all:wechat"]);
+        // unwatching a Telegram chat under all:wechat is just unwatching, no exclusion
+        assert!(!watch_update(&mut l, "tg:u1", false));
+        assert_eq!(l, vec!["all:wechat"]);
+    }
+    #[test]
+    fn file_limits() {
+        let t = crate::text::file_too_big(42 * 1048576, false, 20 * 1048576);
+        assert!(t.contains("42.0MB 超过 20MB 上限") && t.contains("ffmpeg"), "{t}");
+        assert!(crate::text::file_too_big(50 * 1048576 + 1, true, 50 * 1048576).contains("大于 50.0MB"));
     }
     #[test]
     fn chat_by_name() {

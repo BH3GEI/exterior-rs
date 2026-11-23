@@ -42,6 +42,8 @@ pub const PARAMS: &[Param] = &[
     Param { key: "limit_warn_pct", label: "订阅窗口用量达到多少百分比时提醒（codex）并标为接近上限", default: "90" },
     Param { key: "usage_keep_days", label: "用量记录保留多少天", default: "14" },
     Param { key: "usage_max_mb", label: "用量记录文件最大多少 MB（超过时只留最新的一半）", default: "20" },
+    Param { key: "stuck_min", label: "卡死提醒：回合多少分钟没有任何输出，或 agent 中途退出多少分钟没续上，就提醒全局话题一次（0 为关闭）", default: "30" },
+    Param { key: "drain_s", label: "重启或安装前，最多等各话题把已生成的输出发完多少秒", default: "180" },
     Param { key: "refresh_s", label: "同步话题列表的间隔（秒）", default: "60" },
     Param { key: "wait_s", label: "向 brief 等待新消息的时长（秒）", default: "20" },
     Param { key: "brief_timeout_s", label: "向 brief 发出一个请求的时限（秒）；上传文件时另加按 1 Mbps 估算的上传时间；须大于等待新消息的时长", default: "70" },
