@@ -317,7 +317,14 @@ pub fn watch(from: &str, chat: &str, on: bool) -> Result<String, String> {
     let chat = if chat.is_empty() || chat.starts_with('-') || chat.starts_with("all") || chat.starts_with(brief::TOPIC_PREFIX) { chat } else { resolve_chat(&chat)? };
     let chat = chat.as_str();
     if chat.is_empty() || chat == "--list" {
-        return Ok(if batch.is_some() && chat.is_empty() { said } else { format!("{}{}", text::watching(&list), text::watch_batch_note(batch_now)) });
+        if batch.is_some() && chat.is_empty() { return Ok(said); }
+        let others: Vec<(String, usize)> = {
+            let ss = sessions.lock().unwrap();
+            store::notes().iter().filter(|n| n["deleted"] != true && n["topic"].as_str() != Some(from))
+                .filter_map(|n| { let k = n["watch"].as_array().map(|a| a.len()).unwrap_or(0);
+                    let t = n["topic"].as_str()?; (k > 0).then(|| (ss.get(t).map(|s| s.name.clone()).unwrap_or(t.to_string()), k)) }).collect()
+        };
+        return Ok(format!("{}{}{}", text::watching(&list), text::watch_batch_note(batch_now), text::watch_others(&others)));
     }
     if chat.starts_with(brief::TOPIC_PREFIX) { return Err(text::WATCH_TOPIC.into()); }
     // an option it does not know (--help, a typo): not a chat
@@ -439,6 +446,25 @@ fn flush_now(tid: &str) -> usize {
     if let Some(p) = taken.filter(|p| !p.lines.is_empty()) { READY.lock().unwrap().push((tid.to_string(), p.lines)); pend_save(); }
     n
 }
+
+/// The chats of the user's own Telegram account ("tg:…") reach brief only when they are read: brief asks Telegram
+/// for a chat's new messages when /api/messages names it (at most once a minute). A watched one is read here, so its
+/// new messages come into brief, and so to the watcher, without anyone having to look.
+fn tg_refresher() {
+    loop {
+        let mut chats: Vec<String> = store::notes().iter().filter(|n| n["deleted"] != true)
+            .flat_map(|n| n["watch"].as_array().cloned().unwrap_or_default())
+            .filter_map(|c| c.as_str().map(String::from))
+            .filter(|c| tg_user_chat(c)).collect();
+        chats.sort(); chats.dedup();
+        for c in chats { let _ = brief::get(&format!("/api/messages?chat={}&limit=1", urlenc(&c))); }
+        std::thread::sleep(TG_REFRESH);
+    }
+}
+
+/// A chat of the user's own Telegram account (not one of exterior's topics, which are "tgbot:…").
+fn tg_user_chat(c: &str) -> bool { c.starts_with("tg:") && !c.starts_with(brief::TOPIC_PREFIX) }
+const TG_REFRESH: Duration = Duration::from_secs(30);
 
 fn watcher(sessions: Sessions, own: Own, tx: Sender<Ev>) {
     let latest = || brief::get("/api/messages?limit=1").and_then(|v| v.as_array().and_then(|a| a.iter().filter_map(|m| m["id"].as_u64()).max()));
@@ -1070,6 +1096,7 @@ fn run(sessions: Sessions) {
     std::thread::spawn(|| for d in store::devices() { if let Err(e) = crate::prompt::install(&d) { store::log(&format!("install brief key on {}: {e}", d["name"])); } });
     refresh(&sessions);
     { let (s, o, t) = (sessions.clone(), own.clone(), tx.clone()); std::thread::spawn(move || watcher(s, o, t)); }
+    std::thread::spawn(tg_refresher);
     for (tid, msg) in resend {
         send(&own, &sessions, &tid, &text::sys(text::RESTART_RESEND));
         let line = if msg.starts_with('/') { msg } else { text::resent(&msg) };
@@ -1791,6 +1818,13 @@ mod tests {
         // unwatching a Telegram chat under all:wechat is just unwatching, no exclusion
         assert!(!watch_update(&mut l, "tg:u1", false));
         assert_eq!(l, vec!["all:wechat"]);
+    }
+    #[test]
+    fn tg_user_chats() {
+        assert!(super::tg_user_chat("tg:u9094997560"));
+        assert!(!super::tg_user_chat("tgbot:812"));
+        assert!(!super::tg_user_chat("wxid_1"));
+        assert!(!super::tg_user_chat("all:telegram"));
     }
     #[test]
     fn file_limits() {

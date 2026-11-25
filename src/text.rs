@@ -284,6 +284,12 @@ fn watch_name(c: &str) -> String {
     if c == "all" { "所有来源的全部会话（含以后新出现的）".into() }
     else if let Some(s) = c.strip_prefix("all:") { format!("{s} 的全部会话（含以后新出现的）") } else { c.to_string() }
 }
+/// After a topic's own list: which other topics watch something (each topic's list is its own).
+pub fn watch_others(o: &[(String, usize)]) -> String {
+    if o.is_empty() { return String::new(); }
+    format!("\n（以上只是本话题的。其他话题在盯：{}）", o.iter().map(|(n, k)| format!("{n} {k} 项")).collect::<Vec<_>>().join("、"))
+}
+
 pub fn watching(list: &[String]) -> String {
     if list.is_empty() { return "没有在盯的会话".into(); }
     let all: Vec<String> = list.iter().filter(|c| c.starts_with("all")).map(|c| watch_name(c)).collect();
