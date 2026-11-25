@@ -123,11 +123,15 @@ fn send_sh(dev: &Value, windows: bool) -> String {
     let (key, url) = (host::quote(&format!("{}/.exterior-key", root(dev))), host::quote(&format!("{}/api/send", self_url(dev))));
     // while exterior restarts the gateway refuses or answers 502/503: wait and try again; an empty answer is no answer
     let opts = "--connect-timeout 10 --max-time 600 --retry 6 --retry-delay 5 --retry-connrefused";
+    // one id for this invocation: curl's retries of it are recognised by exterior and done once
+    let rid = r#"rid=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"#;
     let call = if windows {
         format!(r#"enc() {{ printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g'; }}
-out=$(printf '%s' "$text" | curl -sS {opts} --fail-with-body -H "Authorization: Bearer $(cat {key})" --data "cmd=$cmd" --data "from=$(enc "$EXTERIOR_TOPIC")" --data "to=$(enc "$to")" --data-urlencode "text@-" {url})"#)
+{rid}
+out=$(printf '%s' "$text" | curl -sS {opts} --fail-with-body -H "Authorization: Bearer $(cat {key})" --data "rid=$rid" --data "cmd=$cmd" --data "from=$(enc "$EXTERIOR_TOPIC")" --data "to=$(enc "$to")" --data-urlencode "text@-" {url})"#)
     } else {
-        format!(r#"out=$(curl -sS {opts} --fail-with-body -H "Authorization: Bearer $(cat {key})" --data-urlencode "cmd=$cmd" --data-urlencode "from=$EXTERIOR_TOPIC" --data-urlencode "to=$to" --data-urlencode "text=$text" {url})"#)
+        format!(r#"{rid}
+out=$(curl -sS {opts} --fail-with-body -H "Authorization: Bearer $(cat {key})" --data "rid=$rid" --data-urlencode "cmd=$cmd" --data-urlencode "from=$EXTERIOR_TOPIC" --data-urlencode "to=$to" --data-urlencode "text=$text" {url})"#)
     };
     let post = format!(r#"{call}
 rc=$?
@@ -181,7 +185,7 @@ elseif (($cmd -eq 'topic' -and $args.Count -ge 3) -or (($cmd -eq 'draft' -or $cm
 else {{ [Console]::Error.WriteLine($usage); exit 2 }}
 $key = (Get-Content -Raw -Encoding UTF8 -LiteralPath {key}).Trim()
 $e = {{ param($s) [Uri]::EscapeDataString([string]$s) }}
-$body = 'cmd=' + (& $e $cmd) + '&from=' + (& $e $env:EXTERIOR_TOPIC) + '&to=' + (& $e $to) + '&text=' + (& $e $text)
+$body = 'rid=' + [guid]::NewGuid().ToString('N') + '&cmd=' + (& $e $cmd) + '&from=' + (& $e $env:EXTERIOR_TOPIC) + '&to=' + (& $e $to) + '&text=' + (& $e $text)
 try {{ [Console]::OutputEncoding = [Text.Encoding]::UTF8 }} catch {{}}
 try {{
   $r = Invoke-WebRequest -UseBasicParsing -Method Post -Uri {url} -Headers @{{ Authorization = "Bearer $key" }} -ContentType 'application/x-www-form-urlencoded; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($body))
@@ -293,7 +297,12 @@ mod tests {
             assert_eq!(run(&["send", "Polaris", "用", "--help", "看用法"]), Some(0), "send still sends what says --help");
             assert_eq!(run(&["schedule", "add", "07:30", "exterior 开发", "看看"]), Some(0));
             assert_eq!(run(&["schedule"]), Some(2));
+            // each invocation has its own request id (curl's retries of it carry the same one)
             let g: Vec<_> = got.lock().unwrap().iter().map(|b| form(b)).collect();
+            let rids: Vec<String> = g.iter().map(|f| f.get("rid").cloned().unwrap_or_default()).collect();
+            assert!(rids.iter().all(|r| r.len() >= 16), "{rids:?}");
+            assert_eq!(rids.iter().collect::<std::collections::HashSet<_>>().len(), rids.len(), "{rids:?}");
+            let g: Vec<_> = g.into_iter().map(|mut f| { f.remove("rid"); f }).collect();
             let want = |cmd: &str, to: &str, text: &str| [("cmd", cmd), ("from", "tgbot:1"), ("to", to), ("text", text)].map(|(k, v)| (k.to_string(), v.to_string())).into_iter().collect::<std::collections::HashMap<_, _>>();
             assert_eq!(g, vec![want("watch", "wx@chatroom", ""), want("send", "全局", "a b"),
                                want("send", "exterior 开发", "中文 & 符号 = %20 + \"引号\"\n第二行 '单引号'"), want("watch", "", ""), want("usage", "7d", ""),

@@ -338,6 +338,7 @@ pub fn stuck_quiet(name: &str, m: u64) -> String { format!("话题「{name}」�
 pub fn stuck_exited(name: &str, m: u64, why: &str) -> String {
     format!("话题「{name}」的 agent 在回合中途退出，{m} 分钟了还没续上{}。exterior 会在设备恢复后自动重发那条消息；一直不恢复的话需要人看一下。", if why.is_empty() { String::new() } else { format!("（{why}）") })
 }
+pub const SEND_STILL_RUNNING: &str = "这条请求还在处理中（exterior 已收到，不会重复发送），请不要再发一次";
 pub const TOPIC_USAGE: &str = "用法：exterior topic open <话题名> | exterior topic close <话题名或 tgbot:编号>";
 pub fn topic_opened(name: &str, chat: &str, link: &str) -> String { format!("已开话题「{name}」：{chat} {link}（exterior 会接管并启动 agent；用 exterior send {name} <任务> 交代任务）") }
 pub fn topic_closed(name: &str, chat: &str) -> String { format!("已关闭话题「{name}」（{chat}）") }

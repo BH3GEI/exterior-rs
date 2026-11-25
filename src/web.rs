@@ -513,7 +513,7 @@ fn respond(mut req: Request) {
                 if counted { daemon::INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
                 let _busy = Busy(counted);
                 let g = |k: &str| f.get(k).cloned().unwrap_or_default();
-                let r = match g("cmd").as_str() {
+                let r = once(&g("rid"), || match g("cmd").as_str() {
                     "watch" => daemon::watch(&g("from"), &g("to"), true),
                     "unwatch" => daemon::watch(&g("from"), &g("to"), false),
                     "usage" => crate::usage::span(&g("to")).map(crate::usage::report).ok_or_else(|| text::USAGE_SPAN.to_string()),
@@ -522,7 +522,7 @@ fn respond(mut req: Request) {
                     "schedule" => daemon::schedule_cmd(&g("to"), &g("text")),
                     "drain" => { let left = daemon::drain(std::time::Duration::from_secs(params::num("drain_s"))); Ok(text::drained(left)) }
                     _ => daemon::relay(&g("from"), &g("to"), &g("text")),
-                };
+                });
                 match r { Ok(m) => (200, m), Err(e) => (400, e) }
             };
         let _ = req.respond(Response::from_string(format!("{msg}\n")).with_status_code(code));
@@ -601,5 +601,51 @@ mod tests {
         assert_eq!(listen_addr(false, Some("0.0.0.0"), Some("3456")), "0.0.0.0:3456");
         assert_eq!(listen_addr(false, Some("::"), None), "[::]:3000");
         assert_eq!(listen_addr(false, Some("[::1]:9000"), None), "[::1]:9000");
+    }
+}
+
+/// `exterior` requests by their id (the script gives each invocation one): curl retries one that took too long, and the
+/// retry must not send the message again. A repeat waits for the first and answers what it answered.
+static ONCE: std::sync::Mutex<Option<std::collections::HashMap<String, (u64, Option<Result<String, String>>)>>> = std::sync::Mutex::new(None);
+
+fn once(rid: &str, f: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+    if rid.is_empty() { return f(); }
+    let now = store::now();
+    let first = {
+        let mut g = ONCE.lock().unwrap();
+        let m = g.get_or_insert_with(std::collections::HashMap::new);
+        m.retain(|_, (t, _)| now.saturating_sub(*t) < 3 * 3600);
+        match m.get(rid) {
+            Some((_, Some(r))) => return r.clone(),
+            Some((_, None)) => false,
+            None => { m.insert(rid.to_string(), (now, None)); true }
+        }
+    };
+    if first { return finish(rid, f()); }
+    // the first one is still at it
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(590);
+    while std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if let Some((_, Some(r))) = ONCE.lock().unwrap().as_ref().and_then(|m| m.get(rid)) { return r.clone(); }
+    }
+    Err(text::SEND_STILL_RUNNING.into())
+}
+
+fn finish(rid: &str, r: Result<String, String>) -> Result<String, String> {
+    if let Some(m) = ONCE.lock().unwrap().as_mut() { m.insert(rid.to_string(), (store::now(), Some(r.clone()))); }
+    r
+}
+
+#[cfg(test)]
+mod once_tests {
+    #[test]
+    fn a_retry_is_done_once() {
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        let run = || { n.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Ok("已发送".to_string()) };
+        assert_eq!(super::once("r1", run).unwrap(), "已发送");
+        assert_eq!(super::once("r1", run).unwrap(), "已发送");
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1);
+        super::once("", run).unwrap(); super::once("", run).unwrap();
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3, "no id: every call runs");
     }
 }

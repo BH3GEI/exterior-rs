@@ -44,7 +44,13 @@ fn ssh_opts(keys: bool) -> Vec<String> {
     let mut v: Vec<&str> = vec!["-o", "StrictHostKeyChecking=accept-new", "-o", &kh];
     v.extend(auth);
     v.extend(["-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=20"]);
-    v.into_iter().map(String::from).collect()
+    let mut v: Vec<String> = v.into_iter().map(String::from).collect();
+    // every agent, file read and start text over one connection per device: an ssh server may take only so many
+    // connections (LazyCat's terminal-core, the Mac's: about 34; each running agent held one, and new ones were refused)
+    if !cfg!(windows) {
+        v.extend(["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/exterior-cm-%C", "-o", "ControlPersist=600"].map(String::from));
+    }
+    v
 }
 
 /// A shell line run on the device: sh on a remote device and on this machine (PowerShell on Windows).
@@ -446,7 +452,8 @@ mod tests {
         let kh = format!("UserKnownHostsFile={}", crate::store::path("known_hosts"));
         if !kh.contains(' ') && !cfg!(windows) {
             assert_eq!(super::ssh_opts(false), ["-o", "StrictHostKeyChecking=accept-new", "-o", &kh, "-o", "PubkeyAuthentication=no",
-                "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=20"]);
+                "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=20",
+                "-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/exterior-cm-%C", "-o", "ControlPersist=600"]);
         }
     }
 
